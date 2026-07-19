@@ -1,0 +1,101 @@
+// =============================================================================
+// CustomVRAD — all compile-time entities in one FGD
+// =============================================================================
+// Hammer: Tools → Options → Game Configurations → Game Data Files
+// Add this file AFTER your main game FGD (e.g. garrysmod.fgd), then restart Hammer.
+// Path: G:\dev\RND\CustomVRAD\fgd\customvrad.fgd
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// light_env_vol — sky/sun override volume (brush)
+// Place like a trigger (tools/toolstrigger or nodraw).
+// Legacy classname "light_environment_volume" is still accepted by VRAD.
+// -----------------------------------------------------------------------------
+@SolidClass base(Targetname, Angles) color(255 255 0) = light_env_vol :
+	"Compile-time sky/sun override volume for CustomVRAD. " +
+	"Uses the same lighting keys as light_environment. " +
+	"Outside the volume (and in the blend shell) lighting mixes with the map light_environment."
+[
+	_light(color255) : "Brightness and Color" : "255 255 255 200" : "The sunlight color. Last number is the brightness."
+	_ambient(color255) : "Ambient Color and Brightness" : "255 255 255 20" : "Ambient color in shadows. Last number is the brightness."
+	_lightHDR(color255) : "Color and Brightness (HDR)" : "-1 -1 -1 1" : "Leave as '-1 -1 -1 1' to use the SDR values."
+	_ambientHDR(color255) : "Ambient Color and Brightness (HDR)" : "-1 -1 -1 1" : "Leave as '-1 -1 -1 1' to use the SDR values."
+	_lightscaleHDR(float) : "HDR Brightness Scale" : "1" : "Amount to scale the light by when compiling for HDR."
+	_AmbientScaleHDR(float) : "HDR Ambient Brightness Scale" : "1" : "Amount to scale the ambient light by when compiling for HDR."
+	pitch(integer) : "Pitch" : 0 : "Overrides the pitch value in Angles. Negative is down. 0 is horizontal, -90 is straight down."
+	SunSpreadAngle(float) : "Sun Spread Angle" : 0 : "Softens sunlight shadows (degrees). 0 = hard. Higher numbers are more diffuse."
+	BlendDistance(float) : "Blend Distance" : 0 : "World units for the soft fade (smootherstep). Where the fade sits is set by Blend Mode. 0 = hard cut."
+	BlendMode(choices) : "Blend Mode" : 2 : "Where Blend Distance is applied relative to the brush face. Soft Voronoi still stops one volume from tinting another's side." =
+	[
+		0 : "Inside (fade inward from face)"
+		1 : "Outside (fade outward from face)"
+		2 : "Center (fade straddles face)"
+	]
+	priority(integer) : "Priority" : 0 : "When volumes fully overlap (core), higher priority wins. Ties use the smaller volume."
+	BounceVolColor(choices) : "Bounce Color From Volume" : 0 : "When light bounces into this volume from outside: No keeps the outside bounce color; Yes recolors that bounce to this volume's Brightness (_light) hue." =
+	[
+		0 : "No (outside color)"
+		1 : "Yes (volume color)"
+	]
+	BounceVolBright(choices) : "Bounce Bright From Volume" : 0 : "Only applies if Bounce Color From Volume is Yes. No keeps the bounce luminance; Yes also scales brightness by this volume's _light intensity vs the map light_environment." =
+	[
+		0 : "No (keep luminance)"
+		1 : "Yes (scale to volume brightness)"
+	]
+]
+
+// -----------------------------------------------------------------------------
+// light_ao — global AO settings (POINT entity — Entity Tool, not Tie to Entity)
+// Optional. Without this, use CLI -ao / -ao_* or only light_ao_vol volumes.
+// -----------------------------------------------------------------------------
+@PointClass base(Targetname) color(180 200 255) size(-8 -8 -8, 8 8 8) = light_ao :
+	"Compile-time ambient occlusion defaults for CustomVRAD. " +
+	"POINT entity: place with the Entity Tool (not Tie to Entity on a brush). " +
+	"Toggle and set Samples / Distance / Strength / Bias for the whole map. " +
+	"Override locally with light_ao_vol brushes."
+[
+	Enabled(choices) : "Enabled" : 1 : "Master switch for map-wide AO. Volumes can still enable AO inside their bounds when this is No." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	Samples(integer) : "Samples" : 16 : "Hemisphere rays per luxel (quality vs compile time)."
+	Distance(float) : "Distance" : "48" : "Max AO ray length in world units."
+	Strength(float) : "Strength" : "1.0" : "Darkening strength. 0 = off, 1 = normal, above 1 boosts (e.g. 1.5–3). Max 8."
+	Bias(float) : "Bias" : "0.25" : "Offset along surface normal to reduce self-occlusion (too high causes bright edge leaks)."
+	Denoise(choices) : "Denoise" : 0 : "Optional edge-preserving filter on the AO lightmap (reduces ray noise)." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	DenoiseRadius(integer) : "Denoise Radius" : 1 : "Filter radius in luxels (1 = 3x3, 2 = 5x5). Only used if Denoise is Yes."
+	DenoiseStrength(float) : "Denoise Strength" : "1.0" : "How much to blend toward the filtered AO (0..1). Only used if Denoise is Yes."
+]
+
+// -----------------------------------------------------------------------------
+// light_ao_vol — AO override volume (brush)
+// Place like a trigger (tools/toolstrigger or nodraw).
+// -----------------------------------------------------------------------------
+@SolidClass base(Targetname) color(180 200 255) = light_ao_vol :
+	"Compile-time ambient occlusion override volume for CustomVRAD. " +
+	"Uses the same AO keys as light_ao. " +
+	"Outside the volume (and in the blend shell) settings mix with light_ao / CLI defaults."
+[
+	Enabled(choices) : "Enabled" : 1 : "AO inside this volume. Set No to carve out a region with no AO when the map default is on." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	Samples(integer) : "Samples" : 16 : "Hemisphere rays per luxel inside this volume."
+	Distance(float) : "Distance" : "48" : "Max AO ray length in world units."
+	Strength(float) : "Strength" : "1.0" : "Darkening strength. 0 = off, 1 = normal, above 1 boosts (e.g. 1.5–3). Max 8."
+	Bias(float) : "Bias" : "0.25" : "Offset along surface normal to reduce self-occlusion (too high causes bright edge leaks)."
+	BlendDistance(float) : "Blend Distance" : 0 : "World units for the soft fade (smootherstep). Where the fade sits is set by Blend Mode. 0 = hard cut."
+	BlendMode(choices) : "Blend Mode" : 2 : "Where Blend Distance is applied relative to the brush face." =
+	[
+		0 : "Inside (fade inward from face)"
+		1 : "Outside (fade outward from face)"
+		2 : "Center (fade straddles face)"
+	]
+	priority(integer) : "Priority" : 0 : "When volumes fully overlap (core), higher priority wins. Ties use the smaller volume."
+]
