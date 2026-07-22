@@ -1636,6 +1636,29 @@ static void ParseLightPoint( entity_t* e, directlight_t* dl )
 	SetLightFalloffParams(e,dl);
 }
 
+// Soft sphere point light (CustomVRAD light_volume). Same keys as light, plus Radius.
+static void ParseLightVolume( entity_t* e, directlight_t* dl )
+{
+	Vector dest;
+	GetVectorForKey( e, "origin", dest );
+	dl = AllocDLight( dest, true );
+
+	ParseLightGeneric( e, dl );
+	dl->light.type = emit_point;
+	SetLightFalloffParams( e, dl );
+
+	float radius = FloatForKeyWithDefault( e, "Radius",
+		FloatForKeyWithDefault( e, "radius", 16.0f ) );
+	if ( radius < 0.0f )
+		radius = 0.0f;
+	if ( radius > 512.0f )
+		radius = 512.0f;
+	dl->m_flVolumeRadius = radius;
+
+	Msg( "light_volume at (%.0f %.0f %.0f) radius %.1f\n",
+		 dest.x, dest.y, dest.z, radius );
+}
+
 /*
   =============
   CreateDirectLights
@@ -1762,6 +1785,10 @@ void CreateDirectLights (void)
 		{
 			ParseLightPoint( e, dl );
 		}
+		else if (!strcmp(name, "light_volume"))
+		{
+			ParseLightVolume( e, dl );
+		}
 		else
 		{
 			qprintf( "unsupported light entity: \"%s\"\n", name );
@@ -1878,6 +1905,48 @@ static void SoftSunSampleDelta( const Vector &axis, const Vector &t1, const Vect
 	const float phi = (float)i * 2.3999632f;	// golden angle
 	Vector dir = axis * cosTheta + ( t1 * cosf( phi ) + t2 * sinf( phi ) ) * sinTheta;
 	VectorScale( dir, MAX_TRACE_LENGTH, deltaOut );
+}
+
+// ---------------------------------------------------------------------------
+// Soft volume point light (light_volume): low-discrepancy sample points
+// uniformly inside a sphere of Radius. Sample 0 is the center; the rest
+// fill the ball so soft shadows look like soft-sun penumbras.
+// ---------------------------------------------------------------------------
+static int SoftVolumeSampleCount( float flRadius, bool bFast )
+{
+	if ( flRadius <= 0.0f )
+		return 1;
+	// ~16 samples at the default radius of 16; grows gently with size.
+	int n = 8 + (int)( flRadius * 0.5f );
+	if ( n > 40 )
+		n = 40;
+	if ( bFast )
+	{
+		n /= 3;
+		if ( n < 6 )
+			n = 6;
+	}
+	return n;
+}
+
+// Offset from the light center for sample i (uniform in the ball of radius R).
+static void SoftVolumeSampleOffset( float flRadius, int i, Vector &offsetOut )
+{
+	if ( i == 0 || flRadius <= 0.0f )
+	{
+		offsetOut.Init();
+		return;
+	}
+	// Radius via cube-root of radical inverse → uniform volume density.
+	const float u = SoftSunRadicalInverse( (unsigned int)i );
+	const float r = flRadius * cbrtf( u );
+	// Direction: golden-angle spiral on the unit sphere.
+	const float z = 1.0f - 2.0f * SoftSunRadicalInverse( (unsigned int)( i * 2 + 1 ) );
+	const float phi = (float)i * 2.3999632f;
+	const float sinTheta = sqrtf( fmaxf( 0.0f, 1.0f - z * z ) );
+	offsetOut.x = r * sinTheta * cosf( phi );
+	offsetOut.y = r * sinTheta * sinf( phi );
+	offsetOut.z = r * z;
 }
 
 // Helper function - gathers light from sun (emit_skylight)
@@ -2259,6 +2328,127 @@ static bool GatherSampleAmbientSkySSE_GPU( SSE_sampleLightOutput_t &out, directl
 	return true;
 }
 
+// Soft sphere point light: average falloff × N·L × visibility over sample
+// origins scattered inside m_flVolumeRadius (same spirit as soft sun).
+void GatherSampleVolumeLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, int facenum,
+								 FourVectors const& pos, FourVectors *pNormals, int normalCount, int iThread,
+								 int nLFlags, int static_prop_index_to_ignore,
+								 float flEpsilon )
+{
+	bool bIgnoreNormals = ( nLFlags & GATHERLFLAGS_IGNORE_NORMALS ) != 0;
+	bool force_fast = ( nLFlags & GATHERLFLAGS_FORCE_FAST ) != 0;
+	const float flRadius = dl->m_flVolumeRadius;
+	const int nsamples = SoftVolumeSampleCount( flRadius, do_fast || force_fast );
+
+	const bool bHasHardFalloff = ( dl->m_flEndFadeDistance > dl->m_flStartFadeDistance );
+	const fltx4 constant  = ReplicateX4( dl->light.constant_attn );
+	const fltx4 linear    = ReplicateX4( dl->light.linear_attn );
+	const fltx4 quadratic = ReplicateX4( dl->light.quadratic_attn );
+
+	fltx4 accumDot[NUM_BUMP_VECTS + 1];
+	for ( int i = 0; i < normalCount; i++ )
+		accumDot[i] = Four_Zeros;
+
+	int nTraced = nsamples;
+	const int probe = ( nsamples > 12 ) ? 8 : nsamples;
+	fltx4 totalVis = Four_Zeros;
+
+	for ( int s = 0; s < nsamples; s++ )
+	{
+		Vector offset;
+		SoftVolumeSampleOffset( flRadius, s, offset );
+
+		FourVectors src;
+		src.DuplicateVector( dl->light.origin + offset );
+
+		FourVectors delta = src;
+		delta -= pos;
+		fltx4 dist2 = delta.length2();
+		fltx4 rpcDist = ReciprocalSqrtSIMD( dist2 );
+		delta *= rpcDist;
+		fltx4 dist = SqrtEstSIMD( dist2 );
+
+		fltx4 dot = ReplicateX4( (float)CONSTANT_DOT );
+		if ( !bIgnoreNormals )
+			dot = delta * pNormals[0];
+		dot = MaxSIMD( Four_Zeros, dot );
+
+		if ( bHasHardFalloff )
+		{
+			fltx4 notPastFadeDist = CmpLeSIMD( dist, ReplicateX4( dl->m_flEndFadeDistance ) );
+			dot = AndSIMD( dot, notPastFadeDist );
+		}
+
+		dist = MaxSIMD( dist, Four_Ones );
+		fltx4 falloffEvalDist = MinSIMD( dist, ReplicateX4( dl->m_flCapDist ) );
+
+		fltx4 falloff = MulSIMD( falloffEvalDist, falloffEvalDist );
+		falloff = MulSIMD( falloff, quadratic );
+		falloff = AddSIMD( falloff, MulSIMD( linear, falloffEvalDist ) );
+		falloff = AddSIMD( falloff, constant );
+		falloff = ReciprocalSIMD( falloff );
+
+		if ( bHasHardFalloff )
+		{
+			fltx4 t = ReplicateX4( dl->m_flEndFadeDistance - dl->m_flStartFadeDistance );
+			t = ReciprocalSIMD( t );
+			t = MulSIMD( t, SubSIMD( dist, ReplicateX4( dl->m_flStartFadeDistance ) ) );
+			t = MinSIMD( t, Four_Ones );
+			t = MaxSIMD( t, Four_Zeros );
+			t = SubSIMD( Four_Ones, t );
+			fltx4 mult = SubSIMD( MulSIMD( ReplicateX4( 6.0f ), t ), ReplicateX4( 15.0f ) );
+			mult = AddSIMD( MulSIMD( mult, t ), ReplicateX4( 10.0f ) );
+			mult = MulSIMD( MulSIMD( t, t ), mult );
+			mult = MulSIMD( t, mult );
+			falloff = MulSIMD( mult, falloff );
+		}
+
+		fltx4 fractionVisible = Four_Ones;
+		if ( !( nLFlags & GATHERLFLAGS_SKIP_OCCLUSION ) )
+			TestLine( pos, src, &fractionVisible, static_prop_index_to_ignore );
+
+		totalVis = AddSIMD( totalVis, fractionVisible );
+		fltx4 sample = MulSIMD( MulSIMD( falloff, fractionVisible ), dot );
+		accumDot[0] = AddSIMD( accumDot[0], sample );
+
+		for ( int i = 1; i < normalCount; i++ )
+		{
+			fltx4 d = ReplicateX4( (float)CONSTANT_DOT );
+			if ( !bIgnoreNormals )
+			{
+				d = pNormals[i] * delta;
+				d = MaxSIMD( Four_Zeros, d );
+			}
+			accumDot[i] = AddSIMD( accumDot[i], MulSIMD( MulSIMD( falloff, fractionVisible ), d ) );
+		}
+
+		// Soft-sun style early-out: fully lit or fully shadowed after the probe.
+		if ( s + 1 == probe && nsamples > probe )
+		{
+			bool bUniform = true;
+			for ( int lane = 0; lane < 4; lane++ )
+			{
+				float f = SubFloat( totalVis, lane );
+				if ( f > 1e-4f && f < (float)probe - 1e-4f )
+				{
+					bUniform = false;
+					break;
+				}
+			}
+			if ( bUniform )
+			{
+				nTraced = probe;
+				break;
+			}
+		}
+	}
+
+	fltx4 invN = ReplicateX4( 1.0f / (float)nTraced );
+	out.m_flFalloff = Four_Ones;
+	for ( int i = 0; i < normalCount; i++ )
+		out.m_flDot[i] = MulSIMD( accumDot[i], invN );
+}
+
 // Helper function - gathers light from area lights, spot lights, and point lights
 void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, int facenum, 
 								  FourVectors const& pos, FourVectors *pNormals, int normalCount, int iThread,
@@ -2519,6 +2709,13 @@ void GatherSampleLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, int 
 		}
 		break;
 	case emit_point:
+		if ( dl->m_flVolumeRadius > 0.0f )
+		{
+			GatherSampleVolumeLightSSE( out, dl, facenum, pos, pNormals, normalCount,
+										iThread, nLFlags, static_prop_index_to_ignore, flEpsilon );
+			break;
+		}
+		// fall through
 	case emit_surface:
 	case emit_spotlight:
 		GatherSampleStandardLightSSE( out, dl, facenum, pos, pNormals, normalCount,

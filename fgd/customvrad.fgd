@@ -138,3 +138,17 @@
 	]
 	priority(integer) : "Priority" : 0 : "When volumes fully overlap (core), higher priority wins. Ties use the smaller volume."
 ]
+
+// -----------------------------------------------------------------------------
+// light_volume — soft sphere point light (POINT entity)
+// Same editor look/keys as stock light (Light base), plus Radius.
+// Requires garrysmod.fgd (or equivalent) loaded before this FGD.
+// -----------------------------------------------------------------------------
+@PointClass base(Targetname, Light) iconsprite("editor/light.vmt") sphere(_fifty_percent_distance) sphere(_zero_percent_distance) sphere(Radius) = light_volume :
+	"Compile-time soft volume point light for CustomVRAD. " +
+	"Same settings as a normal light, plus Radius. " +
+	"VRAD soft-samples the light origin inside a sphere (like soft sun, but omnidirectional) " +
+	"for soft shadows / penumbra. Exported to the engine as a normal point light at the center."
+[
+	Radius(float) : "Soft Radius" : "16" : "Sphere radius for soft-shadow sampling (world units). 0 = hard point. Default 16. Soft samples scale with radius (like SunSpreadAngle)."
+]

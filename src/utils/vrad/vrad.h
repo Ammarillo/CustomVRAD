@@ -96,6 +96,8 @@ struct directlight_t
 	int		m_nEnvId;
 	// Per-light sun soft-shadow extent (sin of degrees). Used by emit_skylight.
 	float	m_flSunAngularExtent;
+	// light_volume: soft-sample sphere radius in world units (0 = hard point).
+	float	m_flVolumeRadius;
 
 	directlight_t(void)
 	{
@@ -104,6 +106,7 @@ struct directlight_t
 		m_flCapDist = 1.0e22;
 		m_nEnvId = -1;
 		m_flSunAngularExtent = 0.0f;
+		m_flVolumeRadius = 0.0f;
 	}
 };
 

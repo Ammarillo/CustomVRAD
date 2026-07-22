@@ -16,6 +16,7 @@ Compatible lightmap / BSP lighting output for the engine. Experimental — valid
 | `light_env_vol` | brush entity | Local sky / sun / ambient override volumes |
 | `light_ao` / `light_ao_vol` | point / brush | Baked ambient occlusion (map-wide or local) |
 | `light_absorb` | brush entity | Volumes that damp bounce (and optional direct) light |
+| `light_volume` | point entity | Soft sphere point light (scattered origins, like soft sun) |
 | Soft sun | bake | Faster, smoother `SunSpreadAngle` / `-softsun` cone sampling |
 | Cross-face bounce weld | bake | Edge-weighted bounce across coplanar face seams |
 | Lightmap seam stitching | bake | Blends luxels across coplanar VBSP face splits (`-nostitch` to disable) |
@@ -40,6 +41,7 @@ Stock VRAD flags (`-hdr`, `-final`, `-StaticPropLighting`, `-textureshadows`, et
 | `light_ao` | Point entity (Entity Tool) |
 | `light_ao_vol` | Tie brush to entity |
 | `light_absorb` | Tie brush to entity |
+| `light_volume` | Point entity (Entity Tool) |
 
 Legacy classname `light_environment_volume` is still accepted for env volumes. Stock **VBSP** is fine — these entities are compile-time only.
 
@@ -118,6 +120,24 @@ Damps lighting inside a soft-blended brush volume.
 | `BlendDistance` / `BlendMode` / `priority` | like env vols | Soft fade + overlap |
 
 Start low — high strength can crush bounce.
+
+---
+
+## `light_volume` — soft sphere point light
+
+Point entity with the same keys as a normal `light` (inherits the stock `Light` base / editor icon), plus **`Radius`** (default **16**). Soft-samples the light origin with low-discrepancy points scattered **inside a sphere** of that radius — same idea as soft sun, but omnidirectional — so shadows get a soft penumbra instead of a hard point-light edge.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `_light` / `_lightHDR` / `_lightscaleHDR` | (standard) | Color and brightness |
+| `style` | `0` | Appearance / lightstyle |
+| `_constant_attn` / `_linear_attn` / `_quadratic_attn` | `0` / `0` / `1` | Falloff |
+| `_fifty_percent_distance` / `_zero_percent_distance` | `0` | Alternate falloff (overrides Constant/Linear/Quadratic) |
+| `_hardfalloff` | `0` | Hard fade to zero with falloff distances |
+| `_distance` | `0` | Max distance for engine worldlights |
+| `Radius` | `16` | Soft-sample sphere radius (world units). `0` = hard point |
+
+Sample count scales with radius (~16 at default 16, capped at 40; reduced with `-fast`). Fully lit / fully shadowed luxels early-out after a short probe. Exported to the engine as a normal **point** light at the center (softness is bake-only).
 
 ---
 
