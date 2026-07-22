@@ -173,7 +173,9 @@ After `FinalLightFace`, CustomVRAD blends luxels near each shared edge of coplan
 
 ## GPU (`-gpu`)
 
-Optional OpenCL path (needs a working OpenCL ICD; project links `OpenCL.lib` from `src/lib/public/x64`).
+Optional OpenCL path (project links `OpenCL.lib` from `src/lib/public/x64`).
+
+**OpenCL ICD:** usually already on the machine — NVIDIA, AMD, and Intel GPU drivers ship the OpenCL ICD / loader with a normal driver install. You do **not** need a separate OpenCL download for CustomVRAD, and it is **not** bundled in the release zip. If `-gpu` fails to find a device, update your GPU driver; without OpenCL, everything falls back to CPU.
 
 | Flag | Effect |
 |------|--------|
