@@ -54,3 +54,6 @@
 *.app
 *.exe
 bin/
+
+# Local map test assets (not for distribution)
+map_test/
