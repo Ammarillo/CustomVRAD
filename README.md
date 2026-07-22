@@ -18,6 +18,7 @@ Compatible lightmap / BSP lighting output for the engine. Experimental — valid
 | `light_absorb` | brush entity | Volumes that damp bounce (and optional direct) light |
 | Soft sun | bake | Faster, smoother `SunSpreadAngle` / `-softsun` cone sampling |
 | Cross-face bounce weld | bake | Edge-weighted bounce across coplanar face seams |
+| Lightmap seam stitching | bake | Blends luxels across coplanar VBSP face splits (`-nostitch` to disable) |
 | `-gpu` | CLI | OpenCL bounce gather, AO / sky occlusion, prop bounce culling |
 | `-coarse` / `-maxtransfer` / `-bounce_soft` | CLI | Faster / tunable radiosity |
 | Prop lighting speedups | bake | 4-wide SSE direct + GPU-culled bounce for `-StaticPropLighting` |
@@ -68,6 +69,8 @@ Brush that overrides sky, sun, and ambient **inside** its bounds. Outside (and i
 | `InsideCastShadowOut` | Yes | Inside geometry casts sun/sky shadows **outside** this volume |
 
 Bounds use the brush model AABB. Neighbor volumes use a soft Voronoi split so one volume’s outside halo does not tint another’s side.
+
+**Dynamic entities** (players, NPCs, physics props) are lit by the per-leaf ambient cubes, which CustomVRAD bakes volume-aware: rays that hit lit geometry pick up the volume-lit lightmaps, and rays that hit sky use the volume-blended `_ambient` at the sample position instead of the map default. Detail props get the same treatment. Limitation: the engine’s **dynamic sun** (`light_environment` worldlight) is global — a dynamic entity that can trace to sky still receives the map sun’s color/direction, not the volume’s. Enclosed volumes (no sky visibility) are unaffected by this.
 
 **Shadow filters** use the hard volume AABB (not the blend shell). Set `OutsideCastShadowIn` to No so outdoor walls/props don’t darken an interior volume; set `InsideCastShadowOut` to No so interior blockers don’t shadow the courtyard outside.
 
@@ -138,6 +141,16 @@ Tunable with `-bounce_soft N` (default `1`; range `0.5`–`4`; `<1` tighter).
 
 ---
 
+## Lightmap seam stitching
+
+Stock VRAD filters every face's lightmap independently, so coplanar faces split by VBSP (grid splits, brush boundaries) can land on slightly different luxel values along the shared edge — a faint brightness step even on flat, evenly lit surfaces.
+
+After `FinalLightFace`, CustomVRAD blends luxels near each shared edge of coplanar faces toward the neighbor's value at the same world position; at the edge both sides converge to the same average, removing the step. Applies per lightstyle and bump layer; displacements are skipped (they have their own edge rules).
+
+**On by default.** Disable with `-nostitch`.
+
+---
+
 ## GPU (`-gpu`)
 
 Optional OpenCL path (needs a working OpenCL ICD; project links `OpenCL.lib` from `src/lib/public/x64`).
@@ -168,6 +181,7 @@ Without `-gpu`, everything falls back to CPU.
 | `-coarse` | Patch chop `8` — fewer patches, faster VisLeafs / bounce |
 | `-maxtransfer N` | Skip patch transfers farther than N units |
 | `-bounce_soft N` | Bounce luxel splat scale (see bounce weld) |
+| `-nostitch` | Disable lightmap seam stitching across coplanar face splits |
 | `-threads N` | Override thread count (`1`–`256`) |
 
 Auto-detects logical processors (including >64 via processor groups). Work dispatch uses atomics so high thread counts scale better.

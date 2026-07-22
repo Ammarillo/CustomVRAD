@@ -124,6 +124,7 @@ bool		g_bStaticPropLighting = false;
 bool        g_bStaticPropPolys = false;
 bool        g_bTextureShadows = false;
 bool        g_bDisablePropSelfShadowing = false;
+bool        g_bStitchSeams = true;		// blend lightmap luxels across coplanar VBSP face splits
 
 
 CUtlVector<byte> g_FacesVisibleToLights;
@@ -2185,6 +2186,9 @@ bool RadWorld_Go()
 					 VRadGPU_HasScene() ? " [GPU occlusion]" : " [CPU]" );
 			}
 			RunThreadsOnIndividual (numfaces, true, FinalLightFace);
+
+			if ( g_bStitchSeams )
+				StitchLightmapSeams();
 		}
 		
 		// Distribute the lighting data to workers.
@@ -2518,6 +2522,11 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 				VRadGPU_SetRayBatchSize( atoi( argv[i] ) );
 				Msg( "GPU ray batch (-gpu_batch): %s\n", argv[i] );
 			}
+		}
+		else if ( !Q_stricmp( argv[i], "-nostitch" ) )
+		{
+			g_bStitchSeams = false;
+			Msg( "Lightmap seam stitching disabled (-nostitch).\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-coarse" ) )
 		{
@@ -3121,6 +3130,7 @@ void PrintUsage( int argc, char **argv )
 		"  -gpu_transfers  : Experimental GPU transfer rays (usually slower; not recommended).\n"
 		"  -coarse         : Larger lighting patches (chop 8) — faster VisLeafs/bounce.\n"
 		"  -bounce_soft N  : Bounce luxel splat scale (default 1=stock; <1 tighter; range 0.5..4).\n"
+		"  -nostitch       : Disable lightmap seam stitching across coplanar face splits.\n"
 		"  -maxtransfer N  : Skip patch transfers farther than N units (faster VisLeafs).\n"
 		"  -ao             : Bake cosine-weighted ambient occlusion into lightmaps.\n"
 		"  -ao_samples N   : AO rays per luxel (default 16). Implies -ao.\n"

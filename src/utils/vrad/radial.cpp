@@ -56,7 +56,7 @@ static float DistPointToSegment( const Vector &p, const Vector &a, const Vector 
 
 // 0 = skip (far from shared edge on coplanar neighbor), 1 = full.
 // Non-coplanar neighbors return 1 (keep stock neighbor bleed).
-static float BounceWeldWeight( int facenum, int neighborFace, const Vector &patchOrigin )
+static float BounceWeldWeight( int facenum, int neighborFace, const Vector &patchOrigin, float patchRadius )
 {
 	faceneighbor_t *fn = &faceneighbor[facenum];
 	faceneighbor_t *fnN = &faceneighbor[neighborFace];
@@ -92,10 +92,13 @@ static float BounceWeldWeight( int facenum, int neighborFace, const Vector &patc
 	if ( !bFoundShared )
 		return 1.0f;
 
-	if ( bestDist > BOUNCE_WELD_EDGE_DIST )
+	// Falloff length scales with patch size so the nearest row of neighbor
+	// patches always contributes (24 alone is below default chop spacing).
+	float weldDist = BOUNCE_WELD_EDGE_DIST + patchRadius;
+	if ( bestDist > weldDist )
 		return 0.0f;
 
-	float t = 1.0f - ( bestDist / BOUNCE_WELD_EDGE_DIST );
+	float t = 1.0f - ( bestDist / weldDist );
 	// smootherstep
 	return t * t * t * ( t * ( t * 6.0f - 15.0f ) + 10.0f );
 }
@@ -244,7 +247,8 @@ void AddBouncedToRadial( radial_t *rad,
 						 Vector const &pnt, 
 						 Vector2D const &coordmins, Vector2D const &coordmaxs, 
 						 Vector const light[NUM_BUMP_VECTS+1],
-						 bool hasBumpmap, bool neighborHasBumpmap  )
+						 bool hasBumpmap, bool neighborHasBumpmap,
+						 float flWeightScale = 1.0f )
 {
 	int     s_min, s_max, t_min, t_max;
 	Vector2D  coord;
@@ -300,6 +304,10 @@ void AddBouncedToRadial( radial_t *rad,
    
   			if (r > 0)
 			{
+				// Weld falloff scales both light and weight so the normalized
+				// result blends toward own-face patches instead of darkening.
+				r *= flWeightScale;
+
 				if( hasBumpmap )
 				{
 					if( neighborHasBumpmap )
@@ -465,24 +473,14 @@ radial_t *BuildPatchRadial( int facenum )
 				else
 					patchOrigin = patch->origin;
 
-				float weld = BounceWeldWeight( facenum, neighborFace, patchOrigin );
+				Vector patchExtent = patch->maxs - patch->mins;
+				float patchRadius = 0.5f * patchExtent.Length();
+				float weld = BounceWeldWeight( facenum, neighborFace, patchOrigin, patchRadius );
 				if ( weld <= 1e-4f )
 					continue;
 
-				if ( weld >= 0.999f )
-				{
-					AddBouncedToRadial( rad, patchOrigin, mins, maxs, patch->totallight.light,
-						needsBumpmap, needsBumpmap );
-				}
-				else
-				{
-					Vector scaled[NUM_BUMP_VECTS + 1];
-					int nBump = needsBumpmap ? ( NUM_BUMP_VECTS + 1 ) : 1;
-					for ( int b = 0; b < nBump; ++b )
-						VectorScale( patch->totallight.light[b], weld, scaled[b] );
-					AddBouncedToRadial( rad, patchOrigin, mins, maxs, scaled,
-						needsBumpmap, needsBumpmap );
-				}
+				AddBouncedToRadial( rad, patchOrigin, mins, maxs, patch->totallight.light,
+					needsBumpmap, needsBumpmap, weld );
 			}
 		}
 	}
@@ -998,4 +996,194 @@ void FinalLightFace( int iThread, int facenum )
 			VectorToColorRGBExp32( median, *pAvgColor );
 		}
 	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Lightmap seam stitching
+//
+// Every face gets its final lightmap filtered/normalized independently, so two
+// coplanar faces split by VBSP end up with slightly different luxel values
+// along their shared edge (a faint brightness step, also present in stock
+// VRAD). After FinalLightFace, blend luxels near each shared edge toward the
+// value the neighbor face has at the same world position; at the edge itself
+// both sides converge to the same average, removing the seam.
+//-----------------------------------------------------------------------------
+
+static const float STITCH_COPLANAR_DOT = 0.999f;	// ~2.5 degrees
+static const float STITCH_LUXEL_RANGE = 1.75f;		// stitch band, in luxels from the shared edge
+static const int   STITCH_MAX_EDGES = 32;			// shared segments per face pair
+
+static float DistPointToSegment2D( float px, float py, const Vector2D &a, const Vector2D &b )
+{
+	float abx = b.x - a.x, aby = b.y - a.y;
+	float ab2 = abx * abx + aby * aby;
+	float t = 0.0f;
+	if ( ab2 > 1e-6f )
+	{
+		t = ( ( px - a.x ) * abx + ( py - a.y ) * aby ) / ab2;
+		t = clamp( t, 0.0f, 1.0f );
+	}
+	float dx = px - ( a.x + abx * t );
+	float dy = py - ( a.y + aby * t );
+	return sqrtf( dx * dx + dy * dy );
+}
+
+// Bilinear sample of a face's lightmap (decoded to linear) from the snapshot buffer.
+static void StitchSampleLightmap( const byte *pSnapshot, const dface_t *f, int nLuxelsWide, int nLuxelsTall,
+								  int style, int bump, int bumpCount, float s, float t, Vector &out )
+{
+	const int numLuxels = nLuxelsWide * nLuxelsTall;
+	const byte *pBase = pSnapshot + f->lightofs + ( style * bumpCount + bump ) * numLuxels * 4;
+
+	s = clamp( s, 0.0f, (float)( nLuxelsWide - 1 ) );
+	t = clamp( t, 0.0f, (float)( nLuxelsTall - 1 ) );
+
+	int s0 = (int)s, t0 = (int)t;
+	int s1 = min( s0 + 1, nLuxelsWide - 1 );
+	int t1 = min( t0 + 1, nLuxelsTall - 1 );
+	float fs = s - s0, ft = t - t0;
+
+	Vector c00, c10, c01, c11;
+	ColorRGBExp32ToVector( *(const ColorRGBExp32 *)( pBase + ( s0 + t0 * nLuxelsWide ) * 4 ), c00 );
+	ColorRGBExp32ToVector( *(const ColorRGBExp32 *)( pBase + ( s1 + t0 * nLuxelsWide ) * 4 ), c10 );
+	ColorRGBExp32ToVector( *(const ColorRGBExp32 *)( pBase + ( s0 + t1 * nLuxelsWide ) * 4 ), c01 );
+	ColorRGBExp32ToVector( *(const ColorRGBExp32 *)( pBase + ( s1 + t1 * nLuxelsWide ) * 4 ), c11 );
+
+	out = c00 * ( ( 1.0f - fs ) * ( 1.0f - ft ) ) + c10 * ( fs * ( 1.0f - ft ) ) +
+		  c01 * ( ( 1.0f - fs ) * ft ) + c11 * ( fs * ft );
+}
+
+void StitchLightmapSeams()
+{
+	if ( !pdlightdata->Count() )
+		return;
+
+	// Snapshot the post-FinalLightFace data so every read sees unstitched
+	// values; this keeps the blend symmetric for both faces of a seam.
+	CUtlVector<byte> snapshot;
+	snapshot.SetCount( pdlightdata->Count() );
+	Q_memcpy( snapshot.Base(), pdlightdata->Base(), pdlightdata->Count() );
+
+	int nStitchedLuxels = 0;
+
+	for ( int facenum = 0; facenum < numfaces; ++facenum )
+	{
+		dface_t *f = &g_pFaces[facenum];
+		if ( texinfo[f->texinfo].flags & TEX_SPECIAL )
+			continue;
+		if ( f->lightofs < 0 || f->dispinfo != -1 )
+			continue;
+
+		facelight_t *fl = &facelight[facenum];
+		if ( !fl->numluxels || !fl->luxel )
+			continue;
+
+		lightinfo_t lA;
+		InitLightinfo( &lA, facenum );
+		const int wA = f->m_LightmapTextureSizeInLuxels[0] + 1;
+		const int bumpCountA = ( texinfo[f->texinfo].flags & SURF_BUMPLIGHT ) ? ( NUM_BUMP_VECTS + 1 ) : 1;
+
+		faceneighbor_t *fn = &faceneighbor[facenum];
+
+		for ( int j = 0; j < fn->numneighbors; ++j )
+		{
+			const int neighborFace = fn->neighbor[j];
+			dface_t *fB = &g_pFaces[neighborFace];
+			if ( texinfo[fB->texinfo].flags & TEX_SPECIAL )
+				continue;
+			if ( fB->lightofs < 0 || fB->dispinfo != -1 )
+				continue;
+
+			// only stitch across (nearly) coplanar seams
+			if ( DotProduct( fn->facenormal, faceneighbor[neighborFace].facenormal ) < STITCH_COPLANAR_DOT )
+				continue;
+
+			// collect shared edges, converted to A's luxel space
+			Vector2D edgeStart[STITCH_MAX_EDGES], edgeEnd[STITCH_MAX_EDGES];
+			int nEdges = 0;
+			for ( int ea = 0; ea < f->numedges && nEdges < STITCH_MAX_EDGES; ++ea )
+			{
+				int va0 = RadialEdgeVertex( f, ea );
+				int va1 = RadialEdgeVertex( f, ea + 1 );
+				for ( int eb = 0; eb < fB->numedges; ++eb )
+				{
+					int vb0 = RadialEdgeVertex( fB, eb );
+					int vb1 = RadialEdgeVertex( fB, eb + 1 );
+					if ( ( va0 == vb0 && va1 == vb1 ) || ( va0 == vb1 && va1 == vb0 ) )
+					{
+						WorldToLuxelSpace( &lA, dvertexes[va0].point, edgeStart[nEdges] );
+						WorldToLuxelSpace( &lA, dvertexes[va1].point, edgeEnd[nEdges] );
+						++nEdges;
+						break;
+					}
+				}
+			}
+			if ( !nEdges )
+				continue;
+
+			lightinfo_t lB;
+			InitLightinfo( &lB, neighborFace );
+			const int wB = fB->m_LightmapTextureSizeInLuxels[0] + 1;
+			const int hB = fB->m_LightmapTextureSizeInLuxels[1] + 1;
+			const int bumpCountB = ( texinfo[fB->texinfo].flags & SURF_BUMPLIGHT ) ? ( NUM_BUMP_VECTS + 1 ) : 1;
+			const int bumpCount = min( bumpCountA, bumpCountB );
+
+			for ( int i = 0; i < fl->numluxels; ++i )
+			{
+				const float s = (float)( i % wA );
+				const float t = (float)( i / wA );
+
+				float dist = 1e30f;
+				for ( int e = 0; e < nEdges; ++e )
+				{
+					float d = DistPointToSegment2D( s, t, edgeStart[e], edgeEnd[e] );
+					if ( d < dist )
+						dist = d;
+				}
+				if ( dist > STITCH_LUXEL_RANGE )
+					continue;
+
+				// 0.5 at the edge (both sides meet at the average), fading to 0
+				float x = 1.0f - ( dist / STITCH_LUXEL_RANGE );
+				float blend = 0.5f * x * x * ( 3.0f - 2.0f * x );
+
+				Vector2D coordB;
+				WorldToLuxelSpace( &lB, fl->luxel[i], coordB );
+
+				for ( int k = 0; k < MAXLIGHTMAPS && f->styles[k] != 255; ++k )
+				{
+					// matching style on the neighbor
+					int nstyle = -1;
+					for ( int ks = 0; ks < MAXLIGHTMAPS && fB->styles[ks] != 255; ++ks )
+					{
+						if ( fB->styles[ks] == f->styles[k] )
+						{
+							nstyle = ks;
+							break;
+						}
+					}
+					if ( nstyle < 0 )
+						continue;
+
+					for ( int b = 0; b < bumpCount; ++b )
+					{
+						const int ofsA = f->lightofs + ( k * bumpCountA + b ) * fl->numluxels * 4 + i * 4;
+
+						Vector colorA, colorB;
+						ColorRGBExp32ToVector( *(const ColorRGBExp32 *)( snapshot.Base() + ofsA ), colorA );
+						StitchSampleLightmap( snapshot.Base(), fB, wB, hB, nstyle, b, bumpCountB,
+											  coordB.x, coordB.y, colorB );
+
+						Vector stitched = colorA + ( colorB - colorA ) * blend;
+						VectorToColorRGBExp32( stitched, *(ColorRGBExp32 *)&(*pdlightdata)[ofsA] );
+					}
+				}
+
+				++nStitchedLuxels;
+			}
+		}
+	}
+
+	Msg( "Stitched %d seam luxel(s)\n", nStitchedLuxels );
 }

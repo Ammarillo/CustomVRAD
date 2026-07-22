@@ -18,6 +18,7 @@
 #include "studio.h"
 #include "pacifier.h"
 #include "vraddetailprops.h"
+#include "envvolume.h"
 #include "mathlib/halton.h"
 #include "messbuf.h"
 #include "byteswap.h"
@@ -138,6 +139,37 @@ static directlight_t* FindAmbientSkyLight()
 	return s_pCachedSkylight;
 }
 
+//-----------------------------------------------------------------------------
+// Sky ambient intensity (0..255 scale) at a world position, blending
+// light_env_vol ambient overrides by their volume weight. Falls back to the
+// single default ambient when no volumes exist.
+//-----------------------------------------------------------------------------
+void ComputeSkyAmbientAtPos( const Vector &pos, Vector &intensity )
+{
+	intensity.Init();
+
+	if ( !LightEnv_HasVolumes() )
+	{
+		directlight_t *pSkyLight = FindAmbientSkyLight();
+		if ( pSkyLight )
+			intensity = pSkyLight->light.intensity;
+		return;
+	}
+
+	for ( directlight_t *dl = activelights; dl != NULL; dl = dl->next )
+	{
+		if ( dl->light.type != emit_skyambient )
+			continue;
+
+		float flWeight = ( dl->m_nEnvId == LIGHTENV_ID_NONE ) ?
+			1.0f : LightEnv_GetWeight( dl->m_nEnvId, pos );
+		if ( flWeight <= 0.0f )
+			continue;
+
+		VectorMA( intensity, flWeight, dl->light.intensity, intensity );
+	}
+}
+
 
 //-----------------------------------------------------------------------------
 // Compute world center of a prop
@@ -251,20 +283,16 @@ static void ComputeMaxDirectLighting( DetailObjectLump_t& prop, Vector* maxcolor
 // Computes the ambient term from a particular surface
 //-----------------------------------------------------------------------------
 
-static void ComputeAmbientFromSurface( dface_t* pFace, directlight_t* pSkylight, 
+static void ComputeAmbientFromSurface( dface_t* pFace, const Vector &vSkyAmbient, 
 									   Vector& radcolor )
 {
 	texinfo_t* pTex = &texinfo[pFace->texinfo];
 	if (pTex)
 	{
-		// If we hit the sky, use the sky ambient
+		// If we hit the sky, use the sky ambient (volume-blended, 0..255 scale)
 		if (pTex->flags & SURF_SKY)
 		{
-			if (pSkylight)
-			{
-				// add in sky ambient
-				VectorDivide( pSkylight->light.intensity, 255.0f, radcolor ); 
-			}
+			VectorDivide( vSkyAmbient, 255.0f, radcolor ); 
 		}
 		else
 		{
@@ -278,17 +306,14 @@ static void ComputeAmbientFromSurface( dface_t* pFace, directlight_t* pSkylight,
 // Computes the lightmap color at a particular point
 //-----------------------------------------------------------------------------
 
-static void ComputeLightmapColorFromAverage( dface_t* pFace, directlight_t* pSkylight, float scale, Vector pColor[MAX_LIGHTSTYLES] )
+static void ComputeLightmapColorFromAverage( dface_t* pFace, const Vector &vSkyAmbient, float scale, Vector pColor[MAX_LIGHTSTYLES] )
 {
 	texinfo_t* pTex = &texinfo[pFace->texinfo];
 	if (pTex->flags & SURF_SKY)
 	{
-		if (pSkylight)
-		{
-			// add in sky ambient
-			Vector amb = pSkylight->light.intensity / 255.0f; 
-			pColor[0] += amb * scale;
-		}
+		// add in sky ambient (volume-blended)
+		Vector amb = vSkyAmbient / 255.0f; 
+		pColor[0] += amb * scale;
 		return;
 	}
 
@@ -302,7 +327,7 @@ static void ComputeLightmapColorFromAverage( dface_t* pFace, directlight_t* pSky
 		color[1] = TexLightToLinear( pAvgColor->g, pAvgColor->exponent );
 		color[2] = TexLightToLinear( pAvgColor->b, pAvgColor->exponent );
 
-		ComputeAmbientFromSurface( pFace, pSkylight, color );
+		ComputeAmbientFromSurface( pFace, vSkyAmbient, color );
 
 		int style = pFace->styles[maps];
 		pColor[style] += color * scale;
@@ -329,7 +354,7 @@ static bool SurfHasBumpedLightmaps( dface_t *pSurf )
 // Computes the lightmap color at a particular point
 //-----------------------------------------------------------------------------
 
-static void ComputeLightmapColorPointSample( dface_t* pFace, directlight_t* pSkylight, Vector2D const& luv, float scale, Vector pColor[MAX_LIGHTSTYLES] )
+static void ComputeLightmapColorPointSample( dface_t* pFace, const Vector &vSkyAmbient, Vector2D const& luv, float scale, Vector pColor[MAX_LIGHTSTYLES] )
 {
 	// face unaffected by light
 	if (pFace->lightofs == -1 )
@@ -358,7 +383,7 @@ static void ComputeLightmapColorPointSample( dface_t* pFace, directlight_t* pSky
 		color[1] = TexLightToLinear( pLightmap->g, pLightmap->exponent );
 		color[2] = TexLightToLinear( pLightmap->b, pLightmap->exponent );
 
-		ComputeAmbientFromSurface( pFace, pSkylight, color );
+		ComputeAmbientFromSurface( pFace, vSkyAmbient, color );
 		pColor[style] += color * scale;
 
 		pLightmap += offset;
@@ -591,12 +616,18 @@ bool CastRayInLeaf( int iThread, const Vector &start, const Vector &end, int lea
 // Computes ambient lighting along a specified ray.  
 // Ray represents a cone, tanTheta is the tan of the inner cone angle
 //-----------------------------------------------------------------------------
-void CalcRayAmbientLighting( int iThread, const Vector &vStart, const Vector &vEnd, float tanTheta, Vector color[MAX_LIGHTSTYLES] )
+void CalcRayAmbientLighting( int iThread, const Vector &vStart, const Vector &vEnd, float tanTheta, Vector color[MAX_LIGHTSTYLES],
+							 const Vector *pSkyAmbientAtStart )
 {
 	Ray_t ray;
 	ray.Init( vStart, vEnd, vec3_origin, vec3_origin );
 
-	directlight_t *pSkyLight = FindAmbientSkyLight();
+	// volume-blended sky ambient at the sample position (0..255 scale)
+	Vector vSkyAmbient;
+	if ( pSkyAmbientAtStart )
+		vSkyAmbient = *pSkyAmbientAtStart;
+	else
+		ComputeSkyAmbientAtPos( vStart, vSkyAmbient );
 
 	CLightSurface surfEnum(iThread);
 	if (!surfEnum.FindIntersection( ray ))
@@ -623,11 +654,11 @@ void CalcRayAmbientLighting( int iThread, const Vector &vStart, const Vector &vE
 
 	if (scaleAvg != 0)
 	{
-		ComputeLightmapColorFromAverage( surfEnum.m_pSurface, pSkyLight, scaleAvg, color );
+		ComputeLightmapColorFromAverage( surfEnum.m_pSurface, vSkyAmbient, scaleAvg, color );
 	}
 	if (scaleSample != 0)
 	{
-		ComputeLightmapColorPointSample( surfEnum.m_pSurface, pSkyLight, surfEnum.m_LuxelCoord, scaleSample, color );
+		ComputeLightmapColorPointSample( surfEnum.m_pSurface, vSkyAmbient, surfEnum.m_LuxelCoord, scaleSample, color );
 	}
 }
 
@@ -649,13 +680,17 @@ static void ComputeAmbientLightingAtPoint( int iThread, const Vector &origin, Ve
 		color[j].Init( 0,0,0 );
 	}
 
+	// same start position for all rays; compute the blended sky ambient once
+	Vector vSkyAmbient;
+	ComputeSkyAmbientAtPos( origin, vSkyAmbient );
+
 	float tanTheta = tan(VERTEXNORMAL_CONE_INNER_ANGLE);
 	for (int i = 0; i < NUMVERTEXNORMALS; i++)
 	{
 		VectorMA( origin, COORD_EXTENT * 1.74, g_anorms[i], upend );
 
 		// Now that we've got a ray, see what surface we've hit
-		CalcRayAmbientLighting( iThread, origin, upend, tanTheta, color );
+		CalcRayAmbientLighting( iThread, origin, upend, tanTheta, color, &vSkyAmbient );
 
 //		DumpRayToGlView( ray, surfEnum.m_HitFrac, &color[0], "test.out" );
 	}

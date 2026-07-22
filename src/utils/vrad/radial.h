@@ -73,6 +73,10 @@ void FreeRadial( radial_t *rad );
 bool SampleRadial( radial_t *rad, Vector& pnt, Vector light[NUM_BUMP_VECTS + 1], int bumpSampleCount );
 radial_t *BuildPatchRadial( int facenum );
 
+// CustomVRAD: post-FinalLightFace pass that blends luxels along shared edges
+// of coplanar faces so VBSP face splits don't show a brightness step.
+void StitchLightmapSeams();
+
 // utilities
 bool FloatLess( float const& src1, float const& src2 );
 

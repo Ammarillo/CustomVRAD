@@ -142,6 +142,10 @@ void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vect
 	Vector radcolor[NUMVERTEXNORMALS];
 	float tanTheta = tan(VERTEXNORMAL_CONE_INNER_ANGLE);
 
+	// volume-blended sky ambient at this sample point (light_env_vol aware)
+	Vector vSkyAmbient;
+	ComputeSkyAmbientAtPos( vStart, vSkyAmbient );
+
 	for ( int i = 0; i < NUMVERTEXNORMALS; i++ )
 	{
 		Vector vEnd = vStart + g_anorms[i] * (COORD_EXTENT * 1.74);
@@ -149,7 +153,7 @@ void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vect
 		// Now that we've got a ray, see what surface we've hit
 		Vector lightStyleColors[MAX_LIGHTSTYLES];
 		lightStyleColors[0].Init();	// We only care about light style 0 here.
-		CalcRayAmbientLighting( iThread, vStart, vEnd, tanTheta, lightStyleColors );
+		CalcRayAmbientLighting( iThread, vStart, vEnd, tanTheta, lightStyleColors, &vSkyAmbient );
 	
 		radcolor[i] = lightStyleColors[0];
 	}
