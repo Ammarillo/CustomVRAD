@@ -99,3 +99,46 @@
 	]
 	priority(integer) : "Priority" : 0 : "When volumes fully overlap (core), higher priority wins. Ties use the smaller volume."
 ]
+
+// -----------------------------------------------------------------------------
+// light_absorb — light absorber volume (brush)
+// Place like a trigger (tools/toolstrigger or nodraw).
+// -----------------------------------------------------------------------------
+@SolidClass base(Targetname) color(120 80 160) = light_absorb :
+	"Compile-time light absorber volume for CustomVRAD. " +
+	"Damps bounce (and optionally direct) lighting inside the volume. Soft blend like light_env_vol."
+[
+	Strength(float) : "Strength" : "0.5" : "How much light to absorb (0 = none, 1 = full). Soft-blended by Blend Distance."
+	AbsorbDirect(choices) : "Absorb Direct" : 0 : "Also damp direct lights (sun/point/spot) at sample positions." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	AbsorbBounce(choices) : "Absorb Bounce" : 1 : "Damp radiosity bounce through/into this volume." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	BlendDistance(float) : "Blend Distance" : 0 : "World units for the soft fade (smootherstep). 0 = hard cut."
+	BlendMode(choices) : "Blend Mode" : 2 : "Where Blend Distance is applied relative to the brush face." =
+	[
+		0 : "Inside (fade inward from face)"
+		1 : "Outside (fade outward from face)"
+		2 : "Center (fade straddles face)"
+	]
+	priority(integer) : "Priority" : 0 : "When volumes fully overlap (core), higher priority wins. Ties use the smaller volume."
+]
+
+// -----------------------------------------------------------------------------
+// light_portal — linked-space radiosity portal (brush)
+// Pair with targetname / target. Mutual targeting = bidirectional.
+// -----------------------------------------------------------------------------
+@SolidClass base(Targetname, Angles) color(80 200 255) = light_portal :
+	"Compile-time radiosity portal for CustomVRAD. " +
+	"Links two spaces so bounce lighting can transfer through the portal aperture. " +
+	"Set target to the other portal's targetname. If both target each other, transfer is bidirectional. " +
+	"Angles define the portal plane forward (exit direction)."
+[
+	target(target_destination) : "Target Portal" : : "targetname of the linked light_portal."
+	pitch(integer) : "Pitch" : 0 : "Overrides the pitch value in Angles."
+]

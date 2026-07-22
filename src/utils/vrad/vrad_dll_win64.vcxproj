@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -243,6 +243,8 @@ exit 1
     <ClInclude Include="disp_vrad.h" />
     <ClInclude Include="vrad_gpu.h" />
     <ClInclude Include="ao.h" />
+    <ClInclude Include="absorb.h" />
+    <ClInclude Include="portal.h" />
     <ClInclude Include="iincremental.h" />
     <ClInclude Include="imagepacker.h" />
     <ClInclude Include="incremental.h" />
@@ -363,6 +365,8 @@ exit 1
     <ClCompile Include="envvolume.cpp" />
     <ClCompile Include="vrad_gpu.cpp" />
     <ClCompile Include="ao.cpp" />
+    <ClCompile Include="absorb.cpp" />
+    <ClCompile Include="portal.cpp" />
     <ClCompile Include="lightmap.cpp" />
     <ClCompile Include="..\..\public\loadcmdline.cpp" />
     <ClCompile Include="..\..\public\lumpfiles.cpp" />

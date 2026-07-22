@@ -1,55 +1,58 @@
 # CustomVRAD
 
-Custom **VRAD** for **Garry’s Mod (64-bit)** / Source SDK 2013. Drop-in lighting compile with map entities and CLI options for environment volumes, baked ambient occlusion, and optional OpenCL acceleration.
+Custom **64-bit VRAD** for **Garry’s Mod** / Source SDK 2013. Drop-in lighting compile with map entities and CLI options built on top of stock VRAD.
 
-Compatible lightmap output for the engine. Experimental — validate looks on your maps before shipping.
+Compatible lightmap / BSP lighting output for the engine. Experimental — validate looks on your maps before shipping.
 
-**Repo:** https://github.com/Ammarillo/CustomVRAD
-
----
-
-## Features
-
-| Feature | What it does |
-|---------|----------------|
-| `light_env_vol` | Brush volumes that override sky/sun/ambient (same keys as `light_environment`) |
-| `light_ao` / `light_ao_vol` | Map-wide or local baked ambient occlusion in lightmaps |
-| `-gpu` | OpenCL bounce gather + batched sky/ambient occlusion |
-| `-coarse`, `-maxtransfer`, `-bounce_soft` | Faster / tunable radiosity |
-| High thread counts | Auto-detects cores (incl. >64 via processor groups), up to **256** threads |
-
-FGD for all custom entities: [`fgd/customvrad.fgd`](fgd/customvrad.fgd)
+**Repo:** https://github.com/Ammarillo/CustomVRAD  
+**FGD:** [`fgd/customvrad.fgd`](fgd/customvrad.fgd)
 
 ---
 
-## Hammer setup
+## What’s included
 
-1. **Tools → Options → Game Configurations → Game Data Files**
-2. Add `fgd/customvrad.fgd` **after** your game FGD (e.g. `garrysmod.fgd`)
-3. Restart Hammer
+| Feature | Type | Summary |
+|---------|------|---------|
+| `light_env_vol` | brush entity | Local sky / sun / ambient override volumes |
+| `light_ao` / `light_ao_vol` | point / brush | Baked ambient occlusion (map-wide or local) |
+| `light_absorb` | brush entity | Volumes that damp bounce (and optional direct) light |
+| `light_portal` | brush entity | Linked radiosity portals between spaces |
+| Soft sun | bake | Faster, smoother `SunSpreadAngle` / `-softsun` cone sampling |
+| Cross-face bounce weld | bake | Edge-weighted bounce across coplanar face seams |
+| `-gpu` | CLI | OpenCL bounce gather, AO / sky occlusion, prop bounce culling |
+| `-coarse` / `-maxtransfer` / `-bounce_soft` | CLI | Faster / tunable radiosity |
+| Prop lighting speedups | bake | 4-wide SSE direct + GPU-culled bounce for `-StaticPropLighting` |
+| Threading | runtime | Auto core detect (incl. >64), up to **256** threads |
 
-| Classname | Type | How to place |
-|-----------|------|----------------|
-| `light_env_vol` | brush | Tie brush to entity (trigger/nodraw) |
-| `light_ao` | **point** | Entity Tool → classname `light_ao` |
-| `light_ao_vol` | brush | Tie brush to entity (trigger/nodraw) |
-
-Legacy classname `light_environment_volume` is still accepted by VRAD for env volumes.
+Stock VRAD flags (`-hdr`, `-final`, `-StaticPropLighting`, `-textureshadows`, etc.) still work. Run `vrad.exe` with no args for the full stock list.
 
 ---
 
-## `light_env_vol` — sky/sun override volumes
+## Install / Hammer
 
-Compile-time brush that overrides sky/sun/ambient **inside** a volume. Outside (and in the blend shell) lighting mixes with the map’s `light_environment`. Volume lights are **not** exported as engine worldlights.
+1. Build or copy `bin\vrad.exe` + `bin\vrad_dll.dll` (and required Valve DLLs — see [Build](#build-windows)).
+2. Point Hammer’s **Custom VRAD** (or expert compile) at this `vrad.exe`.
+3. **Tools → Options → Game Configurations → Game Data Files** → add `fgd/customvrad.fgd` **after** `garrysmod.fgd` → restart Hammer.
 
-### Setup
+| Classname | Place as |
+|-----------|----------|
+| `light_env_vol` | Tie brush to entity (trigger / nodraw) |
+| `light_ao` | Point entity (Entity Tool) |
+| `light_ao_vol` | Tie brush to entity |
+| `light_absorb` | Tie brush to entity |
+| `light_portal` | Tie brush to entity; pair with `targetname` / `target` |
 
-1. Keep one map `light_environment` (global default).
-2. Make a brush with `tools/toolstrigger` or nodraw → **Tie to Entity** → `light_env_vol`.
-3. Set the same lighting keys as `light_environment`: `_light`, `_ambient`, `angles`, `pitch`, HDR keys, `SunSpreadAngle`.
-4. Tune optional blend / bounce keys below.
+Legacy classname `light_environment_volume` is still accepted for env volumes. Stock **VBSP** is fine — these entities are compile-time only.
 
-### Keys
+---
+
+## `light_env_vol` — sky / sun volumes
+
+Brush that overrides sky, sun, and ambient **inside** its bounds. Outside (and in the blend shell) mixes with the map `light_environment`. Volume lights are **not** exported as engine worldlights.
+
+1. Keep one map `light_environment` as the global default.
+2. Brush → Tie to Entity → `light_env_vol`.
+3. Set the same lighting keys as `light_environment`.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -57,81 +60,156 @@ Compile-time brush that overrides sky/sun/ambient **inside** a volume. Outside (
 | `_lightHDR` / `_ambientHDR` | `-1 -1 -1 1` | HDR overrides; leave default to use SDR |
 | `_lightscaleHDR` / `_AmbientScaleHDR` | `1` | HDR scales |
 | `pitch` | `0` | Overrides pitch in Angles |
-| `SunSpreadAngle` | `0` | Soft sun shadows (degrees) |
-| `BlendDistance` | `0` | Soft fade length in world units (`0` = hard cut). Uses Perlin smootherstep (C2); corners use softmin |
-| `BlendMode` | `2` Center | `0` Inside · `1` Outside · `2` Center (fade straddles face) |
-| `priority` | `0` | When cores fully overlap: higher wins; ties → smaller AABB |
-| `BounceVolColor` | No | Yes = recolor inbound radiosity bounce to this volume’s `_light` hue |
-| `BounceVolBright` | No | Only if BounceVolColor=Yes: also scale bounce luminance vs map `light_environment` |
+| `SunSpreadAngle` | `0` | Soft sun cone (degrees); uses CustomVRAD soft-sun sampler |
+| `BlendDistance` | `0` | Soft fade length (`0` = hard cut). Perlin smootherstep |
+| `BlendMode` | `2` Center | `0` Inside · `1` Outside · `2` Center |
+| `priority` | `0` | Overlapping cores: higher wins; ties → smaller AABB |
+| `BounceVolColor` | No | Recolor inbound radiosity to this volume’s `_light` hue |
+| `BounceVolBright` | No | With BounceVolColor: also scale bounce luminance vs map env |
 
-### Behavior notes
-
-- Bounds use the brush **model AABB** (axis-aligned).
-- Neighbor volumes use a soft **Voronoi** split so one volume’s outside halo does not tint another’s side.
-- Overlapping blend shells mix by weight; leftover weight goes to the default `light_environment`.
-- Env weights are cached per sample group for threading performance.
+Bounds use the brush model AABB. Neighbor volumes use a soft Voronoi split so one volume’s outside halo does not tint another’s side.
 
 ---
 
 ## Ambient occlusion — `-ao`, `light_ao`, `light_ao_vol`
 
-Optional cosine-weighted hemisphere AO baked into lightmaps during `FinalLightFace` (after direct + bounce, before `_minlight` / pack).
+Cosine-weighted hemisphere AO baked into lightmaps in `FinalLightFace` (after direct + bounce).
 
-### Ways to enable
+**Enable via:** CLI `-ao` / `-ao_*`, point `light_ao` (map defaults), and/or brush `light_ao_vol` (local overrides). Combine freely.
 
-1. **CLI:** `-ao` / `-ao_*` (compile defaults)
-2. **Point entity `light_ao`:** map-wide toggle + settings (overrides CLI defaults when present)
-3. **Brush `light_ao_vol`:** local override (blend like `light_env_vol`)
-
-You can combine them: CLI or `light_ao` for the map default, volumes for local stronger/weaker/off regions.
-
-### CLI flags
+### CLI
 
 | Flag | Default | Effect |
 |------|---------|--------|
 | `-ao` | off | Enable AO pass |
-| `-ao_samples N` | `16` | Rays per luxel (implies `-ao`). Reduced automatically with `-fast` |
-| `-ao_distance N` | `48` | Max ray length in world units (implies `-ao`) |
-| `-ao_strength N` | `1.0` | Darkening; may be **>1** to boost (max `8`). Implies `-ao` |
-| `-ao_bias N` | `0.25` | Offset along surface normal to reduce self-hit (implies `-ao`) |
-| `-ao_denoise` | off | Edge-preserving bilateral denoise on AO luxels |
-| `-ao_denoise_radius N` | `1` | Denoise radius `1..4` (implies denoise) |
-| `-ao_denoise_strength N` | `1.0` | Denoise blend `0..1` (implies denoise) |
+| `-ao_samples N` | `16` | Rays per luxel (implies `-ao`; reduced with `-fast`) |
+| `-ao_distance N` | `48` | Max ray length (implies `-ao`) |
+| `-ao_strength N` | `1.0` | Darkening `0`–`8` (implies `-ao`) |
+| `-ao_bias N` | `0.25` | Normal offset (implies `-ao`) |
+| `-ao_denoise` | off | Edge-preserving bilateral denoise |
+| `-ao_denoise_radius N` | `1` | Radius `1`–`4` |
+| `-ao_denoise_strength N` | `1.0` | Blend `0`–`1` |
 
 ### Entity keys
 
-**`light_ao` (point)** and **`light_ao_vol` (brush)** share:
+Shared by `light_ao` and `light_ao_vol`: `Enabled`, `Samples`, `Distance`, `Strength`, `Bias`.
+
+`light_ao` only: `Denoise`, `DenoiseRadius`, `DenoiseStrength`.  
+`light_ao_vol` only: `BlendDistance` / `BlendMode` / `priority` (same idea as env vols).
+
+Volumes soft-blend settings. `Enabled=No` carves AO out; `Enabled=Yes` can add AO when the map default is off. With `-gpu`, AO uses batched OpenCL occlusion when available.
+
+---
+
+## `light_absorb` — absorber volumes
+
+Damps lighting inside a soft-blended brush volume.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `Enabled` | Yes | Master / local AO on-off |
-| `Samples` | `16` | Hemisphere rays per luxel |
-| `Distance` | `48` | Max ray length |
-| `Strength` | `1.0` | Darkening (`0`–`8`) |
-| `Bias` | `0.25` | Normal offset |
+| `Strength` | `0.5` | Absorb amount (`0`–`1`) |
+| `AbsorbDirect` | No | Also damp direct lights at luxels |
+| `AbsorbBounce` | Yes | Damp radiosity gather |
+| `BlendDistance` / `BlendMode` / `priority` | like env vols | Soft fade + overlap |
 
-`light_ao` only (global face filter):
+Start low — high strength can crush bounce.
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `Denoise` | No | Edge-preserving AO filter |
-| `DenoiseRadius` | `1` | Luxel radius (`1` = 3×3, `2` = 5×5) |
-| `DenoiseStrength` | `1.0` | Blend toward filtered AO (`0..1`) |
+---
 
-`light_ao_vol` only:
+## `light_portal` — radiosity portals
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `BlendDistance` / `BlendMode` / `priority` | same idea as `light_env_vol` | Soft fade + overlap resolution |
+Links two spaces so bounce can transfer through an aperture.
 
-### AO behavior notes
+- Set `target` to the other portal’s `targetname`.
+- Mutual targeting = **bidirectional**.
+- **Angles** / `pitch` define portal plane forward (exit direction).
 
-- Volumes soft-blend settings (samples use the **max** of contributors; distance/strength/bias are weight-averaged). Soft Voronoi keeps neighboring shells from fighting.
-- `Enabled=No` on a volume carves out AO when the map default is on; `Enabled=Yes` can add AO when the default is off.
-- With `-gpu`, AO uses batched OpenCL occlusion when available; otherwise CPU `TestLine`.
-- Affects baked lightmaps only (not a runtime effect).
+Keep portals thin and facing the rooms they connect. Uses aperture UV remap + angle rotation for transfer rays.
 
-### Example
+---
+
+## Soft sun (`SunSpreadAngle` / `-softsun`)
+
+Replaces stock’s fixed 30 random rays:
+
+- **Low-discrepancy cone** (golden-angle spiral) — smooth penumbras, less noise at large angles
+- **Adaptive sample count** — scales with angle (~9 at 2°, up to ~40 at 50°)
+- **Early-out** — fully lit / fully shadowed luxels stop after a short probe; only penumbra pays full cost
+
+`0` = hard sun. Typical soft look: **0.5–3°**. Very large angles (e.g. 50°) still cost more, but less than stock and look cleaner.
+
+---
+
+## Cross-face bounce welding
+
+When bounce is written into lightmaps, coplanar neighbor faces that share an edge contribute with **edge-distance falloff**. Distant patches no longer smear rectangular GI across the seam. Non-coplanar neighbors keep the stock neighbor splat.
+
+Tunable with `-bounce_soft N` (default `1`; range `0.5`–`4`; `<1` tighter).
+
+---
+
+## GPU (`-gpu`)
+
+Optional OpenCL path (needs a working OpenCL ICD; project links `OpenCL.lib` from `src/lib/public/x64`).
+
+| Flag | Effect |
+|------|--------|
+| `-gpu` | Bounce gather + batched AO / sky occlusion BVH |
+| `-gpu_maxtris N` | Optional BVH triangle cap (`0` = unlimited) |
+| `-gpu_batch N` | Rays per dispatch (default **32768**; lower = safer vs TDR) |
+| `-gpu_transfers` | Experimental GPU transfer rays — usually **slower**, not recommended |
+
+Also used when present:
+
+- Soft-sun / sky closest-hit batches
+- Static-prop **indirect** ray pre-cull (skip BSP walk for sky / miss)
+
+**Stability:** small ray batches, chunked uploads, device alloc checks, auto CPU fallback on OpenCL errors.  
+**Throughput:** each CPU worker can use its own OpenCL queue + ray buffers (pool up to 64) so dispatches overlap instead of serializing on one queue.
+
+Without `-gpu`, everything falls back to CPU.
+
+---
+
+## Radiosity / speed CLI
+
+| Flag | Effect |
+|------|--------|
+| `-coarse` | Patch chop `8` — fewer patches, faster VisLeafs / bounce |
+| `-maxtransfer N` | Skip patch transfers farther than N units |
+| `-bounce_soft N` | Bounce luxel splat scale (see bounce weld) |
+| `-threads N` | Override thread count (`1`–`256`) |
+
+Auto-detects logical processors (including >64 via processor groups). Work dispatch uses atomics so high thread counts scale better.
+
+---
+
+## Static prop lighting (`-StaticPropLighting`)
+
+CustomVRAD speedups on top of stock prop vertex lighting:
+
+- **4 vertices per SSE gather** for direct light (stock duplicated one vert across all lanes)
+- **GPU bounce-ray culling** with `-gpu` (sky / miss rays skip the BSP lightmap walk)
+
+Quality flags like `-StaticPropPolys` / `-TextureShadows` still apply and are expensive — drop them for preview compiles.
+
+---
+
+## Example commands
+
+**Quality:**
+
+```bat
+PathToCustomVRAD\bin\vrad.exe -hdr -final -StaticPropLighting -textureshadows -ao -ao_samples 32 -gpu -game "PathToGarrysMod\garrysmod" "PathToMap\map"
+```
+
+**Preview:**
+
+```bat
+PathToCustomVRAD\bin\vrad.exe -hdr -fast -coarse -ao -ao_samples 8 -gpu -game "PathToGarrysMod\garrysmod" "PathToMap\map"
+```
+
+**AO-focused:**
 
 ```bat
 vrad.exe -ao -ao_samples 32 -ao_distance 64 -ao_strength 0.85 -ao_denoise -gpu -hdr -game "<gmod>\garrysmod" "<map>"
@@ -139,90 +217,29 @@ vrad.exe -ao -ao_samples 32 -ao_distance 64 -ao_strength 0.85 -ao_denoise -gpu -
 
 ---
 
-## Speed & GPU options
-
-```bat
-vrad.exe -gpu -coarse -maxtransfer 2048 -hdr -game "<gmod>\garrysmod" "<map>"
-```
-
-| Flag | Effect |
-|------|--------|
-| `-gpu` | OpenCL bounce gather + batched ambient/sky occlusion (BVH). Transfer rays stay on CPU SSE |
-| `-coarse` | Patch chop `8` (fewer patches → faster VisLeafs/bounce) |
-| `-bounce_soft N` | Bounce luxel splat scale (default **0.75** = tighter than stock; `1` = stock; range `0.5`–`4`) |
-| `-maxtransfer N` | Skip patch transfers farther than N units (helps large maps) |
-| `-gpu_transfers` | Experimental GPU transfer rays — usually **slower**, not recommended |
-
-Requires a working **OpenCL ICD**. The project links `OpenCL.lib` from `src/lib/public/x64`.
-
-### Threading
-
-- Auto-detects logical processors (including >64 via processor groups), up to **256** threads.
-- Override with `-threads N` (clamped to `1`–`256`).
-- Work dispatch uses atomics (not a global lock) so high thread counts scale better.
-
----
-
-## Typical compile commands
-
-**Quality (HDR + AO + GPU):**
-
-```bat
-PathToCustomVRAD\bin\vrad.exe -hdr -final -StaticPropLighting -textureshadows -ao -ao_samples 32 -gpu -game "PathToGarrysMod\garrysmod" "PathToMap\map"
-```
-
-**Preview (fast):**
-
-```bat
-PathToCustomVRAD\bin\vrad.exe -hdr -fast -coarse -ao -ao_samples 8 -gpu -game "PathToGarrysMod\garrysmod" "PathToMap\map"
-```
-
-Stock VRAD flags (`-bounce`, `-final`, `-StaticPropLighting`, etc.) work as usual — run `vrad.exe` with no args for the full list.
-
----
-
 ## Build (Windows)
 
-### Requirements
-
-- Visual Studio 2022 (Desktop C++, MSVC v143, Windows 10/11 SDK)
-- OpenCL SDK / ICD for `-gpu` (optional if you never use GPU)
-
-### Build
+**Needs:** Visual Studio 2022 (Desktop C++, MSVC v143, Windows 10/11 SDK). OpenCL SDK/ICD only if you use `-gpu`.
 
 1. Open `src/Source GPU compiles tool (L-I).sln`
-2. Build **Release | x64** (not Debug)
-3. Outputs land under `/bin/`
+2. Build **Release | x64**
+3. Outputs under `/bin/` — mainly `vrad_dll_win64` / launcher
 
-Relevant projects: `vrad_dll_win64`, `vrad_launcher_win64`.
-
-### Runtime layout under `/bin/`
+**Runtime next to `vrad.exe`:**
 
 ```
 vrad.exe
 vrad_dll.dll
 tier0.dll
 vstdlib.dll
-vphysics.dll          <- use GMod's vphysics_stub.dll renamed/copied as vphysics.dll
-vphysics_stub.dll
+vphysics.dll          ← use GMod's vphysics_stub.dll copied as vphysics.dll
 bin/x64/filesystem_stdio.dll
-bin/x64/vphysics.dll  <- same stub copy
+bin/x64/vphysics.dll  ← same stub
 ```
 
-Do **not** place GMod `bin/win64/vphysics.dll` next to this build — it needs GMod’s `tier0` and fails with `Unable to load vphysics DLL`. Use **`vphysics_stub.dll`** from GMod win64 (copied as `vphysics.dll`) instead.
+Do **not** use GMod `bin/win64/vphysics.dll` here — it needs GMod’s `tier0` and fails with `Unable to load vphysics DLL`.
 
----
-
-## Platform
-
-- **Windows** only for now
-- Linux not supported
-
----
-
-## Lineage
-
-Based on Source SDK 2013 tooling adapted for Garry’s Mod (64-bit), including work from [Ficool2’s Source SDK 2013 fork](https://github.com/ficool2/source-sdk-2013) and related compile-tool experiments. This repo focuses on **CustomVRAD** features above; older VVIS/OpenCL experiments are not the product focus here.
+**Platform:** Windows only.
 
 ---
 
@@ -230,12 +247,4 @@ Based on Source SDK 2013 tooling adapted for Garry’s Mod (64-bit), including w
 
 **SOURCE 1 SDK LICENSE** — see [LICENSE](LICENSE). Derived work remains under the same non-commercial terms.
 
----
-
-## References
-
-- [Source SDK 2013](https://developer.valvesoftware.com/wiki/Source_SDK_2013)
-- [Ficool2 — Source SDK 2013](https://github.com/ficool2/source-sdk-2013)
-- [Ficool2 — Hammer++ tools](https://ficool2.github.io/HammerPlusPlus-Website/tools.html)
-- [OpenCL](https://www.khronos.org/opencl/)
-- [Garry’s Mod Wiki](https://wiki.facepunch.com/gmod/)
+Based on Source SDK 2013 tooling adapted for Garry’s Mod (64-bit), including work from [Ficool2’s Source SDK 2013 fork](https://github.com/ficool2/source-sdk-2013).

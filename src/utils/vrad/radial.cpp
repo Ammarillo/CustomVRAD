@@ -16,8 +16,89 @@
 #include "ao.h"
 #include "tier1/utlvector.h"
 
-// Bounce luxel splat vs stock RADIALDIST. <1 = tighter (default); >1 = wider.
-float g_flBounceRadialScale = 0.75f;
+// Bounce luxel splat vs stock RADIALDIST. 1 = stock; <1 tighter; >1 wider.
+float g_flBounceRadialScale = 1.0f;
+
+// Cross-face bounce weld: coplanar neighbor patches near a shared edge
+// contribute with edge falloff (reduces rectangular GI seams).
+static const float BOUNCE_WELD_COPLANAR_DOT = 0.985f;	// ~10 deg
+static const float BOUNCE_WELD_EDGE_DIST = 24.0f;
+
+static int RadialEdgeVertex( dface_t *f, int edge )
+{
+	if ( edge < 0 )
+		edge += f->numedges;
+	else if ( edge >= f->numedges )
+		edge = edge % f->numedges;
+
+	int k = dsurfedges[f->firstedge + edge];
+	if ( k < 0 )
+		return dedges[-k].v[1];
+	return dedges[k].v[0];
+}
+
+static float DistPointToSegment( const Vector &p, const Vector &a, const Vector &b )
+{
+	Vector ab = b - a;
+	float ab2 = DotProduct( ab, ab );
+	if ( ab2 < 1e-6f )
+	{
+		Vector d = p - a;
+		return sqrtf( DotProduct( d, d ) );
+	}
+	float t = DotProduct( p - a, ab ) / ab2;
+	if ( t < 0.0f ) t = 0.0f;
+	if ( t > 1.0f ) t = 1.0f;
+	Vector closest = a + ab * t;
+	Vector d = p - closest;
+	return sqrtf( DotProduct( d, d ) );
+}
+
+// 0 = skip (far from shared edge on coplanar neighbor), 1 = full.
+// Non-coplanar neighbors return 1 (keep stock neighbor bleed).
+static float BounceWeldWeight( int facenum, int neighborFace, const Vector &patchOrigin )
+{
+	faceneighbor_t *fn = &faceneighbor[facenum];
+	faceneighbor_t *fnN = &faceneighbor[neighborFace];
+
+	float ndot = DotProduct( fn->facenormal, fnN->facenormal );
+	if ( ndot < BOUNCE_WELD_COPLANAR_DOT )
+		return 1.0f;
+
+	dface_t *fA = &g_pFaces[facenum];
+	dface_t *fB = &g_pFaces[neighborFace];
+
+	float bestDist = 1e30f;
+	bool bFoundShared = false;
+	for ( int ea = 0; ea < fA->numedges; ++ea )
+	{
+		int va0 = RadialEdgeVertex( fA, ea );
+		int va1 = RadialEdgeVertex( fA, ea + 1 );
+		for ( int eb = 0; eb < fB->numedges; ++eb )
+		{
+			int vb0 = RadialEdgeVertex( fB, eb );
+			int vb1 = RadialEdgeVertex( fB, eb + 1 );
+			bool shared = ( va0 == vb0 && va1 == vb1 ) || ( va0 == vb1 && va1 == vb0 );
+			if ( !shared )
+				continue;
+			bFoundShared = true;
+			float d = DistPointToSegment( patchOrigin, dvertexes[va0].point, dvertexes[va1].point );
+			if ( d < bestDist )
+				bestDist = d;
+		}
+	}
+
+	// No exact shared edge (T-junction etc.) — keep stock neighbor splat.
+	if ( !bFoundShared )
+		return 1.0f;
+
+	if ( bestDist > BOUNCE_WELD_EDGE_DIST )
+		return 0.0f;
+
+	float t = 1.0f - ( bestDist / BOUNCE_WELD_EDGE_DIST );
+	// smootherstep
+	return t * t * t * ( t * ( t * 6.0f - 15.0f ) + 10.0f );
+}
 
 
 void WorldToLuxelSpace( lightinfo_t const *l, Vector const &world, Vector2D &coord )
@@ -356,9 +437,10 @@ radial_t *BuildPatchRadial( int facenum )
 
 	for (j=0 ; j<fn->numneighbors; j++)
 	{
-		if( g_FacePatches.Element( fn->neighbor[j] ) != g_FacePatches.InvalidIndex() )
+		const int neighborFace = fn->neighbor[j];
+		if( g_FacePatches.Element( neighborFace ) != g_FacePatches.InvalidIndex() )
 		{
-			for( patch = &g_Patches.Element( g_FacePatches.Element( fn->neighbor[j] ) ); patch; patch = pNextPatch )
+			for( patch = &g_Patches.Element( g_FacePatches.Element( neighborFace ) ); patch; patch = pNextPatch )
 			{
 				// next patch
 				pNextPatch = NULL;
@@ -376,22 +458,29 @@ radial_t *BuildPatchRadial( int facenum )
 				PatchLightmapCoordRange( rad, ndxPatch, mins, maxs  );
 				
 				neighborNeedsBumpmap = texinfo[g_pFaces[facenum].texinfo].flags & SURF_BUMPLIGHT ? true : false;
-				
-				//
-				// displacement surface patch origin position and normal vectors have been changed to
-				// represent the displacement surface position and normal -- for radial "blending"
-				// we need to get the base surface patch origin!
-				//
-				if( ValidDispFace( &g_pFaces[fn->neighbor[j]] ) )
+
+				Vector patchOrigin;
+				if( ValidDispFace( &g_pFaces[neighborFace] ) )
+					WindingCenter( patch->winding, patchOrigin );
+				else
+					patchOrigin = patch->origin;
+
+				float weld = BounceWeldWeight( facenum, neighborFace, patchOrigin );
+				if ( weld <= 1e-4f )
+					continue;
+
+				if ( weld >= 0.999f )
 				{
-					Vector patchOrigin;
-					WindingCenter (patch->winding, patchOrigin );
-					AddBouncedToRadial( rad, patchOrigin, mins, maxs, patch->totallight.light, 
-						needsBumpmap, needsBumpmap );			
+					AddBouncedToRadial( rad, patchOrigin, mins, maxs, patch->totallight.light,
+						needsBumpmap, needsBumpmap );
 				}
 				else
 				{
-					AddBouncedToRadial( rad, patch->origin, mins, maxs, patch->totallight.light,
+					Vector scaled[NUM_BUMP_VECTS + 1];
+					int nBump = needsBumpmap ? ( NUM_BUMP_VECTS + 1 ) : 1;
+					for ( int b = 0; b < nBump; ++b )
+						VectorScale( patch->totallight.light[b], weld, scaled[b] );
+					AddBouncedToRadial( rad, patchOrigin, mins, maxs, scaled,
 						needsBumpmap, needsBumpmap );
 				}
 			}

@@ -1208,6 +1208,86 @@ void ComputeDirectLightingAtPoint( Vector &position, Vector &normal, Vector &out
 }
 
 //-----------------------------------------------------------------------------
+// Same as ComputeDirectLightingAtPoint, but lights up to 4 vertices per
+// gather call — one traced ray set serves 4 verts instead of duplicating
+// one vertex across all SSE lanes (~4x fewer traces for prop vertices).
+//-----------------------------------------------------------------------------
+static void ComputeDirectLightingAtPoints4( const Vector *positions, const Vector *normals,
+											Vector *outColors, int nCount, int iThread,
+											int static_prop_id_to_skip = -1, int nLFlags = 0 )
+{
+	SSE_sampleLightOutput_t	sampleOutput;
+
+	Vector pos[4], nrm[4];
+	int clusters[4];
+	for ( int i = 0; i < 4; i++ )
+	{
+		const int src = ( i < nCount ) ? i : 0;
+		pos[i] = positions[src];
+		nrm[i] = normals[src];
+	}
+	for ( int i = 0; i < nCount; i++ )
+		outColors[i].Init();
+	for ( int i = 0; i < 4; i++ )
+		clusters[i] = ClusterFromPoint( pos[i] );
+
+	for ( directlight_t *dl = activelights; dl != NULL; dl = dl->next )
+	{
+		if ( dl->light.style )
+			continue;
+
+		float pvsMask[4];
+		bool bAnyVisible = false;
+		for ( int i = 0; i < 4; i++ )
+		{
+			pvsMask[i] = PVSCheck( dl->pvs, clusters[i] ) ? 1.0f : 0.0f;
+			if ( i < nCount && pvsMask[i] > 0.0f )
+				bAnyVisible = true;
+		}
+		if ( !bAnyVisible )
+			continue;
+
+		// push each vertex towards the light to avoid surface acne
+		Vector adjusted[4];
+		for ( int i = 0; i < 4; i++ )
+		{
+			adjusted[i] = pos[i];
+			if ( dl->light.type != emit_skyambient )
+			{
+				Vector fudge;
+				if ( dl->light.type == emit_skylight )
+					fudge = -( dl->light.normal );
+				else
+				{
+					fudge = dl->light.origin - pos[i];
+					VectorNormalize( fudge );
+				}
+				adjusted[i] += fudge * 4.0f;
+			}
+			else
+			{
+				adjusted[i] += 4.0f * nrm[i];
+			}
+		}
+
+		FourVectors adjusted_pos4;
+		FourVectors normal4;
+		adjusted_pos4.LoadAndSwizzle( adjusted[0], adjusted[1], adjusted[2], adjusted[3] );
+		normal4.LoadAndSwizzle( nrm[0], nrm[1], nrm[2], nrm[3] );
+
+		GatherSampleLightSSE( sampleOutput, dl, -1, adjusted_pos4, &normal4, 1, iThread,
+							  nLFlags | GATHERLFLAGS_FORCE_FAST, static_prop_id_to_skip, 0.0f );
+
+		for ( int i = 0; i < nCount; i++ )
+		{
+			float scale = pvsMask[i] * sampleOutput.m_flFalloff.m128_f32[i] * sampleOutput.m_flDot[0].m128_f32[i];
+			if ( scale > 0.0f )
+				VectorMA( outColors[i], scale, dl->light.intensity, outColors[i] );
+		}
+	}
+}
+
+//-----------------------------------------------------------------------------
 // Takes the results from a ComputeLighting call and applies it to the static prop in question.
 //-----------------------------------------------------------------------------
 void CVradStaticPropMgr::ApplyLightingToStaticProp( int iStaticProp, CStaticProp &prop, const CComputeStaticPropLightingResults *pResults )
@@ -1378,6 +1458,14 @@ void CVradStaticPropMgr::ComputeLighting( CStaticProp &prop, int iThread, int pr
 				}
 
 				// If we do lightmapping, we also do vertex lighting as a potential fallback. This may change.
+				// Collect valid vertices first, then light them 4 per SSE gather call.
+				CUtlVector<int> validIdx;
+				CUtlVector<Vector> validPos;
+				CUtlVector<Vector> validNrm;
+				validIdx.EnsureCapacity( pStudioMesh->numvertices );
+				validPos.EnsureCapacity( pStudioMesh->numvertices );
+				validNrm.EnsureCapacity( pStudioMesh->numvertices );
+
 				for ( int vertexID = 0; vertexID < pStudioMesh->numvertices; ++vertexID )
 				{
 					Vector sampleNormal;
@@ -1397,37 +1485,48 @@ void CVradStaticPropMgr::ComputeLighting( CStaticProp &prop, int iThread, int pr
 					}
 					else
 					{
-						Vector direct_pos=samplePosition;
-							
-						
-
-						Vector directColor(0,0,0);
-						ComputeDirectLightingAtPoint( direct_pos,
-														sampleNormal, directColor, iThread,
-														skip_prop, nFlags );
-						Vector indirectColor(0,0,0);
-
-						if (g_bShowStaticPropNormals)
-						{
-							directColor= sampleNormal;
-							directColor += Vector(1.0,1.0,1.0);
-							directColor *= 50.0;
-						}
-						else
-						{
-							if (numbounce >= 1)
-								ComputeIndirectLightingAtPoint( 
-									samplePosition, sampleNormal, 
-									indirectColor, iThread, true,
-									( prop.m_Flags & STATIC_PROP_IGNORE_NORMALS) != 0 );
-						}
-						
-						colorVerts[numVertexes].m_bValid = true;
-						colorVerts[numVertexes].m_Position = samplePosition;
-						VectorAdd( directColor, indirectColor, colorVerts[numVertexes].m_Color );
+						validIdx.AddToTail( numVertexes );
+						validPos.AddToTail( samplePosition );
+						validNrm.AddToTail( sampleNormal );
 					}
-					
+
 					numVertexes++;
+				}
+
+				for ( int base = 0; base < validIdx.Count(); base += 4 )
+				{
+					const int n = ( validIdx.Count() - base < 4 ) ? ( validIdx.Count() - base ) : 4;
+					Vector directColors[4];
+
+					if ( g_bShowStaticPropNormals )
+					{
+						for ( int i = 0; i < n; i++ )
+						{
+							directColors[i] = validNrm[base + i];
+							directColors[i] += Vector( 1.0, 1.0, 1.0 );
+							directColors[i] *= 50.0;
+						}
+					}
+					else
+					{
+						ComputeDirectLightingAtPoints4( &validPos[base], &validNrm[base],
+														directColors, n, iThread, skip_prop, nFlags );
+					}
+
+					for ( int i = 0; i < n; i++ )
+					{
+						const int ci = validIdx[base + i];
+						Vector indirectColor( 0, 0, 0 );
+						if ( !g_bShowStaticPropNormals && numbounce >= 1 )
+							ComputeIndirectLightingAtPoint(
+								validPos[base + i], validNrm[base + i],
+								indirectColor, iThread, true,
+								( prop.m_Flags & STATIC_PROP_IGNORE_NORMALS) != 0 );
+
+						colorVerts[ci].m_bValid = true;
+						colorVerts[ci].m_Position = validPos[base + i];
+						VectorAdd( directColors[i], indirectColor, colorVerts[ci].m_Color );
+					}
 				}
 			}
 			

@@ -21,6 +21,8 @@ bool VRadGPU_IsActive();
 bool VRadGPU_HasScene();
 void VRadGPU_SetRequested( bool bRequested );
 void VRadGPU_SetTransfersRequested( bool bRequested );
+void VRadGPU_SetMaxTris( int nMaxTris );       // 0 = unlimited (default)
+void VRadGPU_SetRayBatchSize( int nBatch );    // default 32768
 
 void VRadGPU_CaptureScene( RayTracingEnvironment &rtEnv );
 bool VRadGPU_InitAfterScene();

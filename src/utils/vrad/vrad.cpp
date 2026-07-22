@@ -21,6 +21,8 @@
 #include "loadcmdline.h"
 #include "vrad_gpu.h"
 #include "ao.h"
+#include "absorb.h"
+#include "portal.h"
 #include "radial.h"
 #include "byteswap.h"
 
@@ -1544,6 +1546,7 @@ void GatherLight (int threadnum, void *pUserData)
 	CPatch		*patch;
 	Vector		sum, v;
 	const bool bTintInbound = LightEnv_HasInboundBounceTinting();
+	const bool bAbsorb = Absorb_HasVolumes();
 
 	while (1)
 	{
@@ -1611,6 +1614,10 @@ void GatherLight (int threadnum, void *pUserData)
 				{
 					LightEnv_MaybeTintInboundBounce( receiverEnv, LightEnv_GetPatchEnvId( trans->patch ), v );
 				}
+				if ( bAbsorb )
+				{
+					VectorScale( v, Absorb_BounceScale( patch2->origin, patch->origin ), v );
+				}
 				// remove normal already factored into transfer steradian
 				float scale = 1.0f / DotProduct (delta, patch->normal);
 				VectorScale( v, trans->transfer * scale, v );
@@ -1646,7 +1653,12 @@ void GatherLight (int threadnum, void *pUserData)
 				{
 					LightEnv_MaybeTintInboundBounce( receiverEnv, LightEnv_GetPatchEnvId( trans->patch ), v );
 				}
-				VectorScale( v, trans->transfer, v );
+				float xfer = trans->transfer;
+				if ( bAbsorb )
+				{
+					xfer *= Absorb_BounceScale( g_Patches[trans->patch].origin, patch->origin );
+				}
+				VectorScale( v, xfer, v );
 				VectorAdd( sum, v, sum );
 			}
 			VectorCopy( sum, addlight[j].light[0] );
@@ -1753,6 +1765,11 @@ void BounceLight (void)
 					VRadGPUTransfer_t tr;
 					tr.patch = g_Patches[p].transfers[t].patch;
 					tr.transfer = g_Patches[p].transfers[t].transfer;
+					if ( Absorb_HasVolumes() )
+					{
+						tr.transfer *= Absorb_BounceScale(
+							g_Patches[tr.patch].origin, g_Patches[p].origin );
+					}
 					transfers.AddToTail( tr );
 				}
 				offsets[p + 1] = transfers.Count();
@@ -2001,6 +2018,9 @@ void MakeAllScales (void)
 {
 	// determine visibility between patches
 	BuildVisMatrix ();
+
+	// Extra radiosity links through light_portal pairs (after normal MakeScales).
+	Portal_BuildExtraTransfers();
 	
 	// release visibility matrix
 	FreeVisMatrix ();
@@ -2486,6 +2506,22 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 			VRadGPU_SetRequested( true );
 			VRadGPU_SetTransfersRequested( true );
 			Msg( "GPU transfers requested (-gpu_transfers): experimental, usually slower than CPU.\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-gpu_maxtris" ) )
+		{
+			if ( ++i < argc )
+			{
+				VRadGPU_SetMaxTris( atoi( argv[i] ) );
+				Msg( "GPU max tris (-gpu_maxtris): %s (0 = unlimited).\n", argv[i] );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-gpu_batch" ) )
+		{
+			if ( ++i < argc )
+			{
+				VRadGPU_SetRayBatchSize( atoi( argv[i] ) );
+				Msg( "GPU ray batch (-gpu_batch): %s\n", argv[i] );
+			}
 		}
 		else if ( !Q_stricmp( argv[i], "-coarse" ) )
 		{
@@ -3084,9 +3120,11 @@ void PrintUsage( int argc, char **argv )
 		"  -noskyboxrecurse : Turn off recursion into 3d skybox (skybox shadows on world)\n"
 		"  -nossprops      : Globally disable self-shadowing on static props\n"
 		"  -gpu            : OpenCL bounce gather + batched ambient/sky occlusion.\n"
+		"  -gpu_maxtris N  : Optional GPU BVH triangle cap (default 0 = unlimited).\n"
+		"  -gpu_batch N    : Rays per OpenCL dispatch (default 32768; lower = safer).\n"
 		"  -gpu_transfers  : Experimental GPU transfer rays (usually slower; not recommended).\n"
 		"  -coarse         : Larger lighting patches (chop 8) — faster VisLeafs/bounce.\n"
-		"  -bounce_soft N  : Bounce luxel splat scale (default 0.75 tighter; 1=stock; range 0.5..4).\n"
+		"  -bounce_soft N  : Bounce luxel splat scale (default 1=stock; <1 tighter; range 0.5..4).\n"
 		"  -maxtransfer N  : Skip patch transfers farther than N units (faster VisLeafs).\n"
 		"  -ao             : Bake cosine-weighted ambient occlusion into lightmaps.\n"
 		"  -ao_samples N   : AO rays per luxel (default 16). Implies -ao.\n"

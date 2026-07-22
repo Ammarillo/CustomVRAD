@@ -1,6 +1,8 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
 // OpenCL acceleration for VRAD (-gpu): BVH occlusion/closest + bounce gather.
+// Stability: small ray batches (TDR-safe), scene size / max-alloc guards,
+// chunked uploads, auto-disable on OpenCL errors.
 //
 //=============================================================================//
 
@@ -16,6 +18,8 @@
 #include <cstring>
 #include <mutex>
 #include <cmath>
+#include <algorithm>
+#include <atomic>
 
 bool g_bVRadGPURequested = false;
 bool g_bVRadGPUTransfers = false;
@@ -28,6 +32,7 @@ std::mutex g_clMutex;
 bool g_bActive = false;
 bool g_bSceneUploaded = false;
 bool g_bCaptureDone = false;
+std::atomic<bool> g_bGPUFailed{ false };
 
 cl_platform_id g_platform = nullptr;
 cl_device_id g_device = nullptr;
@@ -38,21 +43,31 @@ cl_kernel g_kOcclusion = nullptr;
 cl_kernel g_kClosest = nullptr;
 cl_kernel g_kGather = nullptr;
 
-// Scene BVH
 cl_mem g_dTris = nullptr;
 cl_mem g_dBVH = nullptr;
 cl_mem g_dPrims = nullptr;
 int g_nTris = 0;
 int g_nBVH = 0;
+cl_ulong g_deviceMaxAlloc = 0;
+cl_ulong g_deviceGlobalMem = 0;
 
-// Persistent reusable ray buffers (grow-only)
-cl_mem g_dRays = nullptr;
-cl_mem g_dVis = nullptr;
-cl_mem g_dHitT = nullptr;
-cl_mem g_dHitFlags = nullptr;
-int g_nRayCapacity = 0;
+// Per-thread trace contexts: own queue + kernels + ray buffers, so all CPU
+// worker threads can dispatch to the GPU concurrently (no global queue lock).
+struct TraceCtx
+{
+	cl_command_queue queue;
+	cl_kernel kOcclusion;
+	cl_kernel kClosest;
+	cl_mem dRays;
+	cl_mem dVis;
+	cl_mem dHitT;
+	cl_mem dHitFlags;
+	int capacity;
+};
+enum { kMaxTraceCtx = 64 };
+std::vector<TraceCtx *> g_ctxPool;	// all created (guarded by g_clMutex)
+std::vector<TraceCtx *> g_ctxFree;	// available for checkout
 
-// Persistent gather buffers
 cl_mem g_dEmit = nullptr;
 cl_mem g_dRefl = nullptr;
 cl_mem g_dTrans = nullptr;
@@ -66,13 +81,24 @@ int g_nPatchesCached = 0;
 int g_nTransCached = 0;
 float g_flDefaultBounceIntensity = 1.0f;
 
+// Keep each OpenCL dispatch short to avoid Windows TDR / driver hangs.
+enum { kMinGPURays = 32 };
+enum { kDefaultRayBatch = 32768 };
+enum { kUploadChunkBytes = 16 * 1024 * 1024 };
+// Soft cap for GPU BVH (0 = unlimited). Override with -gpu_maxtris.
+// Default unlimited — large scenes are handled via small ray batches instead.
+enum { kDefaultMaxTris = 0 };
+
+int g_nMaxRayBatch = kDefaultRayBatch;
+int g_nMaxTris = kDefaultMaxTris;
+
 struct Float4Host { float x, y, z, w; };
 
 #pragma pack(push, 4)
 struct Float3 { float x, y, z, w; };
 struct TriGPU { Float3 a, b, c; int flags; int pad0, pad1, pad2; };
 struct BVHNodeGPU { Float3 bmin, bmax; int left, right, firstPrim, primCount; };
-struct RayGPU { Float3 origin, dir; }; // dir = end-start (unnormalized); tmax = length
+struct RayGPU { Float3 origin, dir; };
 #pragma pack(pop)
 
 struct HostTri
@@ -84,8 +110,6 @@ struct HostTri
 std::vector<HostTri> g_hostTris;
 std::vector<BVHNodeGPU> g_hostBVH;
 std::vector<int> g_primIndices;
-
-enum { kMinGPURays = 32 };
 
 const char *g_kernelSource = R"CLC(
 typedef struct { float x,y,z,w; } Float3;
@@ -129,7 +153,6 @@ static int intersectAABB(Float3 o, Float3 d, float tmax, Float3 bmin, Float3 bma
   return 1;
 }
 
-// Möller–Trumbore; returns t>0 on hit (ray = o + t*d with |d|=1)
 static float intersectTri(Float3 o, Float3 d, TriGPU t)
 {
   Float3 e1 = sub3(t.b, t.a);
@@ -303,10 +326,25 @@ static Float3 ToF3( const Vector &v )
 	return f;
 }
 
-static void CheckCL( cl_int err, const char *what )
+static bool CheckCL( cl_int err, const char *what )
 {
-	if ( err != CL_SUCCESS )
-		Warning( "[VRAD-GPU] %s failed (cl_int %d)\n", what, (int)err );
+	if ( err == CL_SUCCESS )
+		return true;
+	Warning( "[VRAD-GPU] %s failed (cl_int %d)\n", what, (int)err );
+	return false;
+}
+
+static void ReleaseSceneBuffers();
+static void ReleaseGatherBuffers();
+static void ShutdownUnlocked();
+
+// Only flips the flag — resources are freed in VRadGPU_Shutdown so other
+// threads still inside a trace call never touch released handles.
+static void MarkGPUFailed( const char *why )
+{
+	bool expected = false;
+	if ( g_bGPUFailed.compare_exchange_strong( expected, true ) )
+		Warning( "[VRAD-GPU] Disabling GPU for this run: %s (CPU fallback)\n", why );
 }
 
 static void BoundsOfTris( const int *idx, int count, Vector &bmin, Vector &bmax )
@@ -337,9 +375,10 @@ static int BuildBVHRecursive( std::vector<int> &indices, int begin, int end, int
 
 	const int count = end - begin;
 	const int nodeIndex = (int)g_hostBVH.size();
-	g_hostBVH.push_back( node ); // placeholder
+	g_hostBVH.push_back( node );
 
-	if ( count <= 4 || depth > 48 )
+	// Slightly larger leaves → shallower tree, less stack pressure in kernels.
+	if ( count <= 8 || depth > 40 )
 	{
 		BVHNodeGPU leaf = g_hostBVH[nodeIndex];
 		leaf.left = -1;
@@ -411,13 +450,88 @@ static void ReleaseSceneBuffers()
 	g_bSceneUploaded = false;
 }
 
-static void ReleaseRayBuffers()
+static void DestroyTraceCtx( TraceCtx *ctx )
 {
-	if ( g_dRays ) { clReleaseMemObject( g_dRays ); g_dRays = nullptr; }
-	if ( g_dVis ) { clReleaseMemObject( g_dVis ); g_dVis = nullptr; }
-	if ( g_dHitT ) { clReleaseMemObject( g_dHitT ); g_dHitT = nullptr; }
-	if ( g_dHitFlags ) { clReleaseMemObject( g_dHitFlags ); g_dHitFlags = nullptr; }
-	g_nRayCapacity = 0;
+	if ( !ctx )
+		return;
+	if ( ctx->dRays ) clReleaseMemObject( ctx->dRays );
+	if ( ctx->dVis ) clReleaseMemObject( ctx->dVis );
+	if ( ctx->dHitT ) clReleaseMemObject( ctx->dHitT );
+	if ( ctx->dHitFlags ) clReleaseMemObject( ctx->dHitFlags );
+	if ( ctx->kOcclusion ) clReleaseKernel( ctx->kOcclusion );
+	if ( ctx->kClosest ) clReleaseKernel( ctx->kClosest );
+	if ( ctx->queue ) clReleaseCommandQueue( ctx->queue );
+	delete ctx;
+}
+
+static void ReleaseTraceCtxPool()
+{
+	for ( TraceCtx *ctx : g_ctxPool )
+		DestroyTraceCtx( ctx );
+	g_ctxPool.clear();
+	g_ctxFree.clear();
+}
+
+static TraceCtx *CreateTraceCtx()
+{
+	TraceCtx *ctx = new TraceCtx;
+	memset( ctx, 0, sizeof( *ctx ) );
+	ctx->capacity = g_nMaxRayBatch;
+
+	cl_int err = CL_SUCCESS;
+	ctx->queue = clCreateCommandQueue( g_context, g_device, 0, &err );
+	if ( !CheckCL( err, "ctx queue" ) ) { DestroyTraceCtx( ctx ); return nullptr; }
+	ctx->kOcclusion = clCreateKernel( g_program, "kOcclusion", &err );
+	if ( !CheckCL( err, "ctx kOcclusion" ) ) { DestroyTraceCtx( ctx ); return nullptr; }
+	ctx->kClosest = clCreateKernel( g_program, "kClosest", &err );
+	if ( !CheckCL( err, "ctx kClosest" ) ) { DestroyTraceCtx( ctx ); return nullptr; }
+	ctx->dRays = clCreateBuffer( g_context, CL_MEM_READ_ONLY, sizeof( RayGPU ) * ctx->capacity, nullptr, &err );
+	if ( !CheckCL( err, "ctx dRays" ) ) { DestroyTraceCtx( ctx ); return nullptr; }
+	ctx->dVis = clCreateBuffer( g_context, CL_MEM_WRITE_ONLY, ctx->capacity, nullptr, &err );
+	if ( !CheckCL( err, "ctx dVis" ) ) { DestroyTraceCtx( ctx ); return nullptr; }
+	ctx->dHitT = clCreateBuffer( g_context, CL_MEM_WRITE_ONLY, sizeof( float ) * ctx->capacity, nullptr, &err );
+	if ( !CheckCL( err, "ctx dHitT" ) ) { DestroyTraceCtx( ctx ); return nullptr; }
+	ctx->dHitFlags = clCreateBuffer( g_context, CL_MEM_WRITE_ONLY, sizeof( int ) * ctx->capacity, nullptr, &err );
+	if ( !CheckCL( err, "ctx dHitFlags" ) ) { DestroyTraceCtx( ctx ); return nullptr; }
+
+	// Bind the static scene args once.
+	clSetKernelArg( ctx->kOcclusion, 0, sizeof( cl_mem ), &ctx->dRays );
+	clSetKernelArg( ctx->kOcclusion, 1, sizeof( cl_mem ), &ctx->dVis );
+	clSetKernelArg( ctx->kOcclusion, 2, sizeof( cl_mem ), &g_dTris );
+	clSetKernelArg( ctx->kOcclusion, 3, sizeof( cl_mem ), &g_dBVH );
+	clSetKernelArg( ctx->kOcclusion, 4, sizeof( cl_mem ), &g_dPrims );
+	clSetKernelArg( ctx->kClosest, 0, sizeof( cl_mem ), &ctx->dRays );
+	clSetKernelArg( ctx->kClosest, 1, sizeof( cl_mem ), &ctx->dHitT );
+	clSetKernelArg( ctx->kClosest, 2, sizeof( cl_mem ), &ctx->dHitFlags );
+	clSetKernelArg( ctx->kClosest, 3, sizeof( cl_mem ), &g_dTris );
+	clSetKernelArg( ctx->kClosest, 4, sizeof( cl_mem ), &g_dBVH );
+	clSetKernelArg( ctx->kClosest, 5, sizeof( cl_mem ), &g_dPrims );
+	return ctx;
+}
+
+static TraceCtx *AcquireTraceCtx()
+{
+	std::lock_guard<std::mutex> lock( g_clMutex );
+	if ( !g_bActive || !g_bSceneUploaded || g_bGPUFailed )
+		return nullptr;
+	if ( !g_ctxFree.empty() )
+	{
+		TraceCtx *ctx = g_ctxFree.back();
+		g_ctxFree.pop_back();
+		return ctx;
+	}
+	if ( (int)g_ctxPool.size() >= kMaxTraceCtx )
+		return nullptr;	// all busy — caller falls back to CPU tracing
+	TraceCtx *ctx = CreateTraceCtx();
+	if ( ctx )
+		g_ctxPool.push_back( ctx );
+	return ctx;
+}
+
+static void ReturnTraceCtx( TraceCtx *ctx )
+{
+	std::lock_guard<std::mutex> lock( g_clMutex );
+	g_ctxFree.push_back( ctx );
 }
 
 static void ReleaseGatherBuffers()
@@ -435,31 +549,32 @@ static void ReleaseGatherBuffers()
 	g_nTransCached = 0;
 }
 
-static bool EnsureRayBuffers( int nRays )
+static bool WriteBufferChunked( cl_mem buf, size_t totalBytes, const void *data, const char *what )
 {
-	if ( nRays <= g_nRayCapacity && g_dRays && g_dVis && g_dHitT && g_dHitFlags )
-		return true;
-
-	ReleaseRayBuffers();
-
-	const int capacity = ( nRays < 256 ) ? 256 : nRays;
-	cl_int err = CL_SUCCESS;
-	g_dRays = clCreateBuffer( g_context, CL_MEM_READ_ONLY, sizeof( RayGPU ) * capacity, nullptr, &err );
-	CheckCL( err, "dRays" );
-	g_dVis = clCreateBuffer( g_context, CL_MEM_WRITE_ONLY, capacity, nullptr, &err );
-	CheckCL( err, "dVis" );
-	g_dHitT = clCreateBuffer( g_context, CL_MEM_WRITE_ONLY, sizeof( float ) * capacity, nullptr, &err );
-	CheckCL( err, "dHitT" );
-	g_dHitFlags = clCreateBuffer( g_context, CL_MEM_WRITE_ONLY, sizeof( int ) * capacity, nullptr, &err );
-	CheckCL( err, "dHitFlags" );
-
-	if ( !g_dRays || !g_dVis || !g_dHitT || !g_dHitFlags )
+	const char *p = (const char *)data;
+	for ( size_t off = 0; off < totalBytes; off += kUploadChunkBytes )
 	{
-		ReleaseRayBuffers();
+		const size_t n = (std::min)( (size_t)kUploadChunkBytes, totalBytes - off );
+		cl_int err = clEnqueueWriteBuffer( g_queue, buf, CL_TRUE, off, n, p + off, 0, nullptr, nullptr );
+		if ( !CheckCL( err, what ) )
+			return false;
+	}
+	return true;
+}
+
+static bool FitsDeviceAlloc( size_t bytes, const char *label )
+{
+	if ( g_deviceMaxAlloc == 0 )
+		return true;
+	// Leave headroom — some ICDs reject near-limit COPY/WRITE sizes.
+	const cl_ulong limit = (cl_ulong)( g_deviceMaxAlloc * 0.85 );
+	if ( bytes > (size_t)limit )
+	{
+		Warning( "[VRAD-GPU] %s is %zu MB (device max alloc ~%llu MB) — skipping GPU scene.\n",
+				 label, bytes / ( 1024 * 1024 ),
+				 (unsigned long long)( g_deviceMaxAlloc / ( 1024 * 1024 ) ) );
 		return false;
 	}
-
-	g_nRayCapacity = capacity;
 	return true;
 }
 
@@ -469,12 +584,41 @@ static bool UploadSceneToGPU()
 	if ( !g_bCaptureDone || g_hostTris.empty() )
 		return false;
 
+	const int nCaptured = (int)g_hostTris.size();
+	if ( g_nMaxTris > 0 && nCaptured > g_nMaxTris )
+	{
+		Warning( "[VRAD-GPU] Scene has %d tris (limit %d). GPU BVH skipped — bounce still on GPU; "
+				 "occlusion/closest use CPU. Raise with -gpu_maxtris N or drop -StaticPropPolys.\n",
+				 nCaptured, g_nMaxTris );
+		g_hostTris.clear();
+		g_hostTris.shrink_to_fit();
+		g_bCaptureDone = false;
+		return false;
+	}
+
 	BuildBVH();
 	if ( g_hostBVH.empty() || g_primIndices.empty() )
 		return false;
 
 	g_nTris = (int)g_hostTris.size();
 	g_nBVH = (int)g_hostBVH.size();
+
+	const size_t triBytes = sizeof( TriGPU ) * (size_t)g_nTris;
+	const size_t bvhBytes = sizeof( BVHNodeGPU ) * (size_t)g_nBVH;
+	const size_t primBytes = sizeof( int ) * g_primIndices.size();
+	if ( !FitsDeviceAlloc( triBytes, "triangle buffer" ) ||
+		 !FitsDeviceAlloc( bvhBytes, "BVH buffer" ) ||
+		 !FitsDeviceAlloc( primBytes, "prim index buffer" ) )
+	{
+		g_hostTris.clear();
+		g_hostBVH.clear();
+		g_primIndices.clear();
+		g_hostTris.shrink_to_fit();
+		g_hostBVH.shrink_to_fit();
+		g_primIndices.shrink_to_fit();
+		g_bCaptureDone = false;
+		return false;
+	}
 
 	std::vector<TriGPU> tris( g_nTris );
 	for ( int i = 0; i < g_nTris; ++i )
@@ -486,18 +630,36 @@ static bool UploadSceneToGPU()
 		tris[i].pad0 = tris[i].pad1 = tris[i].pad2 = 0;
 	}
 
-	cl_int err = CL_SUCCESS;
-	g_dTris = clCreateBuffer( g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-							  sizeof( TriGPU ) * g_nTris, tris.data(), &err );
-	CheckCL( err, "tris buffer" );
-	g_dBVH = clCreateBuffer( g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-							 sizeof( BVHNodeGPU ) * g_nBVH, g_hostBVH.data(), &err );
-	CheckCL( err, "bvh buffer" );
-	g_dPrims = clCreateBuffer( g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-							   sizeof( int ) * g_primIndices.size(), g_primIndices.data(), &err );
-	CheckCL( err, "prims buffer" );
+	// Free host triangle soup before device upload to cut peak RAM.
+	g_hostTris.clear();
+	g_hostTris.shrink_to_fit();
+	g_bCaptureDone = false;
 
-	if ( !g_dTris || !g_dBVH || !g_dPrims )
+	cl_int err = CL_SUCCESS;
+	g_dTris = clCreateBuffer( g_context, CL_MEM_READ_ONLY, triBytes, nullptr, &err );
+	if ( !CheckCL( err, "tris buffer alloc" ) ) { ReleaseSceneBuffers(); return false; }
+	g_dBVH = clCreateBuffer( g_context, CL_MEM_READ_ONLY, bvhBytes, nullptr, &err );
+	if ( !CheckCL( err, "bvh buffer alloc" ) ) { ReleaseSceneBuffers(); return false; }
+	g_dPrims = clCreateBuffer( g_context, CL_MEM_READ_ONLY, primBytes, nullptr, &err );
+	if ( !CheckCL( err, "prims buffer alloc" ) ) { ReleaseSceneBuffers(); return false; }
+
+	if ( !WriteBufferChunked( g_dTris, triBytes, tris.data(), "tris upload" ) ||
+		 !WriteBufferChunked( g_dBVH, bvhBytes, g_hostBVH.data(), "bvh upload" ) ||
+		 !WriteBufferChunked( g_dPrims, primBytes, g_primIndices.data(), "prims upload" ) )
+	{
+		ReleaseSceneBuffers();
+		return false;
+	}
+
+	tris.clear();
+	tris.shrink_to_fit();
+	g_hostBVH.clear();
+	g_primIndices.clear();
+	g_hostBVH.shrink_to_fit();
+	g_primIndices.shrink_to_fit();
+
+	err = clFinish( g_queue );
+	if ( !CheckCL( err, "scene upload finish" ) )
 	{
 		ReleaseSceneBuffers();
 		return false;
@@ -507,12 +669,11 @@ static bool UploadSceneToGPU()
 	return true;
 }
 
-// Caller must hold g_clMutex (or be single-threaded during init failure).
 static void ShutdownUnlocked()
 {
 	g_bActive = false;
 	ReleaseGatherBuffers();
-	ReleaseRayBuffers();
+	ReleaseTraceCtxPool();
 	ReleaseSceneBuffers();
 	if ( g_kOcclusion ) { clReleaseKernel( g_kOcclusion ); g_kOcclusion = nullptr; }
 	if ( g_kClosest ) { clReleaseKernel( g_kClosest ); g_kClosest = nullptr; }
@@ -522,10 +683,24 @@ static void ShutdownUnlocked()
 	if ( g_context ) { clReleaseContext( g_context ); g_context = nullptr; }
 	g_device = nullptr;
 	g_platform = nullptr;
+	g_deviceMaxAlloc = 0;
+	g_deviceGlobalMem = 0;
 	g_hostTris.clear();
 	g_hostBVH.clear();
 	g_primIndices.clear();
 	g_bCaptureDone = false;
+}
+
+static bool FillRays( const Vector *pStarts, const Vector *pEnds, int offset, int count, std::vector<RayGPU> &rays )
+{
+	rays.resize( count );
+	for ( int i = 0; i < count; ++i )
+	{
+		const int src = offset + i;
+		rays[i].origin = ToF3( pStarts[src] );
+		rays[i].dir = ToF3( pEnds[src] - pStarts[src] );
+	}
+	return true;
 }
 
 } // namespace
@@ -540,14 +715,28 @@ void VRadGPU_SetTransfersRequested( bool bRequested )
 	g_bVRadGPUTransfers = bRequested;
 }
 
+void VRadGPU_SetMaxTris( int nMaxTris )
+{
+	g_nMaxTris = ( nMaxTris < 0 ) ? 0 : nMaxTris;
+}
+
+void VRadGPU_SetRayBatchSize( int nBatch )
+{
+	if ( nBatch < 1024 )
+		nBatch = 1024;
+	if ( nBatch > 262144 )
+		nBatch = 262144;
+	g_nMaxRayBatch = nBatch;
+}
+
 bool VRadGPU_IsActive()
 {
-	return g_bActive;
+	return g_bActive && !g_bGPUFailed;
 }
 
 bool VRadGPU_HasScene()
 {
-	return g_bSceneUploaded;
+	return g_bSceneUploaded && !g_bGPUFailed;
 }
 
 void VRadGPU_CaptureScene( RayTracingEnvironment &rtEnv )
@@ -555,7 +744,6 @@ void VRadGPU_CaptureScene( RayTracingEnvironment &rtEnv )
 	g_hostTris.clear();
 	g_bCaptureDone = false;
 
-	// Capture while Vertex() is still valid (before KD convert / intersection format).
 	const int n = rtEnv.OptimizedTriangleList.Count();
 	g_hostTris.reserve( n );
 	for ( int i = 0; i < n; ++i )
@@ -576,6 +764,7 @@ bool VRadGPU_InitAfterScene()
 {
 	g_bActive = false;
 	g_bSceneUploaded = false;
+	g_bGPUFailed = false;
 	if ( !g_bVRadGPURequested )
 		return false;
 
@@ -592,27 +781,47 @@ bool VRadGPU_InitAfterScene()
 	std::vector<cl_platform_id> plats( nPlat );
 	clGetPlatformIDs( nPlat, plats.data(), nullptr );
 
-	bool found = false;
-	for ( cl_uint p = 0; p < nPlat && !found; ++p )
+	cl_device_id bestDev = nullptr;
+	cl_platform_id bestPlat = nullptr;
+	cl_ulong bestMem = 0;
+	for ( cl_uint p = 0; p < nPlat; ++p )
 	{
 		cl_uint nDev = 0;
 		if ( clGetDeviceIDs( plats[p], CL_DEVICE_TYPE_GPU, 0, nullptr, &nDev ) != CL_SUCCESS || nDev == 0 )
 			continue;
 		std::vector<cl_device_id> devs( nDev );
 		clGetDeviceIDs( plats[p], CL_DEVICE_TYPE_GPU, nDev, devs.data(), nullptr );
-		g_platform = plats[p];
-		g_device = devs[0];
-		found = true;
+		for ( cl_uint d = 0; d < nDev; ++d )
+		{
+			cl_ulong mem = 0;
+			clGetDeviceInfo( devs[d], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof( mem ), &mem, nullptr );
+			if ( mem >= bestMem )
+			{
+				bestMem = mem;
+				bestDev = devs[d];
+				bestPlat = plats[p];
+			}
+		}
 	}
-	if ( !found )
+	if ( !bestDev )
 	{
 		Warning( "[VRAD-GPU] No OpenCL GPU device; using CPU.\n" );
 		return false;
 	}
 
+	g_platform = bestPlat;
+	g_device = bestDev;
+	g_deviceGlobalMem = bestMem;
+	clGetDeviceInfo( g_device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof( g_deviceMaxAlloc ), &g_deviceMaxAlloc, nullptr );
+
 	char name[256] = {};
 	clGetDeviceInfo( g_device, CL_DEVICE_NAME, sizeof( name ), name, nullptr );
-	Msg( "[VRAD-GPU] Using device: %s\n", name );
+	Msg( "[VRAD-GPU] Using device: %s (%.1f GB, max alloc %.0f MB, ray batch %d, max tris %d)\n",
+		 name,
+		 (double)g_deviceGlobalMem / ( 1024.0 * 1024.0 * 1024.0 ),
+		 (double)g_deviceMaxAlloc / ( 1024.0 * 1024.0 ),
+		 g_nMaxRayBatch,
+		 g_nMaxTris );
 
 	g_context = clCreateContext( nullptr, 1, &g_device, nullptr, nullptr, &err );
 	if ( err != CL_SUCCESS )
@@ -639,7 +848,8 @@ bool VRadGPU_InitAfterScene()
 		return false;
 	}
 
-	err = clBuildProgram( g_program, 1, &g_device, "-cl-fast-relaxed-math", nullptr, nullptr );
+	// Avoid -cl-fast-relaxed-math (can worsen numerical edge cases on some ICDs).
+	err = clBuildProgram( g_program, 1, &g_device, "-cl-mad-enable", nullptr, nullptr );
 	if ( err != CL_SUCCESS )
 	{
 		size_t logSize = 0;
@@ -669,7 +879,7 @@ bool VRadGPU_InitAfterScene()
 		Msg( "[VRAD-GPU] Building BVH...\n" );
 		bSceneOk = UploadSceneToGPU();
 		if ( !bSceneOk )
-			Warning( "[VRAD-GPU] BVH upload failed; occlusion/closest stay on CPU.\n" );
+			Warning( "[VRAD-GPU] BVH upload skipped/failed; occlusion/closest stay on CPU.\n" );
 	}
 	else
 	{
@@ -684,7 +894,7 @@ bool VRadGPU_InitAfterScene()
 	}
 	else
 	{
-		Msg( "[VRAD-GPU] Ready — bounce gather accelerated.\n" );
+		Msg( "[VRAD-GPU] Ready — bounce gather accelerated (CPU traces).\n" );
 	}
 	return true;
 }
@@ -697,97 +907,110 @@ void VRadGPU_Shutdown()
 
 bool VRadGPU_TraceOcclusion( const Vector *pStarts, const Vector *pEnds, unsigned char *pVisible, int nRays )
 {
-	if ( !g_bActive || !g_bSceneUploaded || nRays < kMinGPURays )
+	if ( !VRadGPU_HasScene() || nRays < kMinGPURays )
 		return false;
 
-	std::lock_guard<std::mutex> lock( g_clMutex );
-
-	if ( !EnsureRayBuffers( nRays ) )
+	TraceCtx *ctx = AcquireTraceCtx();
+	if ( !ctx )
 		return false;
 
-	std::vector<RayGPU> rays( nRays );
-	for ( int i = 0; i < nRays; ++i )
+	bool bOk = true;
+	std::vector<RayGPU> rays;
+	for ( int offset = 0; offset < nRays && bOk; offset += ctx->capacity )
 	{
-		rays[i].origin = ToF3( pStarts[i] );
-		rays[i].dir = ToF3( pEnds[i] - pStarts[i] );
+		const int count = (std::min)( ctx->capacity, nRays - offset );
+		FillRays( pStarts, pEnds, offset, count, rays );
+
+		cl_int err = clEnqueueWriteBuffer( ctx->queue, ctx->dRays, CL_FALSE, 0,
+										   sizeof( RayGPU ) * count, rays.data(), 0, nullptr, nullptr );
+		if ( !CheckCL( err, "write rays" ) )
+		{
+			MarkGPUFailed( "occlusion ray upload" );
+			bOk = false;
+			break;
+		}
+
+		clSetKernelArg( ctx->kOcclusion, 5, sizeof( int ), &count );
+
+		size_t global = (size_t)count;
+		err = clEnqueueNDRangeKernel( ctx->queue, ctx->kOcclusion, 1, nullptr, &global, nullptr, 0, nullptr, nullptr );
+		if ( !CheckCL( err, "kOcclusion enqueue" ) )
+		{
+			MarkGPUFailed( "occlusion kernel" );
+			bOk = false;
+			break;
+		}
+
+		err = clEnqueueReadBuffer( ctx->queue, ctx->dVis, CL_TRUE, 0, count, pVisible + offset, 0, nullptr, nullptr );
+		if ( !CheckCL( err, "occlusion read" ) )
+		{
+			MarkGPUFailed( "occlusion readback" );
+			bOk = false;
+			break;
+		}
 	}
 
-	cl_int err = clEnqueueWriteBuffer( g_queue, g_dRays, CL_FALSE, 0,
-									   sizeof( RayGPU ) * nRays, rays.data(), 0, nullptr, nullptr );
-	if ( err != CL_SUCCESS )
-	{
-		CheckCL( err, "write rays" );
-		return false;
-	}
-
-	clSetKernelArg( g_kOcclusion, 0, sizeof( cl_mem ), &g_dRays );
-	clSetKernelArg( g_kOcclusion, 1, sizeof( cl_mem ), &g_dVis );
-	clSetKernelArg( g_kOcclusion, 2, sizeof( cl_mem ), &g_dTris );
-	clSetKernelArg( g_kOcclusion, 3, sizeof( cl_mem ), &g_dBVH );
-	clSetKernelArg( g_kOcclusion, 4, sizeof( cl_mem ), &g_dPrims );
-	clSetKernelArg( g_kOcclusion, 5, sizeof( int ), &nRays );
-
-	size_t global = (size_t)nRays;
-	err = clEnqueueNDRangeKernel( g_queue, g_kOcclusion, 1, nullptr, &global, nullptr, 0, nullptr, nullptr );
-	if ( err != CL_SUCCESS )
-	{
-		CheckCL( err, "kOcclusion enqueue" );
-		return false;
-	}
-
-	err = clEnqueueReadBuffer( g_queue, g_dVis, CL_TRUE, 0, nRays, pVisible, 0, nullptr, nullptr );
-	return err == CL_SUCCESS;
+	ReturnTraceCtx( ctx );
+	return bOk;
 }
 
 bool VRadGPU_TraceClosest( const Vector *pStarts, const Vector *pEnds,
 						   float *pHitT, int *pHitFlags, int nRays )
 {
-	if ( !g_bActive || !g_bSceneUploaded || nRays < kMinGPURays )
+	if ( !VRadGPU_HasScene() || nRays < kMinGPURays )
 		return false;
 
-	std::lock_guard<std::mutex> lock( g_clMutex );
-
-	if ( !EnsureRayBuffers( nRays ) )
+	TraceCtx *ctx = AcquireTraceCtx();
+	if ( !ctx )
 		return false;
 
-	std::vector<RayGPU> rays( nRays );
-	for ( int i = 0; i < nRays; ++i )
+	bool bOk = true;
+	std::vector<RayGPU> rays;
+	for ( int offset = 0; offset < nRays && bOk; offset += ctx->capacity )
 	{
-		rays[i].origin = ToF3( pStarts[i] );
-		rays[i].dir = ToF3( pEnds[i] - pStarts[i] );
+		const int count = (std::min)( ctx->capacity, nRays - offset );
+		FillRays( pStarts, pEnds, offset, count, rays );
+
+		cl_int err = clEnqueueWriteBuffer( ctx->queue, ctx->dRays, CL_FALSE, 0,
+										   sizeof( RayGPU ) * count, rays.data(), 0, nullptr, nullptr );
+		if ( !CheckCL( err, "write rays" ) )
+		{
+			MarkGPUFailed( "closest ray upload" );
+			bOk = false;
+			break;
+		}
+
+		clSetKernelArg( ctx->kClosest, 6, sizeof( int ), &count );
+
+		size_t global = (size_t)count;
+		err = clEnqueueNDRangeKernel( ctx->queue, ctx->kClosest, 1, nullptr, &global, nullptr, 0, nullptr, nullptr );
+		if ( !CheckCL( err, "kClosest enqueue" ) )
+		{
+			MarkGPUFailed( "closest kernel" );
+			bOk = false;
+			break;
+		}
+
+		err = clEnqueueReadBuffer( ctx->queue, ctx->dHitT, CL_FALSE, 0,
+								   sizeof( float ) * count, pHitT + offset, 0, nullptr, nullptr );
+		if ( !CheckCL( err, "closest hitT read" ) )
+		{
+			MarkGPUFailed( "closest readback" );
+			bOk = false;
+			break;
+		}
+		err = clEnqueueReadBuffer( ctx->queue, ctx->dHitFlags, CL_TRUE, 0,
+								   sizeof( int ) * count, pHitFlags + offset, 0, nullptr, nullptr );
+		if ( !CheckCL( err, "closest flags read" ) )
+		{
+			MarkGPUFailed( "closest readback" );
+			bOk = false;
+			break;
+		}
 	}
 
-	cl_int err = clEnqueueWriteBuffer( g_queue, g_dRays, CL_FALSE, 0,
-									   sizeof( RayGPU ) * nRays, rays.data(), 0, nullptr, nullptr );
-	if ( err != CL_SUCCESS )
-	{
-		CheckCL( err, "write rays" );
-		return false;
-	}
-
-	clSetKernelArg( g_kClosest, 0, sizeof( cl_mem ), &g_dRays );
-	clSetKernelArg( g_kClosest, 1, sizeof( cl_mem ), &g_dHitT );
-	clSetKernelArg( g_kClosest, 2, sizeof( cl_mem ), &g_dHitFlags );
-	clSetKernelArg( g_kClosest, 3, sizeof( cl_mem ), &g_dTris );
-	clSetKernelArg( g_kClosest, 4, sizeof( cl_mem ), &g_dBVH );
-	clSetKernelArg( g_kClosest, 5, sizeof( cl_mem ), &g_dPrims );
-	clSetKernelArg( g_kClosest, 6, sizeof( int ), &nRays );
-
-	size_t global = (size_t)nRays;
-	err = clEnqueueNDRangeKernel( g_queue, g_kClosest, 1, nullptr, &global, nullptr, 0, nullptr, nullptr );
-	if ( err != CL_SUCCESS )
-	{
-		CheckCL( err, "kClosest enqueue" );
-		return false;
-	}
-
-	err = clEnqueueReadBuffer( g_queue, g_dHitT, CL_FALSE, 0,
-							   sizeof( float ) * nRays, pHitT, 0, nullptr, nullptr );
-	if ( err != CL_SUCCESS )
-		return false;
-	err = clEnqueueReadBuffer( g_queue, g_dHitFlags, CL_TRUE, 0,
-							   sizeof( int ) * nRays, pHitFlags, 0, nullptr, nullptr );
-	return err == CL_SUCCESS;
+	ReturnTraceCtx( ctx );
+	return bOk;
 }
 
 bool VRadGPU_UploadTransferGraph( const Vector *pReflectivity,
@@ -796,10 +1019,12 @@ bool VRadGPU_UploadTransferGraph( const Vector *pReflectivity,
 								  const int *pPatchEnvIds,
 								  int nPatches )
 {
-	if ( !g_bActive || nPatches <= 0 )
+	if ( !VRadGPU_IsActive() || nPatches <= 0 )
 		return false;
 
 	std::lock_guard<std::mutex> lock( g_clMutex );
+	if ( g_bGPUFailed )
+		return false;
 
 	const int nTrans = pOffsets[nPatches];
 	if ( nTrans <= 0 )
@@ -807,17 +1032,40 @@ bool VRadGPU_UploadTransferGraph( const Vector *pReflectivity,
 
 	ReleaseGatherBuffers();
 
-	cl_int err;
-	g_dRefl = clCreateBuffer( g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-							  sizeof( Vector ) * nPatches, (void *)pReflectivity, &err );
-	g_dTrans = clCreateBuffer( g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-							   sizeof( VRadGPUTransfer_t ) * nTrans, (void *)pTransfers, &err );
-	g_dOff = clCreateBuffer( g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-							 sizeof( int ) * ( nPatches + 1 ), (void *)pOffsets, &err );
-	g_dPatchEnv = clCreateBuffer( g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-								  sizeof( int ) * nPatches, (void *)pPatchEnvIds, &err );
-	g_dEmit = clCreateBuffer( g_context, CL_MEM_READ_ONLY, sizeof( Vector ) * nPatches, nullptr, &err );
-	g_dAdd = clCreateBuffer( g_context, CL_MEM_WRITE_ONLY, sizeof( Vector ) * nPatches, nullptr, &err );
+	cl_int err = CL_SUCCESS;
+	const size_t reflBytes = sizeof( Vector ) * (size_t)nPatches;
+	const size_t transBytes = sizeof( VRadGPUTransfer_t ) * (size_t)nTrans;
+	const size_t offBytes = sizeof( int ) * (size_t)( nPatches + 1 );
+	const size_t envBytes = sizeof( int ) * (size_t)nPatches;
+
+	if ( !FitsDeviceAlloc( reflBytes, "reflectivity" ) ||
+		 !FitsDeviceAlloc( transBytes, "transfers" ) )
+	{
+		Warning( "[VRAD-GPU] Transfer graph too large for device; bounce gather stays on CPU.\n" );
+		return false;
+	}
+
+	g_dRefl = clCreateBuffer( g_context, CL_MEM_READ_ONLY, reflBytes, nullptr, &err );
+	if ( !CheckCL( err, "dRefl alloc" ) ) { ReleaseGatherBuffers(); return false; }
+	g_dTrans = clCreateBuffer( g_context, CL_MEM_READ_ONLY, transBytes, nullptr, &err );
+	if ( !CheckCL( err, "dTrans alloc" ) ) { ReleaseGatherBuffers(); return false; }
+	g_dOff = clCreateBuffer( g_context, CL_MEM_READ_ONLY, offBytes, nullptr, &err );
+	if ( !CheckCL( err, "dOff alloc" ) ) { ReleaseGatherBuffers(); return false; }
+	g_dPatchEnv = clCreateBuffer( g_context, CL_MEM_READ_ONLY, envBytes, nullptr, &err );
+	if ( !CheckCL( err, "dPatchEnv alloc" ) ) { ReleaseGatherBuffers(); return false; }
+	g_dEmit = clCreateBuffer( g_context, CL_MEM_READ_ONLY, reflBytes, nullptr, &err );
+	if ( !CheckCL( err, "dEmit alloc" ) ) { ReleaseGatherBuffers(); return false; }
+	g_dAdd = clCreateBuffer( g_context, CL_MEM_WRITE_ONLY, reflBytes, nullptr, &err );
+	if ( !CheckCL( err, "dAdd alloc" ) ) { ReleaseGatherBuffers(); return false; }
+
+	if ( !WriteBufferChunked( g_dRefl, reflBytes, pReflectivity, "refl upload" ) ||
+		 !WriteBufferChunked( g_dTrans, transBytes, pTransfers, "trans upload" ) ||
+		 !WriteBufferChunked( g_dOff, offBytes, pOffsets, "off upload" ) ||
+		 !WriteBufferChunked( g_dPatchEnv, envBytes, pPatchEnvIds, "env upload" ) )
+	{
+		ReleaseGatherBuffers();
+		return false;
+	}
 
 	const int nVol = LightEnv_VolumeCount();
 	const int nTint = nVol + 1;
@@ -845,10 +1093,9 @@ bool VRadGPU_UploadTransferGraph( const Vector *pReflectivity,
 	g_dVolUseBright = clCreateBuffer( g_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
 									  sizeof( int ) * nTint, useBright.data(), &err );
 
-	if ( !g_dRefl || !g_dTrans || !g_dOff || !g_dPatchEnv || !g_dEmit || !g_dAdd ||
-		 !g_dVolTint || !g_dVolUseColor || !g_dVolUseBright )
+	if ( !g_dVolTint || !g_dVolUseColor || !g_dVolUseBright )
 	{
-		Warning( "[VRAD-GPU] UploadTransferGraph buffer alloc failed\n" );
+		Warning( "[VRAD-GPU] UploadTransferGraph volume buffers failed\n" );
 		ReleaseGatherBuffers();
 		return false;
 	}
@@ -861,13 +1108,20 @@ bool VRadGPU_UploadTransferGraph( const Vector *pReflectivity,
 
 bool VRadGPU_GatherBounce( const Vector *pEmitLight, Vector *pAddLight, int nPatches )
 {
-	if ( !g_bActive || nPatches != g_nPatchesCached || !g_dEmit )
+	if ( !VRadGPU_IsActive() || nPatches != g_nPatchesCached || !g_dEmit )
 		return false;
 
 	std::lock_guard<std::mutex> lock( g_clMutex );
+	if ( g_bGPUFailed )
+		return false;
 
 	cl_int err = clEnqueueWriteBuffer( g_queue, g_dEmit, CL_FALSE, 0,
 									   sizeof( Vector ) * nPatches, pEmitLight, 0, nullptr, nullptr );
+	if ( !CheckCL( err, "emit upload" ) )
+	{
+		MarkGPUFailed( "gather emit upload" );
+		return false;
+	}
 
 	clSetKernelArg( g_kGather, 0, sizeof( cl_mem ), &g_dEmit );
 	clSetKernelArg( g_kGather, 1, sizeof( cl_mem ), &g_dRefl );
@@ -883,12 +1137,18 @@ bool VRadGPU_GatherBounce( const Vector *pEmitLight, Vector *pAddLight, int nPat
 
 	size_t global = (size_t)nPatches;
 	err = clEnqueueNDRangeKernel( g_queue, g_kGather, 1, nullptr, &global, nullptr, 0, nullptr, nullptr );
-	if ( err != CL_SUCCESS )
+	if ( !CheckCL( err, "kGatherBounce enqueue" ) )
 	{
-		CheckCL( err, "kGatherBounce enqueue" );
+		MarkGPUFailed( "gather kernel" );
 		return false;
 	}
+
 	err = clEnqueueReadBuffer( g_queue, g_dAdd, CL_TRUE, 0,
 							   sizeof( Vector ) * nPatches, pAddLight, 0, nullptr, nullptr );
-	return err == CL_SUCCESS;
+	if ( !CheckCL( err, "gather readback" ) )
+	{
+		MarkGPUFailed( "gather readback" );
+		return false;
+	}
+	return true;
 }

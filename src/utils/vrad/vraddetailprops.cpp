@@ -21,6 +21,10 @@
 #include "mathlib/halton.h"
 #include "messbuf.h"
 #include "byteswap.h"
+#include "vrad_gpu.h"
+
+#include <vector>
+#include <algorithm>
 
 bool LoadStudioModel( char const* pModelName, CUtlBuffer& buf );
 
@@ -663,23 +667,93 @@ static void ComputeAmbientLightingAtPoint( int iThread, const Vector &origin, Ve
 }
 
 //-----------------------------------------------------------------------------
+// Walk the BSP for one bounce ray and accumulate the lightmap color at the
+// hit. Returns false if the walk found no surface at all (caller may retry
+// with a longer ray); returns true when the ray is fully handled, even if
+// the surface contributed nothing (sky / unlit faces).
+//-----------------------------------------------------------------------------
+static bool SampleIndirectRay( int iThread, const Vector &position, const Vector &dir,
+							   float rayLen, Vector &outColor )
+{
+	Vector vEnd;
+	VectorMA( position, rayLen, dir, vEnd );
+
+	Ray_t ray;
+	ray.Init( position, vEnd, vec3_origin, vec3_origin );
+
+	CLightSurface surfEnum( iThread );
+	if ( !surfEnum.FindIntersection( ray ) )
+		return false;
+
+	// get color from surface lightmap
+	texinfo_t* pTex = &texinfo[surfEnum.m_pSurface->texinfo];
+	if ( !pTex || pTex->flags & SURF_SKY )
+	{
+		// ignore contribution from sky
+		// sky ambient already accounted for during direct pass
+		return true;
+	}
+
+	if ( surfEnum.m_pSurface->styles[0] == 255 || surfEnum.m_pSurface->lightofs < 0 )
+	{
+		// no light affects this face
+		return true;
+	}
+
+	Vector lightmapColor;
+	if ( !surfEnum.m_bHasLuxel )
+	{
+		ColorRGBExp32* pAvgLightmapColor = dface_AvgLightColor( surfEnum.m_pSurface, 0 );
+		ColorRGBExp32ToVector( *pAvgLightmapColor, lightmapColor );
+	}
+	else
+	{
+		// get color from displacement
+		int smax = ( surfEnum.m_pSurface->m_LightmapTextureSizeInLuxels[0] ) + 1;
+		int tmax = ( surfEnum.m_pSurface->m_LightmapTextureSizeInLuxels[1] ) + 1;
+
+		// luxelcoord is in the space of the accumulated lightmap page; we need to convert
+		// it to be in the space of the surface
+		int ds = clamp( (int)surfEnum.m_LuxelCoord.x, 0, smax-1 );
+		int dt = clamp( (int)surfEnum.m_LuxelCoord.y, 0, tmax-1 );
+
+		ColorRGBExp32* pLightmap = (ColorRGBExp32*)&(*pdlightdata)[surfEnum.m_pSurface->lightofs];
+		pLightmap += dt * smax + ds;
+		ColorRGBExp32ToVector( *pLightmap, lightmapColor );
+	}
+
+	float invLengthSqr = 1.0f / (1.0f + ((vEnd - position) * surfEnum.m_HitFrac / 128.0).LengthSqr());
+	// Include falloff using invsqrlaw.
+	VectorMultiply( lightmapColor, invLengthSqr * dtexdata[pTex->texdata].reflectivity, lightmapColor );
+	VectorAdd( outColor, lightmapColor, outColor );
+	return true;
+}
+
+//-----------------------------------------------------------------------------
 // Trace hemispherical rays from a vertex, accumulating indirect
 // sources at each ray termination.
+//
+// GPU fast path: batch all hemisphere rays through the OpenCL BVH first.
+// Rays that miss everything or hit sky are dropped without a BSP walk
+// (most rays outdoors), and real hits shorten the CPU walk from
+// MAX_TRACE_LENGTH to just past the known hit distance.
 //-----------------------------------------------------------------------------
 void ComputeIndirectLightingAtPoint( Vector &position, Vector &normal, Vector &outColor,
 									 int iThread, bool force_fast, bool bIgnoreNormals )
 {
-	Ray_t			ray;
-	CLightSurface	surfEnum(iThread);
-
 	outColor.Init();
 
-	
 	int nSamples = NUMVERTEXNORMALS;
 	if ( do_fast || force_fast )
 		nSamples /= 4;
 	else
 		nSamples *= g_flSkySampleScale;
+
+	// Generate the forward hemisphere directions up front.
+	std::vector<Vector> dirs;
+	std::vector<float> dots;
+	dirs.reserve( nSamples );
+	dots.reserve( nSamples );
 
 	float totalDot = 0;
 	DirectionalSampler_t sampler;
@@ -700,58 +774,54 @@ void ComputeIndirectLightingAtPoint( Vector &position, Vector &normal, Vector &o
 		}
 
 		totalDot += dot;
+		dirs.push_back( samplingNormal );
+		dots.push_back( dot );
+	}
 
-		// trace to determine surface
-		Vector vEnd;
-		VectorScale( samplingNormal, MAX_TRACE_LENGTH, vEnd );
-		VectorAdd( position, vEnd, vEnd );
-
-		ray.Init( position, vEnd, vec3_origin, vec3_origin );
-		if ( !surfEnum.FindIntersection( ray ) )
-			continue;
-
-		// get color from surface lightmap
-		texinfo_t* pTex = &texinfo[surfEnum.m_pSurface->texinfo];
-		if ( !pTex || pTex->flags & SURF_SKY )
+	const int nRays = (int)dirs.size();
+	if ( nRays > 0 )
+	{
+		bool bGPUDone = false;
+		if ( VRadGPU_HasScene() && nRays >= 8 )
 		{
-			// ignore contribution from sky
-			// sky ambient already accounted for during direct pass
-			continue;
+			std::vector<Vector> starts( nRays ), ends( nRays );
+			for ( int j = 0; j < nRays; j++ )
+			{
+				starts[j] = position;
+				VectorMA( position, MAX_TRACE_LENGTH, dirs[j], ends[j] );
+			}
+			std::vector<float> hitT( nRays );
+			std::vector<int> hitFlags( nRays );
+			if ( VRadGPU_TraceClosest( starts.data(), ends.data(), hitT.data(), hitFlags.data(), nRays ) )
+			{
+				for ( int j = 0; j < nRays; j++ )
+				{
+					const bool bHit = hitT[j] < MAX_TRACE_LENGTH - 1.0f;
+					if ( !bHit || ( hitFlags[j] & TRACE_ID_SKY ) )
+						continue;	// escaped to void or sky — no bounce
+
+					// Static props aren't part of the BSP walk; the first world
+					// surface may lie beyond the prop, so keep the full ray.
+					float rayLen = MAX_TRACE_LENGTH;
+					if ( !( hitFlags[j] & TRACE_ID_STATICPROP ) )
+						rayLen = (std::min)( (float)MAX_TRACE_LENGTH, hitT[j] + 64.0f );
+
+					if ( !SampleIndirectRay( iThread, position, dirs[j], rayLen, outColor ) &&
+						 rayLen < MAX_TRACE_LENGTH )
+					{
+						// Shortened walk found nothing (rare BVH/BSP mismatch) — retry full.
+						SampleIndirectRay( iThread, position, dirs[j], MAX_TRACE_LENGTH, outColor );
+					}
+				}
+				bGPUDone = true;
+			}
 		}
 
-		if ( surfEnum.m_pSurface->styles[0] == 255 || surfEnum.m_pSurface->lightofs < 0 )
+		if ( !bGPUDone )
 		{
-			// no light affects this face
-			continue;
+			for ( int j = 0; j < nRays; j++ )
+				SampleIndirectRay( iThread, position, dirs[j], MAX_TRACE_LENGTH, outColor );
 		}
-
-
-		Vector lightmapColor;
-		if ( !surfEnum.m_bHasLuxel )
-		{
-			ColorRGBExp32* pAvgLightmapColor = dface_AvgLightColor( surfEnum.m_pSurface, 0 );
-			ColorRGBExp32ToVector( *pAvgLightmapColor, lightmapColor );
-		}
-		else
-		{
-			// get color from displacement
-			int smax = ( surfEnum.m_pSurface->m_LightmapTextureSizeInLuxels[0] ) + 1;
-			int tmax = ( surfEnum.m_pSurface->m_LightmapTextureSizeInLuxels[1] ) + 1;
-
-			// luxelcoord is in the space of the accumulated lightmap page; we need to convert
-			// it to be in the space of the surface
-			int ds = clamp( (int)surfEnum.m_LuxelCoord.x, 0, smax-1 );
-			int dt = clamp( (int)surfEnum.m_LuxelCoord.y, 0, tmax-1 );
-
-			ColorRGBExp32* pLightmap = (ColorRGBExp32*)&(*pdlightdata)[surfEnum.m_pSurface->lightofs];
-			pLightmap += dt * smax + ds;
-			ColorRGBExp32ToVector( *pLightmap, lightmapColor );
-		}
-
-		float invLengthSqr = 1.0f / (1.0f + ((vEnd - position) * surfEnum.m_HitFrac / 128.0).LengthSqr());
-		// Include falloff using invsqrlaw.
-		VectorMultiply( lightmapColor, invLengthSqr * dtexdata[pTex->texdata].reflectivity, lightmapColor );
-		VectorAdd( outColor, lightmapColor, outColor );
 	}
 
 	if ( totalDot )

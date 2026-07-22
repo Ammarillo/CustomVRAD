@@ -26,6 +26,8 @@
 #include "coordsize.h"
 #include "envvolume.h"
 #include "ao.h"
+#include "absorb.h"
+#include "portal.h"
 
 enum
 {
@@ -1005,6 +1007,8 @@ void FreeDLights()
 	gSkyLight = NULL;
 	gAmbient = NULL;
 	LightEnv_ClearVolumes();
+	Absorb_Clear();
+	Portal_Clear();
 
 	directlight_t *pNext;
 	for( directlight_t *pCur=activelights; pCur; pCur=pNext )
@@ -1719,6 +1723,25 @@ void CreateDirectLights (void)
 	{
 		e = &entities[i];
 		name = ValueForKey (e, "classname");
+		if (!strcmp(name, "light_absorb"))
+			Absorb_ParseVolumeEntity( e );
+	}
+	if ( Absorb_HasVolumes() )
+		Msg( "light_absorb: %d volume(s) active\n", Absorb_VolumeCount() );
+
+	for (i=0 ; i<(unsigned)num_entities ; i++)
+	{
+		e = &entities[i];
+		name = ValueForKey (e, "classname");
+		if (!strcmp(name, "light_portal"))
+			Portal_ParseEntity( e );
+	}
+	Portal_LinkPairs();
+
+	for (i=0 ; i<(unsigned)num_entities ; i++)
+	{
+		e = &entities[i];
+		name = ValueForKey (e, "classname");
 		if (strncmp (name, "light", 5))
 			continue;
 
@@ -1731,7 +1754,9 @@ void CreateDirectLights (void)
 			!strcmp(name, "light_env_vol") ||
 			!strcmp(name, "light_environment_volume") ||
 			!strcmp(name, "light_ao") ||
-			!strcmp(name, "light_ao_vol"))
+			!strcmp(name, "light_ao_vol") ||
+			!strcmp(name, "light_absorb") ||
+			!strcmp(name, "light_portal"))
 			continue;
 
 		if (!strcmp (name, "light_spot"))
@@ -1812,8 +1837,53 @@ void ExportDirectLightsToWorldLights()
 
 #define CONSTANT_DOT (.7/2)
 
-#define NSAMPLES_SUN_AREA_LIGHT 30							// number of samples to take for an
-                                                            // non-point sun light
+// ---------------------------------------------------------------------------
+// Soft sun (SunSpreadAngle) cone sampling.
+// Low-discrepancy directions (van der Corput radius + golden-angle spiral)
+// give smooth penumbras with no random speckle, and any prefix of the
+// sequence is evenly spread over the cone — so a short probe pass can
+// early-out luxels that are fully lit or fully shadowed.
+// ---------------------------------------------------------------------------
+static inline float SoftSunRadicalInverse( unsigned int i )
+{
+	i = ( i << 16 ) | ( i >> 16 );
+	i = ( ( i & 0x00ff00ffu ) << 8 ) | ( ( i & 0xff00ff00u ) >> 8 );
+	i = ( ( i & 0x0f0f0f0fu ) << 4 ) | ( ( i & 0xf0f0f0f0u ) >> 4 );
+	i = ( ( i & 0x33333333u ) << 2 ) | ( ( i & 0xccccccccu ) >> 2 );
+	i = ( ( i & 0x55555555u ) << 1 ) | ( ( i & 0xaaaaaaaau ) >> 1 );
+	return (float)( i * 2.3283064365386963e-10 );
+}
+
+// Scale ray count with spread angle: small penumbras need far fewer rays.
+static int SoftSunSampleCount( float flSinExtent, bool bFast )
+{
+	float s = flSinExtent;
+	if ( s < 0.0f ) s = 0.0f;
+	if ( s > 1.0f ) s = 1.0f;
+	const float angleDeg = (float)( asin( s ) * ( 180.0 / M_PI ) );
+	int n = 8 + (int)( angleDeg * 0.6f );		// 2° → 9, 20° → 20, 50° → 38
+	if ( n > 40 )
+		n = 40;
+	if ( bFast )
+	{
+		n /= 3;
+		if ( n < 6 )
+			n = 6;
+	}
+	return n;
+}
+
+static void SoftSunSampleDelta( const Vector &axis, const Vector &t1, const Vector &t2,
+								float cosThetaMax, int i, Vector &deltaOut )
+{
+	// Sample 0 is the exact sun direction; later samples fill the cone evenly.
+	const float u = ( i == 0 ) ? 0.0f : SoftSunRadicalInverse( (unsigned int)i );
+	const float cosTheta = 1.0f - u * ( 1.0f - cosThetaMax );
+	const float sinTheta = sqrtf( fmaxf( 0.0f, 1.0f - cosTheta * cosTheta ) );
+	const float phi = (float)i * 2.3999632f;	// golden angle
+	Vector dir = axis * cosTheta + ( t1 * cosf( phi ) + t2 * sinf( phi ) ) * sinTheta;
+	VectorScale( dir, MAX_TRACE_LENGTH, deltaOut );
+}
 
 // Helper function - gathers light from sun (emit_skylight)
 void GatherSampleSkyLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, int facenum, 
@@ -1837,18 +1907,19 @@ void GatherSampleSkyLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, i
 		return;
 
 	float sunExtent = dl->m_flSunAngularExtent;
-	int nsamples = 1;
-	if ( sunExtent > 0.0f )
-	{
-		nsamples = NSAMPLES_SUN_AREA_LIGHT;
-		if ( do_fast || force_fast )
-			nsamples /= 4;
-	}
+	const int nsamples = ( sunExtent > 0.0f ) ? SoftSunSampleCount( sunExtent, do_fast || force_fast ) : 1;
+
+	// Cone basis around the direction toward the sun.
+	Vector axis = -dl->light.normal;
+	Vector t1, t2;
+	VectorVectors( axis, t1, t2 );
+	float sinExtent = ( sunExtent > 1.0f ) ? 1.0f : sunExtent;
+	const float cosThetaMax = sqrtf( fmaxf( 0.0f, 1.0f - sinExtent * sinExtent ) );
 
 	fltx4 totalFractionVisible = Four_Zeros;
 	fltx4 fractionVisible = Four_Zeros;
-
-	DirectionalSampler_t sampler;
+	int nTraced = nsamples;
+	bool bTraceDone = false;
 
 	// Soft sun: batch GPU closest-hits when enough samples.
 	if ( VRadGPU_HasScene() && nsamples >= 8 )
@@ -1859,13 +1930,7 @@ void GatherSampleSkyLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, i
 		for ( int d = 0; d < nsamples; d++ )
 		{
 			Vector delta;
-			VectorScale( dl->light.normal, -MAX_TRACE_LENGTH, delta );
-			if ( d )
-			{
-				Vector ofs = sampler.NextValue();
-				ofs *= MAX_TRACE_LENGTH * sunExtent;
-				delta += ofs;
-			}
+			SoftSunSampleDelta( axis, t1, t2, cosThetaMax, d, delta );
 			for ( int lane = 0; lane < 4; lane++ )
 			{
 				starts.push_back( pos.Vec( lane ) );
@@ -1890,37 +1955,58 @@ void GatherSampleSkyLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, i
 				}
 				totalFractionVisible = AddSIMD( totalFractionVisible, LoadUnalignedSIMD( vis ) );
 			}
-			goto sky_see_amount;
+			bTraceDone = true;
 		}
-		// GPU failed — fall through to CPU (reset sampler state by recomputing)
-		totalFractionVisible = Four_Zeros;
-		sampler = DirectionalSampler_t();
-	}
-
-	for ( int d = 0; d < nsamples; d++ )
-	{
-		// determine visibility of skylight
-		// serach back to see if we can hit a sky brush
-		Vector delta;
-		VectorScale( dl->light.normal, -MAX_TRACE_LENGTH, delta );
-		if ( d )
+		else
 		{
-			// jitter light source location
-			Vector ofs = sampler.NextValue();
-			ofs *= MAX_TRACE_LENGTH * sunExtent;
-			delta += ofs;
+			// GPU failed — fall back to CPU tracing below.
+			totalFractionVisible = Four_Zeros;
 		}
-		FourVectors delta4;
-		delta4.DuplicateVector ( delta );
-		delta4 += pos;
-
-		TestLine_DoesHitSky ( pos, delta4, &fractionVisible, true, static_prop_index_to_ignore );
-
-		totalFractionVisible = AddSIMD ( totalFractionVisible, fractionVisible );
 	}
 
-sky_see_amount:
-	fltx4 seeAmount = MulSIMD ( totalFractionVisible, ReplicateX4 ( 1.0f / nsamples ) );
+	if ( !bTraceDone )
+	{
+		// Probe a well-spread prefix first; luxels fully lit or fully shadowed
+		// across all 4 lanes skip the rest of the cone (penumbra pays full cost).
+		const int probe = ( nsamples > 12 ) ? 8 : nsamples;
+
+		for ( int d = 0; d < nsamples; d++ )
+		{
+			Vector delta;
+			if ( nsamples == 1 )
+				VectorScale( dl->light.normal, -MAX_TRACE_LENGTH, delta );
+			else
+				SoftSunSampleDelta( axis, t1, t2, cosThetaMax, d, delta );
+			FourVectors delta4;
+			delta4.DuplicateVector ( delta );
+			delta4 += pos;
+
+			TestLine_DoesHitSky ( pos, delta4, &fractionVisible, true, static_prop_index_to_ignore );
+
+			totalFractionVisible = AddSIMD ( totalFractionVisible, fractionVisible );
+
+			if ( d + 1 == probe && nsamples > probe )
+			{
+				bool bUniform = true;
+				for ( int lane = 0; lane < 4; lane++ )
+				{
+					float f = SubFloat( totalFractionVisible, lane );
+					if ( f > 1e-4f && f < (float)probe - 1e-4f )
+					{
+						bUniform = false;
+						break;
+					}
+				}
+				if ( bUniform )
+				{
+					nTraced = probe;
+					break;
+				}
+			}
+		}
+	}
+
+	fltx4 seeAmount = MulSIMD ( totalFractionVisible, ReplicateX4 ( 1.0f / nTraced ) );
 	out.m_flDot[0] = MulSIMD ( dot, seeAmount );
 	out.m_flFalloff = Four_Ones;
 	out.m_flSunAmount = MulSIMD ( seeAmount, ReplicateX4( 10000.0f ) );
@@ -2440,6 +2526,19 @@ void GatherSampleLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, int 
 		out.m_flSunAmount = MulSIMD( out.m_flSunAmount, envWeights );
 		for ( int b = 0; b < normalCount; b++ )
 			out.m_flDot[b] = MulSIMD( out.m_flDot[b], envWeights );
+	}
+
+	if ( Absorb_HasVolumes() )
+	{
+		fltx4 absorbScale = Four_Ones;
+		absorbScale = SetComponentSIMD( absorbScale, 0, Absorb_DirectScale( pos.Vec( 0 ) ) );
+		absorbScale = SetComponentSIMD( absorbScale, 1, Absorb_DirectScale( pos.Vec( 1 ) ) );
+		absorbScale = SetComponentSIMD( absorbScale, 2, Absorb_DirectScale( pos.Vec( 2 ) ) );
+		absorbScale = SetComponentSIMD( absorbScale, 3, Absorb_DirectScale( pos.Vec( 3 ) ) );
+		out.m_flFalloff = MulSIMD( out.m_flFalloff, absorbScale );
+		out.m_flSunAmount = MulSIMD( out.m_flSunAmount, absorbScale );
+		for ( int b = 0; b < normalCount; b++ )
+			out.m_flDot[b] = MulSIMD( out.m_flDot[b], absorbScale );
 	}
 
 	// NOTE: Notice here that if the light is on the back side of the face
