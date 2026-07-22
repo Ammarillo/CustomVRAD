@@ -27,7 +27,6 @@
 #include "envvolume.h"
 #include "ao.h"
 #include "absorb.h"
-#include "portal.h"
 
 enum
 {
@@ -1008,7 +1007,6 @@ void FreeDLights()
 	gAmbient = NULL;
 	LightEnv_ClearVolumes();
 	Absorb_Clear();
-	Portal_Clear();
 
 	directlight_t *pNext;
 	for( directlight_t *pCur=activelights; pCur; pCur=pNext )
@@ -1740,15 +1738,6 @@ void CreateDirectLights (void)
 	{
 		e = &entities[i];
 		name = ValueForKey (e, "classname");
-		if (!strcmp(name, "light_portal"))
-			Portal_ParseEntity( e );
-	}
-	Portal_LinkPairs();
-
-	for (i=0 ; i<(unsigned)num_entities ; i++)
-	{
-		e = &entities[i];
-		name = ValueForKey (e, "classname");
 		if (strncmp (name, "light", 5))
 			continue;
 
@@ -1762,8 +1751,7 @@ void CreateDirectLights (void)
 			!strcmp(name, "light_environment_volume") ||
 			!strcmp(name, "light_ao") ||
 			!strcmp(name, "light_ao_vol") ||
-			!strcmp(name, "light_absorb") ||
-			!strcmp(name, "light_portal"))
+			!strcmp(name, "light_absorb"))
 			continue;
 
 		if (!strcmp (name, "light_spot"))

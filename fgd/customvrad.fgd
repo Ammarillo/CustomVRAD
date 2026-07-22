@@ -138,17 +138,3 @@
 	]
 	priority(integer) : "Priority" : 0 : "When volumes fully overlap (core), higher priority wins. Ties use the smaller volume."
 ]
-
-// -----------------------------------------------------------------------------
-// light_portal — linked-space radiosity portal (brush)
-// Pair with targetname / target. Mutual targeting = bidirectional.
-// -----------------------------------------------------------------------------
-@SolidClass base(Targetname, Angles) color(80 200 255) = light_portal :
-	"Compile-time radiosity portal for CustomVRAD. " +
-	"Links two spaces so bounce lighting can transfer through the portal aperture. " +
-	"Set target to the other portal's targetname. If both target each other, transfer is bidirectional. " +
-	"Angles define the portal plane forward (exit direction)."
-[
-	target(target_destination) : "Target Portal" : : "targetname of the linked light_portal."
-	pitch(integer) : "Pitch" : 0 : "Overrides the pitch value in Angles."
-]

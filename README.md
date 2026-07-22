@@ -16,7 +16,6 @@ Compatible lightmap / BSP lighting output for the engine. Experimental — valid
 | `light_env_vol` | brush entity | Local sky / sun / ambient override volumes |
 | `light_ao` / `light_ao_vol` | point / brush | Baked ambient occlusion (map-wide or local) |
 | `light_absorb` | brush entity | Volumes that damp bounce (and optional direct) light |
-| `light_portal` | brush entity | Linked radiosity portals between spaces |
 | Soft sun | bake | Faster, smoother `SunSpreadAngle` / `-softsun` cone sampling |
 | Cross-face bounce weld | bake | Edge-weighted bounce across coplanar face seams |
 | `-gpu` | CLI | OpenCL bounce gather, AO / sky occlusion, prop bounce culling |
@@ -40,7 +39,6 @@ Stock VRAD flags (`-hdr`, `-final`, `-StaticPropLighting`, `-textureshadows`, et
 | `light_ao` | Point entity (Entity Tool) |
 | `light_ao_vol` | Tie brush to entity |
 | `light_absorb` | Tie brush to entity |
-| `light_portal` | Tie brush to entity; pair with `targetname` / `target` |
 
 Legacy classname `light_environment_volume` is still accepted for env volumes. Stock **VBSP** is fine — these entities are compile-time only.
 
@@ -117,18 +115,6 @@ Damps lighting inside a soft-blended brush volume.
 | `BlendDistance` / `BlendMode` / `priority` | like env vols | Soft fade + overlap |
 
 Start low — high strength can crush bounce.
-
----
-
-## `light_portal` — radiosity portals
-
-Links two spaces so bounce can transfer through an aperture.
-
-- Set `target` to the other portal’s `targetname`.
-- Mutual targeting = **bidirectional**.
-- **Angles** / `pitch` define portal plane forward (exit direction).
-
-Keep portals thin and facing the rooms they connect. Uses aperture UV remap + angle rotation for transfer rays.
 
 ---
 

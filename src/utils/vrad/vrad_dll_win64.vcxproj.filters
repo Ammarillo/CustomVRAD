@@ -80,9 +80,6 @@
     <ClInclude Include="absorb.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="portal.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="lightmap.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -422,9 +419,6 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="absorb.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="portal.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="lightmap.cpp">

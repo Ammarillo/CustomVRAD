@@ -22,7 +22,6 @@
 #include "vrad_gpu.h"
 #include "ao.h"
 #include "absorb.h"
-#include "portal.h"
 #include "radial.h"
 #include "byteswap.h"
 
@@ -2019,9 +2018,6 @@ void MakeAllScales (void)
 	// determine visibility between patches
 	BuildVisMatrix ();
 
-	// Extra radiosity links through light_portal pairs (after normal MakeScales).
-	Portal_BuildExtraTransfers();
-	
 	// release visibility matrix
 	FreeVisMatrix ();
 
