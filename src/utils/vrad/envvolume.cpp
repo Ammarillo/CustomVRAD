@@ -10,6 +10,7 @@
 static LightEnvVolumeInfo_t s_Volumes[LIGHTENV_MAX_VOLUMES];
 static int s_nVolumes = 0;
 static bool s_bAnyInboundBounceTint = false;
+static bool s_bAnyShadowCastFilter = false;
 static float s_flDefaultBounceIntensity = 1.0f;
 static CUtlVector<int> s_PatchEnvId;
 
@@ -17,6 +18,7 @@ void LightEnv_ClearVolumes()
 {
 	s_nVolumes = 0;
 	s_bAnyInboundBounceTint = false;
+	s_bAnyShadowCastFilter = false;
 	s_flDefaultBounceIntensity = 1.0f;
 	s_PatchEnvId.RemoveAll();
 }
@@ -37,7 +39,8 @@ bool LightEnv_HasInboundBounceTinting()
 }
 
 int LightEnv_AddVolume( const Vector &mins, const Vector &maxs, float blendDistance, int blendMode, int priority,
-						bool inboundBounceUsesVolumeColor, bool inboundBounceUsesVolumeBrightness )
+						bool inboundBounceUsesVolumeColor, bool inboundBounceUsesVolumeBrightness,
+						bool outsideCastShadow, bool insideCastShadow )
 {
 	if ( s_nVolumes >= LIGHTENV_MAX_VOLUMES )
 	{
@@ -56,6 +59,8 @@ int LightEnv_AddVolume( const Vector &mins, const Vector &maxs, float blendDista
 	v.priority = priority;
 	v.bInboundBounceUsesVolumeColor = inboundBounceUsesVolumeColor;
 	v.bInboundBounceUsesVolumeBrightness = inboundBounceUsesVolumeBrightness;
+	v.bOutsideCastShadow = outsideCastShadow;
+	v.bInsideCastShadow = insideCastShadow;
 	v.bounceTint.Init( 1.0f, 1.0f, 1.0f );
 	v.bounceIntensity = 1.0f;
 
@@ -68,9 +73,47 @@ int LightEnv_AddVolume( const Vector &mins, const Vector &maxs, float blendDista
 
 	if ( inboundBounceUsesVolumeColor )
 		s_bAnyInboundBounceTint = true;
+	if ( !outsideCastShadow || !insideCastShadow )
+		s_bAnyShadowCastFilter = true;
 
 	++s_nVolumes;
 	return v.envId;
+}
+
+bool LightEnv_HasShadowCastFilters()
+{
+	return s_bAnyShadowCastFilter;
+}
+
+static bool PointInVolumeAABB( const LightEnvVolumeInfo_t &v, const Vector &pos )
+{
+	return pos.x >= v.mins.x && pos.x <= v.maxs.x &&
+		   pos.y >= v.mins.y && pos.y <= v.maxs.y &&
+		   pos.z >= v.mins.z && pos.z <= v.maxs.z;
+}
+
+bool LightEnv_ShouldIgnoreSkyOccluder( const Vector &samplePos, const Vector &hitPos )
+{
+	if ( !s_bAnyShadowCastFilter )
+		return false;
+
+	for ( int i = 0; i < s_nVolumes; ++i )
+	{
+		const LightEnvVolumeInfo_t &v = s_Volumes[i];
+		if ( v.bOutsideCastShadow && v.bInsideCastShadow )
+			continue;
+
+		const bool sampleIn = PointInVolumeAABB( v, samplePos );
+		const bool hitIn = PointInVolumeAABB( v, hitPos );
+
+		// Outside geo → sample inside volume
+		if ( sampleIn && !hitIn && !v.bOutsideCastShadow )
+			return true;
+		// Inside geo → sample outside volume
+		if ( !sampleIn && hitIn && !v.bInsideCastShadow )
+			return true;
+	}
+	return false;
 }
 
 void LightEnv_SetDefaultBounceIntensity( const Vector &lightColor )

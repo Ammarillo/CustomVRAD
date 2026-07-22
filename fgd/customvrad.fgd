@@ -42,6 +42,16 @@
 		0 : "No (keep luminance)"
 		1 : "Yes (scale to volume brightness)"
 	]
+	OutsideCastShadowIn(choices) : "OutsideCastShadowIn" : 1 : "Outside geometry casts sun/sky shadows into this volume. No = outside blockers are ignored for samples inside." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	InsideCastShadowOut(choices) : "InsideCastShadowOut" : 1 : "Inside geometry casts sun/sky shadows outside this volume. No = inside blockers are ignored for samples outside." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
 ]
 
 // -----------------------------------------------------------------------------

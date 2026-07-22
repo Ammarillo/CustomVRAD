@@ -1574,9 +1574,14 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 		IntForKeyWithDefault( e, "BounceVolColor", IntForKeyWithDefault( e, "InboundBounceUsesVolumeColor", 0 ) ) != 0;
 	bool inboundBounceUsesVolumeBrightness =
 		IntForKeyWithDefault( e, "BounceVolBright", IntForKeyWithDefault( e, "InboundBounceUsesVolumeBrightness", 0 ) ) != 0;
+	bool outsideCastShadow = IntForKeyWithDefault( e, "OutsideCastShadowIn",
+		IntForKeyWithDefault( e, "OutsideCastShadow", 1 ) ) != 0;
+	bool insideCastShadow = IntForKeyWithDefault( e, "InsideCastShadowOut",
+		IntForKeyWithDefault( e, "InsideCastShadow", 1 ) ) != 0;
 
 	int envId = LightEnv_AddVolume( pModelData->mins, pModelData->maxs, blendDistance, blendMode, priority,
-									inboundBounceUsesVolumeColor, inboundBounceUsesVolumeBrightness );
+									inboundBounceUsesVolumeColor, inboundBounceUsesVolumeBrightness,
+									outsideCastShadow, insideCastShadow );
 	if ( envId == LIGHTENV_ID_NONE )
 		return;
 
@@ -1609,13 +1614,15 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 	else if ( blendMode == LIGHTENV_BLEND_OUTSIDE )
 		pBlendModeName = "outside";
 
-	Msg( "light_env_vol env %d  mins(%.0f %.0f %.0f) maxs(%.0f %.0f %.0f) blend %.1f mode %s priority %d inboundBounceColor %s brightness %s\n",
+	Msg( "light_env_vol env %d  mins(%.0f %.0f %.0f) maxs(%.0f %.0f %.0f) blend %.1f mode %s priority %d inboundBounceColor %s brightness %s outsideShadow %s insideShadow %s\n",
 		 envId,
 		 pModelData->mins.x, pModelData->mins.y, pModelData->mins.z,
 		 pModelData->maxs.x, pModelData->maxs.y, pModelData->maxs.z,
 		 blendDistance, pBlendModeName, priority,
 		 inboundBounceUsesVolumeColor ? "yes" : "no",
-		 inboundBounceUsesVolumeBrightness ? "yes" : "no" );
+		 inboundBounceUsesVolumeBrightness ? "yes" : "no",
+		 outsideCastShadow ? "yes" : "no",
+		 insideCastShadow ? "yes" : "no" );
 }
 
 static void ParseLightPoint( entity_t* e, directlight_t* dl )
@@ -1941,6 +1948,7 @@ void GatherSampleSkyLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, i
 		std::vector<int> hitFlags( starts.size() );
 		if ( VRadGPU_TraceClosest( starts.data(), ends.data(), hitT.data(), hitFlags.data(), (int)starts.size() ) )
 		{
+			const bool bFilterShadows = LightEnv_HasShadowCastFilters();
 			for ( int d = 0; d < nsamples; d++ )
 			{
 				float vis[4];
@@ -1951,6 +1959,12 @@ void GatherSampleSkyLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, i
 					float tmax = dd.Length();
 					bool bHit = hitT[ri] < tmax - 1e-3f;
 					bool bSky = ( hitFlags[ri] & TRACE_ID_SKY ) != 0;
+					if ( bHit && !bSky && bFilterShadows )
+					{
+						Vector hitPos = starts[ri] + dd * ( hitT[ri] / tmax );
+						if ( LightEnv_ShouldIgnoreSkyOccluder( starts[ri], hitPos ) )
+							bHit = false;
+					}
 					vis[lane] = ( !bHit || bSky ) ? 1.0f : 0.0f;
 				}
 				totalFractionVisible = AddSIMD( totalFractionVisible, LoadUnalignedSIMD( vis ) );
@@ -2214,6 +2228,7 @@ static bool GatherSampleAmbientSkySSE_GPU( SSE_sampleLightOutput_t &out, directl
 	if ( !VRadGPU_TraceClosest( starts.data(), ends.data(), hitT.data(), hitFlags.data(), (int)starts.size() ) )
 		return false;
 
+	const bool bFilterShadows = LightEnv_HasShadowCastFilters();
 	for ( size_t si = 0; si < samples.size(); ++si )
 	{
 		const AmbSample_t &s = samples[si];
@@ -2228,6 +2243,12 @@ static bool GatherSampleAmbientSkySSE_GPU( SSE_sampleLightOutput_t &out, directl
 			// miss or sky hit => visible; opaque hit => occluded
 			bool bHit = hitT[ri] < tmax - 1e-3f;
 			bool bSky = ( hitFlags[ri] & TRACE_ID_SKY ) != 0;
+			if ( bHit && !bSky && bFilterShadows )
+			{
+				Vector hitPos = starts[ri] + d * ( hitT[ri] / tmax );
+				if ( LightEnv_ShouldIgnoreSkyOccluder( starts[ri], hitPos ) )
+					bHit = false;
+			}
 			vis[lane] = ( !bHit || bSky ) ? 1.0f : 0.0f;
 		}
 		fltx4 fractionVisible = LoadUnalignedSIMD( vis );

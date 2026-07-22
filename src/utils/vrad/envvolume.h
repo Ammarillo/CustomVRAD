@@ -35,13 +35,16 @@ struct LightEnvVolumeInfo_t
 	int		envId;		// 1..N
 	bool	bInboundBounceUsesVolumeColor;
 	bool	bInboundBounceUsesVolumeBrightness;
+	bool	bOutsideCastShadow;	// outside geo casts sun shadows into the volume
+	bool	bInsideCastShadow;	// inside geo casts sun shadows outside the volume
 	Vector	bounceTint;			// volume _light chromaticity (sums to 1)
 	float	bounceIntensity;	// sum of volume _light RGB intensity
 };
 
 void LightEnv_ClearVolumes();
 int  LightEnv_AddVolume( const Vector &mins, const Vector &maxs, float blendDistance, int blendMode, int priority,
-						 bool inboundBounceUsesVolumeColor, bool inboundBounceUsesVolumeBrightness );
+						 bool inboundBounceUsesVolumeColor, bool inboundBounceUsesVolumeBrightness,
+						 bool outsideCastShadow = true, bool insideCastShadow = true );
 void LightEnv_SetVolumeBounceTint( int envId, const Vector &lightColor );
 void LightEnv_SetDefaultBounceIntensity( const Vector &lightColor );
 float LightEnv_GetDefaultBounceIntensity();
@@ -62,6 +65,13 @@ int LightEnv_GetDominantEnvId( const Vector &pos );
 
 // True if any light_environment_volume was parsed.
 bool LightEnv_HasVolumes();
+
+// True if any volume has Outside/Inside Cast Shadow disabled (sky occlusion filter).
+bool LightEnv_HasShadowCastFilters();
+
+// True if an opaque sky-occlusion hit at hitPos should be ignored for samplePos
+// based on volume OutsideCastShadowIn / InsideCastShadowOut flags.
+bool LightEnv_ShouldIgnoreSkyOccluder( const Vector &samplePos, const Vector &hitPos );
 
 // True if any volume wants inbound bounce recoloring.
 bool LightEnv_HasInboundBounceTinting();

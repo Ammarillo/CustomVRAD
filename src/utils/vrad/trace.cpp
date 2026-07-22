@@ -13,6 +13,7 @@
 #include "trace.h"
 #include "Cmodel.h"
 #include "mathlib/vmatrix.h"
+#include "envvolume.h"
 
 
 //=============================================================================
@@ -369,6 +370,7 @@ void TestLine_DoesHitSky( FourVectors const& start, FourVectors const& stop,
 	}
 
 	float aOcclusion[4];
+	const bool bFilterShadows = LightEnv_HasShadowCastFilters();
 	for ( int i = 0; i < 4; i++ )
 	{
 		aOcclusion[i] = 0.0f;
@@ -377,12 +379,46 @@ void TestLine_DoesHitSky( FourVectors const& start, FourVectors const& stop,
 		{
 			int id = g_RtEnv.OptimizedTriangleList[rt_result.HitIds[i]].m_Data.m_IntersectData.m_nTriangleID;
 			if ( !( id & TRACE_ID_SKY ) )
+			{
+				if ( bFilterShadows )
+				{
+					const float t = rt_result.HitDistance.m128_f32[i];
+					Vector samplePos = start.Vec( i );
+					Vector dir = stop.Vec( i ) - samplePos;
+					Vector hitPos = samplePos + dir * ( t / len.m128_f32[i] );
+					if ( LightEnv_ShouldIgnoreSkyOccluder( samplePos, hitPos ) )
+						continue;
+				}
 				aOcclusion[i] = 1.0f;
+			}
 		}
 	}
 	fltx4 occlusion = LoadUnalignedSIMD( aOcclusion );
 	if (g_bTextureShadows)
 		occlusion = MaxSIMD ( occlusion, coverageCallback.GetCoverage() );
+
+	// Texture-shadow coverage can still mark ignored cross-boundary hits; clear those lanes.
+	if ( bFilterShadows )
+	{
+		for ( int i = 0; i < 4; i++ )
+		{
+			if ( aOcclusion[i] == 0.0f &&
+				 ( rt_result.HitIds[i] != -1 ) &&
+				 ( rt_result.HitDistance.m128_f32[i] < len.m128_f32[i] ) )
+			{
+				int id = g_RtEnv.OptimizedTriangleList[rt_result.HitIds[i]].m_Data.m_IntersectData.m_nTriangleID;
+				if ( !( id & TRACE_ID_SKY ) )
+				{
+					const float t = rt_result.HitDistance.m128_f32[i];
+					Vector samplePos = start.Vec( i );
+					Vector dir = stop.Vec( i ) - samplePos;
+					Vector hitPos = samplePos + dir * ( t / len.m128_f32[i] );
+					if ( LightEnv_ShouldIgnoreSkyOccluder( samplePos, hitPos ) )
+						SubFloat( occlusion, i ) = 0.0f;
+				}
+			}
+		}
+	}
 
 	bool fullyOccluded = ( TestSignSIMD( CmpGeSIMD( occlusion, Four_Ones ) ) == 0xF );
 

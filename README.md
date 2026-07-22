@@ -66,8 +66,12 @@ Brush that overrides sky, sun, and ambient **inside** its bounds. Outside (and i
 | `priority` | `0` | Overlapping cores: higher wins; ties → smaller AABB |
 | `BounceVolColor` | No | Recolor inbound radiosity to this volume’s `_light` hue |
 | `BounceVolBright` | No | With BounceVolColor: also scale bounce luminance vs map env |
+| `OutsideCastShadowIn` | Yes | Outside geometry casts sun/sky shadows **into** this volume |
+| `InsideCastShadowOut` | Yes | Inside geometry casts sun/sky shadows **outside** this volume |
 
 Bounds use the brush model AABB. Neighbor volumes use a soft Voronoi split so one volume’s outside halo does not tint another’s side.
+
+**Shadow filters** use the hard volume AABB (not the blend shell). Set `OutsideCastShadowIn` to No so outdoor walls/props don’t darken an interior volume; set `InsideCastShadowOut` to No so interior blockers don’t shadow the courtyard outside.
 
 ---
 
