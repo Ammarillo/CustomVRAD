@@ -14,14 +14,17 @@ Compatible lightmap / BSP lighting output for the engine. Experimental — valid
 | Feature | Type | Summary |
 |---------|------|---------|
 | `light_env_vol` | brush entity | Local sky / sun / ambient override volumes |
-| `light_ao` / `light_ao_vol` | point / brush | Baked ambient occlusion (map-wide or local) |
+| Directional sky ambient | bake | Zenith / horizon gradient + soft sun wrap (`_ambientzenith`, `_ambienthorizon`, `AmbientSunWrap`) |
+| Volume sun in leaf cubes | bake | Sky-visible leaf samples accumulate volume-blended sun into ambient cubes |
+| `light_ao` / `light_ao_vol` | point / brush | Baked AO with multi-scale, selective direct/bounce/sky factors, bent normals |
 | `light_absorb` | brush entity | Volumes that damp bounce (and optional direct) light |
 | `light_volume` | point entity | Soft sphere point light (scattered origins, like soft sun) |
 | Soft sun | bake | Faster, smoother `SunSpreadAngle` / `-softsun` cone sampling |
 | Cross-face bounce weld | bake | Edge-weighted bounce across coplanar face seams |
 | Lightmap seam stitching | bake | Blends luxels across coplanar VBSP face splits (`-nostitch` to disable) |
 | `-gpu` | CLI | OpenCL bounce gather, AO / sky occlusion, prop bounce culling |
-| `-coarse` / `-maxtransfer` / `-bounce_soft` | CLI | Faster / tunable radiosity |
+| `-coarse` / `-adaptivechop` / `-texbounce` / `-energy` / `-cavity` / `-maxtransfer` / `-bounce_soft` / `-bounce_boost` | CLI | Faster / tunable radiosity (cavity damp on by default) |
+| VMT `$vrad_emit*` | material | Textured emission: strength + optional mask + emitmap/basetexture color |
 | Prop lighting speedups | bake | 4-wide SSE direct + GPU-culled bounce for `-StaticPropLighting` |
 | Threading | runtime | Auto core detect (incl. >64), up to **256** threads |
 
@@ -58,6 +61,8 @@ Brush that overrides sky, sun, and ambient **inside** its bounds. Outside (and i
 | Key | Default | Description |
 |-----|---------|-------------|
 | `_light` / `_ambient` | (standard) | Sun and ambient color + brightness |
+| `_ambientzenith` / `_ambienthorizon` | `-1 -1 -1 1` (= `_ambient`) | Directional sky ambient (zenith vs horizon). Sentinel / unset = stock flat ambient |
+| `AmbientSunWrap` | `0` | Soft sun contribution into sky ambient (`0` = off; try `0.3`–`0.8`; clamped `0`–`2`) |
 | `_lightHDR` / `_ambientHDR` | `-1 -1 -1 1` | HDR overrides; leave default to use SDR |
 | `_lightscaleHDR` / `_AmbientScaleHDR` | `1` | HDR scales |
 | `pitch` | `0` | Overrides pitch in Angles |
@@ -65,14 +70,20 @@ Brush that overrides sky, sun, and ambient **inside** its bounds. Outside (and i
 | `BlendDistance` | `0` | Soft fade length (`0` = hard cut). Perlin smootherstep |
 | `BlendMode` | `2` Center | `0` Inside · `1` Outside · `2` Center |
 | `priority` | `0` | Overlapping cores: higher wins; ties → smaller AABB |
-| `BounceVolColor` | No | Recolor inbound radiosity to this volume’s `_light` hue |
+| `BounceVolColor` | No | Recolor bounced light **inside** this volume to the volume’s `_light` hue |
 | `BounceVolBright` | No | With BounceVolColor: also scale bounce luminance vs map env |
 | `OutsideCastShadowIn` | Yes | Outside geometry casts sun/sky shadows **into** this volume |
 | `InsideCastShadowOut` | Yes | Inside geometry casts sun/sky shadows **outside** this volume |
 
+If an entity still has legacy keys (`OutsideCastShadow` / `InsideCastShadow`) that disagree with the new names, VRAD prefers the **legacy** value and prints a warning — delete the unused key in Hammer and re-save.
+
+Same zenith / horizon / sun-wrap keys work on the map `light_environment`.
+
 Bounds use the brush model AABB. Neighbor volumes use a soft Voronoi split so one volume’s outside halo does not tint another’s side.
 
-**Dynamic entities** (players, NPCs, physics props) are lit by the per-leaf ambient cubes, which CustomVRAD bakes volume-aware: rays that hit lit geometry pick up the volume-lit lightmaps, and rays that hit sky use the volume-blended `_ambient` at the sample position instead of the map default. Detail props get the same treatment. Limitation: the engine’s **dynamic sun** (`light_environment` worldlight) is global — a dynamic entity that can trace to sky still receives the map sun’s color/direction, not the volume’s. Enclosed volumes (no sky visibility) are unaffected by this.
+**Dynamic entities** (players, NPCs, physics props) are lit by the per-leaf ambient cubes. CustomVRAD bakes those volume-aware: rays that hit lit geometry pick up volume-lit lightmaps; rays that hit sky use volume-blended directional `_ambient`; and when a sample can see the sun through sky, **volume-blended sun** (direction + color × visibility) is accumulated into the cube faces. Shared sky helpers also keep detail-prop and leaf-cube sky paths consistent.
+
+**Note:** the engine’s exported `light_environment` worldlight is still a single global sun for dynamic RT lighting. Leaf-cube sun fill covers most of the volume look for ambient-lit dynamics; full per-volume dynamic sun would need engine changes. Enclosed volumes (no sky visibility) are unaffected.
 
 **Shadow filters** use the hard volume AABB (not the blend shell). Set `OutsideCastShadowIn` to No so outdoor walls/props don’t darken an interior volume; set `InsideCastShadowOut` to No so interior blockers don’t shadow the courtyard outside.
 
@@ -80,7 +91,7 @@ Bounds use the brush model AABB. Neighbor volumes use a soft Voronoi split so on
 
 ## Ambient occlusion — `-ao`, `light_ao`, `light_ao_vol`
 
-Cosine-weighted hemisphere AO baked into lightmaps in `FinalLightFace` (after direct + bounce).
+Multi-scale hemisphere AO baked into lightmaps in `FinalLightFace`. AO applies **selectively**: strong on bounce / skyambient, weaker on hard direct sun (so sun isn’t crushed). Short AO rays also gather a **bent normal** (average open direction) used to lift AO in open areas.
 
 **Enable via:** CLI `-ao` / `-ao_*`, point `light_ao` (map defaults), and/or brush `light_ao_vol` (local overrides). Combine freely.
 
@@ -90,21 +101,26 @@ Cosine-weighted hemisphere AO baked into lightmaps in `FinalLightFace` (after di
 |------|---------|--------|
 | `-ao` | off | Enable AO pass |
 | `-ao_samples N` | `16` | Rays per luxel (implies `-ao`; reduced with `-fast`) |
-| `-ao_distance N` | `48` | Max ray length (implies `-ao`) |
+| `-ao_distance N` | `48` | Room-scale ray length (implies `-ao`) |
+| `-ao_contact N` | `0` (auto) | Contact-scale length; `0` = `distance * 0.35` |
 | `-ao_strength N` | `1.0` | Darkening `0`–`8` (implies `-ao`) |
 | `-ao_bias N` | `0.25` | Normal offset (implies `-ao`) |
+| `-ao_direct N` | `0.35` | AO factor on direct/sun |
+| `-ao_bounce N` | `1.0` | AO factor on bounce |
+| `-ao_sky N` | `1.0` | AO factor on skyambient-heavy samples |
+| `-ao_bent N` | `0.5` | Bent-normal lift strength |
 | `-ao_denoise` | off | Edge-preserving bilateral denoise |
 | `-ao_denoise_radius N` | `1` | Radius `1`–`4` |
 | `-ao_denoise_strength N` | `1.0` | Blend `0`–`1` |
 
 ### Entity keys
 
-Shared by `light_ao` and `light_ao_vol`: `Enabled`, `Samples`, `Distance`, `Strength`, `Bias`.
+Shared by `light_ao` and `light_ao_vol` (defaults match CLI): `Enabled`, `Samples`, `Distance`, `ContactDistance` (`0` = auto), `ContactWeight` (`0.5` = equal blend of contact vs room), `Strength`, `Bias`, `DirectFactor`, `BounceFactor`, `SkyFactor`, `BentStrength`.
 
 `light_ao` only: `Denoise`, `DenoiseRadius`, `DenoiseStrength`.  
 `light_ao_vol` only: `BlendDistance` / `BlendMode` / `priority` (same idea as env vols).
 
-Volumes soft-blend settings. `Enabled=No` carves AO out; `Enabled=Yes` can add AO when the map default is off. With `-gpu`, AO uses batched OpenCL occlusion when available.
+Volumes soft-blend settings. `Enabled=No` carves AO out; `Enabled=Yes` can add AO when the map default is off. With `-gpu`, single-scale AO can use batched OpenCL; multi-scale / bent normals use the CPU path.
 
 ---
 
@@ -201,12 +217,47 @@ Without `-gpu`, everything falls back to CPU.
 | Flag | Effect |
 |------|--------|
 | `-coarse` | Patch chop `8` — fewer patches, faster VisLeafs / bounce |
+| `-adaptivechop` | Finer patches where sky visibility contrasts (floor `4` under `-coarse`) |
+| `-texbounce` | Sample `$basetexture` albedo per patch for color bleed (supports VTF 7.5; fallback: flat texdata average) |
+| `-energy` | **Default on** — cavity-damped radiosity (enclosed bounce darkened; outdoor nearly unchanged) |
+| `-noenergy` | Stock Valve radiosity (no enclosure damp) |
+| `-cavity N` | Fully-enclosed gather scale vs stock (default `0.70`; range `0.25`–`1`; implies energy) |
 | `-maxtransfer N` | Skip patch transfers farther than N units |
 | `-bounce_soft N` | Bounce luxel splat scale (see bounce weld) |
+| `-bounce_boost N` | **Artistic** scale of final bounced light after radiosity (`1` = stock; `0`–`16`). Direct lights unchanged. Does not compound across bounces. |
 | `-nostitch` | Disable lightmap seam stitching across coplanar face splits |
 | `-threads N` | Override thread count (`1`–`256`) |
 
 Auto-detects logical processors (including >64 via processor groups). Work dispatch uses atomics so high thread counts scale better.
+
+---
+
+## VMT textured emission (`$vrad_emit*`)
+
+Per-material emissive surfaces driven by VMT keys (no `lights.rad` entry required). Emission color comes from texels — same idea as `-texbounce`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `$vrad_emit` | `0` | Set to `1` to enable (optional if strength &gt; 0) |
+| `$vrad_emitstrength` | `200` if emit on without value | Intensity scaler (same role as the 4th number in `lights.rad`) |
+| `$vrad_emitdensity` | `1` | Optional finer patch chop only (`>1` subdivides more). Contact wash is area-softened — you do **not** need high density |
+| `$vrad_emitmask` | unset | Optional greyscale mask — white = full emit, black = none |
+| `$vrad_emitmap` / `$vrad_emissivemap` | unset | Optional color map for emitted light. If unset, uses `$basetexture` |
+
+Example:
+
+```
+LightmappedGeneric
+{
+	"$basetexture" "aui/random/rainbow"
+	"$vrad_emit" "1"
+	"$vrad_emitstrength" "400"
+	"$vrad_emitmask" "aui/random/rainbow_emitmask"
+	// optional: "$vrad_emitmap" "aui/random/rainbow_emitcolor"
+}
+```
+
+CustomVRAD samples color × mask × strength per patch and creates one **`emit_surface` light per patch** with **area-soft falloff** (`1/(r²+R²)`, R from patch area) so near contact stays smooth without thousands of lights. Self-illum is also added so the surface glows. Works with VTF 7.5. `lights.rad` texlights get the same soft falloff. Worldlights cap is **65536** (stock 8192).
 
 ---
 
@@ -216,6 +267,7 @@ CustomVRAD speedups on top of stock prop vertex lighting:
 
 - **4 vertices per SSE gather** for direct light (stock duplicated one vert across all lanes)
 - **GPU bounce-ray culling** with `-gpu` (sky / miss rays skip the BSP lightmap walk)
+- **Cleaner bounce on props** — bilinear luxel reads + cheap vertex soften (keeps stock-fast sample counts)
 
 Quality flags like `-StaticPropPolys` / `-TextureShadows` still apply and are expensive — drop them for preview compiles.
 
@@ -226,7 +278,7 @@ Quality flags like `-StaticPropPolys` / `-TextureShadows` still apply and are ex
 **Quality:**
 
 ```bat
-PathToCustomVRAD\bin\vrad.exe -hdr -final -StaticPropLighting -textureshadows -ao -ao_samples 32 -gpu -game "PathToGarrysMod\garrysmod" "PathToMap\map"
+PathToCustomVRAD\bin\vrad.exe -hdr -final -StaticPropLighting -textureshadows -texbounce -ao -ao_samples 32 -gpu -game "PathToGarrysMod\garrysmod" "PathToMap\map"
 ```
 
 **Preview:**

@@ -18,6 +18,9 @@
 [
 	_light(color255) : "Brightness and Color" : "255 255 255 200" : "The sunlight color. Last number is the brightness."
 	_ambient(color255) : "Ambient Color and Brightness" : "255 255 255 20" : "Ambient color in shadows. Last number is the brightness."
+	_ambientzenith(color255) : "Ambient Zenith" : "-1 -1 -1 1" : "Sky ambient color straight up. Leave -1 -1 -1 1 to use Ambient. CustomVRAD directional sky."
+	_ambienthorizon(color255) : "Ambient Horizon" : "-1 -1 -1 1" : "Sky ambient color at the horizon. Leave -1 -1 -1 1 to use Ambient. CustomVRAD directional sky."
+	AmbientSunWrap(float) : "Ambient Sun Wrap" : "0" : "Soft sun contribution into sky ambient (0 = off, ~0.5 typical). CustomVRAD."
 	_lightHDR(color255) : "Color and Brightness (HDR)" : "-1 -1 -1 1" : "Leave as '-1 -1 -1 1' to use the SDR values."
 	_ambientHDR(color255) : "Ambient Color and Brightness (HDR)" : "-1 -1 -1 1" : "Leave as '-1 -1 -1 1' to use the SDR values."
 	_lightscaleHDR(float) : "HDR Brightness Scale" : "1" : "Amount to scale the light by when compiling for HDR."
@@ -32,12 +35,12 @@
 		2 : "Center (fade straddles face)"
 	]
 	priority(integer) : "Priority" : 0 : "When volumes fully overlap (core), higher priority wins. Ties use the smaller volume."
-	BounceVolColor(choices) : "Bounce Color From Volume" : 0 : "When light bounces into this volume from outside: No keeps the outside bounce color; Yes recolors that bounce to this volume's Brightness (_light) hue." =
+	BounceVolColor(choices) : "Bounce Color From Volume" : 0 : "Recolor bounced light inside this volume to this volume's Brightness (_light) hue. Applies to all radiosity gathered in the volume." =
 	[
-		0 : "No (outside color)"
+		0 : "No (natural bounce color)"
 		1 : "Yes (volume color)"
 	]
-	BounceVolBright(choices) : "Bounce Bright From Volume" : 0 : "Only applies if Bounce Color From Volume is Yes. No keeps the bounce luminance; Yes also scales brightness by this volume's _light intensity vs the map light_environment." =
+	BounceVolBright(choices) : "Bounce Bright From Volume" : 0 : "Only applies if Bounce Color From Volume is Yes. No keeps bounce luminance; Yes also scales brightness by this volume's _light intensity vs the map light_environment." =
 	[
 		0 : "No (keep luminance)"
 		1 : "Yes (scale to volume brightness)"
@@ -70,9 +73,15 @@
 		1 : "Yes"
 	]
 	Samples(integer) : "Samples" : 16 : "Hemisphere rays per luxel (quality vs compile time)."
-	Distance(float) : "Distance" : "48" : "Max AO ray length in world units."
+	Distance(float) : "Distance" : "48" : "Room-scale AO ray length in world units."
+	ContactDistance(float) : "Contact Distance" : "0" : "Contact-scale AO ray length. 0 = auto (Distance * 0.35)."
+	ContactWeight(float) : "Contact Weight" : "0.5" : "Blend of contact vs room AO (0=room only, 1=contact only)."
 	Strength(float) : "Strength" : "1.0" : "Darkening strength. 0 = off, 1 = normal, above 1 boosts (e.g. 1.5–3). Max 8."
 	Bias(float) : "Bias" : "0.25" : "Offset along surface normal to reduce self-occlusion (too high causes bright edge leaks)."
+	DirectFactor(float) : "Direct Factor" : "0.35" : "How much AO applies to direct/sun (keep low so hard sun isn't crushed)."
+	BounceFactor(float) : "Bounce Factor" : "1.0" : "How much AO applies to bounced light."
+	SkyFactor(float) : "Sky Factor" : "1.0" : "How much AO applies to sky ambient (when sample has little sun)."
+	BentStrength(float) : "Bent Strength" : "0.5" : "Bent-normal lift: reduce AO crush toward open directions (0=off)."
 	Denoise(choices) : "Denoise" : 0 : "Optional edge-preserving filter on the AO lightmap (reduces ray noise)." =
 	[
 		0 : "No"
@@ -97,9 +106,15 @@
 		1 : "Yes"
 	]
 	Samples(integer) : "Samples" : 16 : "Hemisphere rays per luxel inside this volume."
-	Distance(float) : "Distance" : "48" : "Max AO ray length in world units."
+	Distance(float) : "Distance" : "48" : "Room-scale AO ray length in world units."
+	ContactDistance(float) : "Contact Distance" : "0" : "Contact-scale AO ray length. 0 = auto (Distance * 0.35)."
+	ContactWeight(float) : "Contact Weight" : "0.5" : "Blend of contact vs room AO (0=room only, 1=contact only)."
 	Strength(float) : "Strength" : "1.0" : "Darkening strength. 0 = off, 1 = normal, above 1 boosts (e.g. 1.5–3). Max 8."
 	Bias(float) : "Bias" : "0.25" : "Offset along surface normal to reduce self-occlusion (too high causes bright edge leaks)."
+	DirectFactor(float) : "Direct Factor" : "0.35" : "AO on direct/sun (keep low so hard sun isn't crushed)."
+	BounceFactor(float) : "Bounce Factor" : "1.0" : "AO on bounced light."
+	SkyFactor(float) : "Sky Factor" : "1.0" : "AO on sky ambient (when sample has little sun)."
+	BentStrength(float) : "Bent Strength" : "0.5" : "Bent-normal lift toward open directions (0=off)."
 	BlendDistance(float) : "Blend Distance" : 0 : "World units for the soft fade (smootherstep). Where the fade sits is set by Blend Mode. 0 = hard cut."
 	BlendMode(choices) : "Blend Mode" : 2 : "Where Blend Distance is applied relative to the brush face." =
 	[
