@@ -88,4 +88,10 @@ ChunkFileResult_t LoadEntityKeyCallback( const char *szKey, const char *szValue,
 // fill in the global entities/num_entities array.
 bool LoadEntsFromMapFile( char const *pFilename );
 
+// Load the first/best light_environment from a .vmf into pOut (epairs allocated).
+// Searches top-level entities and Hammer "hidden" chunks (visgroup-hidden ents).
+// Prefers visible over hidden; among equals picks highest _light brightness.
+// Does not touch the global entities[] array. Returns false if not found / unreadable.
+bool LoadLightEnvironmentEntityFromVmf( const char *pFilename, entity_t *pOut );
+
 #endif // MAP_SHARED_H

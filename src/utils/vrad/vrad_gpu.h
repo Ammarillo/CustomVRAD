@@ -13,14 +13,12 @@
 class RayTracingEnvironment;
 
 extern bool g_bVRadGPURequested;
-extern bool g_bVRadGPUTransfers; // experimental; usually slower
 extern bool g_bVRadCoarsePatches; // larger chop → fewer patches
 extern float g_flMaxTransferDist; // 0 = off; world units squared cull in VisLeafs
 
 bool VRadGPU_IsActive();
 bool VRadGPU_HasScene();
 void VRadGPU_SetRequested( bool bRequested );
-void VRadGPU_SetTransfersRequested( bool bRequested );
 void VRadGPU_SetMaxTris( int nMaxTris );       // 0 = unlimited (default)
 void VRadGPU_SetRayBatchSize( int nBatch );    // default 32768
 

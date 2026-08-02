@@ -22,7 +22,6 @@
 #include <atomic>
 
 bool g_bVRadGPURequested = false;
-bool g_bVRadGPUTransfers = false;
 bool g_bVRadCoarsePatches = false;
 float g_flMaxTransferDist = 0.0f;
 
@@ -171,6 +170,51 @@ static float intersectTri(Float3 o, Float3 d, TriGPU t)
   return tt;
 }
 
+// Oklab (Ottosson) — inbound bounce tint only in this kernel.
+static Float3 oklabFromLin(float r, float g, float b)
+{
+  if (r < 0.0f) r = 0.0f;
+  if (g < 0.0f) g = 0.0f;
+  if (b < 0.0f) b = 0.0f;
+  float l = 0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b;
+  float m = 0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b;
+  float s = 0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b;
+  float l_ = cbrt(l);
+  float m_ = cbrt(m);
+  float s_ = cbrt(s);
+  return make3(
+    0.2104542553f*l_ + 0.7936177850f*m_ - 0.0040720468f*s_,
+    1.9779984951f*l_ - 2.4285922050f*m_ + 0.4505937099f*s_,
+    0.0259040371f*l_ + 0.7827717662f*m_ - 0.8086757660f*s_);
+}
+static Float3 oklabToLin(Float3 lab)
+{
+  float l_ = lab.x + 0.3963377774f * lab.y + 0.2158037573f * lab.z;
+  float m_ = lab.x - 0.1055613458f * lab.y - 0.0638541728f * lab.z;
+  float s_ = lab.x - 0.0894841775f * lab.y - 1.2914855480f * lab.z;
+  float l = l_*l_*l_;
+  float m = m_*m_*m_;
+  float s = s_*s_*s_;
+  Float3 rgb = make3(
+    +4.0767416621f*l - 3.3077115913f*m + 0.2309699292f*s,
+    -1.2684380046f*l + 2.6097574011f*m - 0.3413193965f*s,
+    -0.0041960863f*l - 0.7034186147f*m + 1.7076147010f*s);
+  if (rgb.x < 0.0f) rgb.x = 0.0f;
+  if (rgb.y < 0.0f) rgb.y = 0.0f;
+  if (rgb.z < 0.0f) rgb.z = 0.0f;
+  return rgb;
+}
+static void oklabApplyTintPreserveL(float *vx, float *vy, float *vz, Tint4 tint, float lumScale)
+{
+  Float3 ol = oklabFromLin(*vx, *vy, *vz);
+  Float3 ot = oklabFromLin(tint.x, tint.y, tint.z);
+  ol.x *= (lumScale > 0.0f) ? lumScale : 0.0f;
+  ol.y = ot.y;
+  ol.z = ot.z;
+  Float3 rgb = oklabToLin(ol);
+  *vx = rgb.x; *vy = rgb.y; *vz = rgb.z;
+}
+
 __kernel void kOcclusion(
   __global const RayGPU* rays,
   __global uchar* visible,
@@ -296,16 +340,12 @@ __kernel void kGatherBounce(
     int emitEnv = patchEnv[tr.patch];
     if (recvEnv > 0 && volUseColor[recvEnv] != 0 && emitEnv != recvEnv) {
       float lum = vx + vy + vz;
-      Tint4 tint = volTint[recvEnv];
-      if (volUseBright[recvEnv] != 0) {
-        float scale = tint.w / defaultIntensity;
-        vx = tint.x * (lum * scale);
-        vy = tint.y * (lum * scale);
-        vz = tint.z * (lum * scale);
-      } else {
-        vx = tint.x * lum;
-        vy = tint.y * lum;
-        vz = tint.z * lum;
+      if (lum >= 1e-10f) {
+        Tint4 tint = volTint[recvEnv];
+        float scale = 1.0f;
+        if (volUseBright[recvEnv] != 0)
+          scale = tint.w / defaultIntensity;
+        oklabApplyTintPreserveL(&vx, &vy, &vz, tint, scale);
       }
     }
     sx += vx; sy += vy; sz += vz;
@@ -708,11 +748,6 @@ static bool FillRays( const Vector *pStarts, const Vector *pEnds, int offset, in
 void VRadGPU_SetRequested( bool bRequested )
 {
 	g_bVRadGPURequested = bRequested;
-}
-
-void VRadGPU_SetTransfersRequested( bool bRequested )
-{
-	g_bVRadGPUTransfers = bRequested;
 }
 
 void VRadGPU_SetMaxTris( int nMaxTris )

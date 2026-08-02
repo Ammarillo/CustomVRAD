@@ -27,6 +27,11 @@
 #include "envvolume.h"
 #include "ao.h"
 #include "absorb.h"
+#include "bounce_vol.h"
+#include "map_shared.h"
+#include "vrad_emit.h"
+
+extern char source[MAX_PATH];
 
 enum
 {
@@ -577,6 +582,41 @@ void DumpFaces( lightinfo_t *pLightInfo, int ndxFace )
 
 
 //-----------------------------------------------------------------------------
+// Pull luxel-space coords inward from lightmap edges so lighting rays start
+// away from adjacent solid (thin walls / door jambs / concave corners).
+//-----------------------------------------------------------------------------
+static void EdgePullLuxelCoord( float &s, float &t, int width, int height, float inset )
+{
+	if ( inset <= 0.0f )
+		return;
+
+	if ( width > 1 )
+	{
+		float s0 = inset;
+		float s1 = (float)( width - 1 ) - inset;
+		if ( s1 < s0 )
+			s0 = s1 = 0.5f * (float)( width - 1 );
+		if ( s < s0 )
+			s = s0;
+		else if ( s > s1 )
+			s = s1;
+	}
+
+	if ( height > 1 )
+	{
+		float t0 = inset;
+		float t1 = (float)( height - 1 ) - inset;
+		if ( t1 < t0 )
+			t0 = t1 = 0.5f * (float)( height - 1 );
+		if ( t < t0 )
+			t = t0;
+		else if ( t > t1 )
+			t = t1;
+	}
+}
+
+
+//-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 bool BuildFacesamplesAndLuxels_DoFast( lightinfo_t *pLightInfo, facelight_t *pFaceLight )
 {
@@ -621,6 +661,12 @@ bool BuildFacesamplesAndLuxels_DoFast( lightinfo_t *pLightInfo, facelight_t *pFa
 			pSamples->maxs[0] = s + 0.5;
 			pSamples->maxs[1] = t + 0.5;
 			pSamples->area = pFaceLight->worldAreaPerLuxel;
+			float sCoord = (float)s;
+			float tCoord = (float)t;
+			if ( g_bEdgePull )
+				EdgePullLuxelCoord( sCoord, tCoord, width, height, g_flEdgePullInset );
+			pSamples->coord[0] = sCoord;
+			pSamples->coord[1] = tCoord;
 			LuxelSpaceToWorld( pLightInfo, pSamples->coord[0], pSamples->coord[1], pSamples->pos );
 			VectorCopy( pSamples->pos, *pLuxels );
 
@@ -721,6 +767,8 @@ bool BuildFacesamples( lightinfo_t *pLightInfo, facelight_t *pFaceLight )
 				pSamples->area = WindingAreaAndBalancePoint(  pWindingS2, center ) * pFaceLight->worldAreaPerLuxel;
 				pSamples->coord[0] = center.x; 
 				pSamples->coord[1] = center.y;
+				if ( g_bEdgePull )
+					EdgePullLuxelCoord( pSamples->coord[0], pSamples->coord[1], width, height, g_flEdgePullInset );
 
 				// find winding bounds (then convert it to 2D)
 				Vector minbounds, maxbounds;
@@ -865,7 +913,11 @@ bool BuildFaceLuxels( lightinfo_t *pLightInfo, facelight_t *pFaceLight )
 	{
 		for( int s = 0; s < width; s++ )
 		{
-			LuxelSpaceToWorld( pLightInfo, s, t, pFaceLight->luxel[s+t*width] );
+			float sCoord = (float)s;
+			float tCoord = (float)t;
+			if ( g_bEdgePull )
+				EdgePullLuxelCoord( sCoord, tCoord, width, height, g_flEdgePullInset );
+			LuxelSpaceToWorld( pLightInfo, sCoord, tCoord, pFaceLight->luxel[s+t*width] );
 		}
 	}
 
@@ -1007,6 +1059,7 @@ void FreeDLights()
 	gAmbient = NULL;
 	LightEnv_ClearVolumes();
 	Absorb_Clear();
+	BounceVol_Clear();
 
 	directlight_t *pNext;
 	for( directlight_t *pCur=activelights; pCur; pCur=pNext )
@@ -1596,12 +1649,60 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 	pSky->light.type = emit_skylight;
 	pSky->m_nEnvId = envId;
 	pSky->m_flSunAngularExtent = ParseSunSpreadExtent( e );
+
+	// FGD defaults (white sun, pitch/angles 0) would otherwise replace the map
+	// light_environment with a horizontal white sun inside the volume. Inherit
+	// unset/default sun direction + color from the default env when present.
+	bool bInheritedDir = false;
+	bool bInheritedColor = false;
+	if ( gSkyLight )
+	{
+		Vector angles;
+		GetVectorForKey( e, "angles", angles );
+		const float pitch = FloatForKey( e, "pitch" );
+		const bool bDefaultOrient =
+			( fabsf( pitch ) < 0.01f ) &&
+			( fabsf( angles.x ) < 0.01f ) &&
+			( fabsf( angles.y ) < 0.01f ) &&
+			( fabsf( angles.z ) < 0.01f );
+		if ( bDefaultOrient )
+		{
+			VectorCopy( gSkyLight->light.normal, pSky->light.normal );
+			bInheritedDir = true;
+		}
+
+		// Exact FGD default string for _light on light_env_vol
+		const char *pLightKey = ValueForKey( e, "_light" );
+		if ( pLightKey && ( !pLightKey[0] || !Q_stricmp( pLightKey, "255 255 255 200" ) ) )
+		{
+			VectorCopy( gSkyLight->light.intensity, pSky->light.intensity );
+			bInheritedColor = true;
+		}
+
+		// SunSpreadAngle left at 0 → use default env's soft-sun extent
+		if ( !ValueForKeyWithDefault( e, "SunSpreadAngle" ) ||
+			 fabsf( FloatForKeyWithDefault( e, "SunSpreadAngle", 0.0f ) ) < 1e-6f )
+		{
+			pSky->m_flSunAngularExtent = gSkyLight->m_flSunAngularExtent;
+		}
+	}
+
 	LightEnv_SetVolumeBounceTint( envId, pSky->light.intensity );
 
 	directlight_t *pAmbient = AllocDLight( dest, false );
 	pAmbient->light.type = emit_skyambient;
 	pAmbient->m_nEnvId = envId;
 	ParseSkyAmbientFromEntity( e, pSky, pAmbient );
+
+	// FGD default ambient "255 255 255 20" → inherit default env ambient
+	if ( gAmbient )
+	{
+		const char *pAmbKey = ValueForKey( e, "_ambient" );
+		if ( pAmbKey && ( !pAmbKey[0] || !Q_stricmp( pAmbKey, "255 255 255 20" ) ) )
+		{
+			VectorCopy( gAmbient->light.intensity, pAmbient->light.intensity );
+		}
+	}
 
 	AddDLightToActiveList( pSky );
 	AddDLightToActiveList( pAmbient );
@@ -1612,7 +1713,7 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 	else if ( blendMode == LIGHTENV_BLEND_OUTSIDE )
 		pBlendModeName = "outside";
 
-	Msg( "light_env_vol env %d  mins(%.0f %.0f %.0f) maxs(%.0f %.0f %.0f) blend %.1f mode %s priority %d inboundBounceColor %s brightness %s outsideShadow %s insideShadow %s\n",
+	Msg( "light_env_vol env %d  mins(%.0f %.0f %.0f) maxs(%.0f %.0f %.0f) blend %.1f mode %s priority %d inboundBounceColor %s brightness %s outsideShadow %s insideShadow %s%s%s\n",
 		 envId,
 		 pModelData->mins.x, pModelData->mins.y, pModelData->mins.z,
 		 pModelData->maxs.x, pModelData->maxs.y, pModelData->maxs.z,
@@ -1620,7 +1721,9 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 		 inboundBounceUsesVolumeColor ? "yes" : "no",
 		 inboundBounceUsesVolumeBrightness ? "yes" : "no",
 		 outsideCastShadow ? "yes" : "no",
-		 insideCastShadow ? "yes" : "no" );
+		 insideCastShadow ? "yes" : "no",
+		 bInheritedDir ? " inheritDir" : "",
+		 bInheritedColor ? " inheritColor" : "" );
 }
 
 static void ParseLightPoint( entity_t* e, directlight_t* dl )
@@ -1699,6 +1802,7 @@ void CreateDirectLights (void)
 			dl = AllocDLight( p->origin, true );
 
 			dl->light.type = emit_surface;
+			dl->facenum = p->faceNumber;
 			VectorCopy (p->normal, dl->light.normal);
 			Assert( VectorLength( p->normal ) > 1.0e-20 );
 			// scale intensity by number of texture instances
@@ -1706,8 +1810,18 @@ void CreateDirectLights (void)
 
 			// scale to a range that results in actual light
 			VectorScale( dl->light.intensity, DIRECT_SCALE, dl->light.intensity );
+
+			// Soft area falloff for pathtrace / near-field contact (equiv. disk radius²).
+			dl->m_flAreaRadius2 = max( 4.0f, p->area / (float)M_PI );
+			dl->m_flEndFadeDistance = -1.0f; // AllocDLight uses calloc (no ctor)
+			dl->m_flCapDist = 1.0e22f;
+			// Match VRadEmit: keep origin off the surface for pathtrace shadow rays.
+			VectorMA( dl->light.origin, 0.8f, dl->light.normal, dl->light.origin );
 		}
 	}
+
+	// VMT $vrad_emit* textured surface lights (pathtrace NEE + classic direct).
+	VRadEmit_CreateDirectLights();
 	
 	//
 	// entities — default light_environment first so volumes can inherit sun extent
@@ -1718,6 +1832,28 @@ void CreateDirectLights (void)
 		name = ValueForKey (e, "classname");
 		if (!strcmp(name, "light_environment"))
 			ParseLightEnvironment( e, dl );
+	}
+
+	// Cordon / editor cull often strips light_environment from the BSP while
+	// the source .vmf still has it — outdoor sky goes black without this.
+	if ( !gSkyLight )
+	{
+		char vmfPath[MAX_PATH];
+		Q_strncpy( vmfPath, source, sizeof( vmfPath ) );
+		V_SetExtension( vmfPath, ".vmf", sizeof( vmfPath ) );
+
+		entity_t vmfEnv;
+		memset( &vmfEnv, 0, sizeof( vmfEnv ) );
+		if ( LoadLightEnvironmentEntityFromVmf( vmfPath, &vmfEnv ) )
+		{
+			Msg( "light_environment missing from BSP (cordon/hidden?) — loaded from %s\n", vmfPath );
+			ParseLightEnvironment( &vmfEnv, dl );
+		}
+		else
+		{
+			Warning( "WARNING: no light_environment in BSP or '%s' — outdoor/sky lighting will be black.\n",
+					 vmfPath );
+		}
 	}
 
 	for (i=0 ; i<(unsigned)num_entities ; i++)
@@ -1761,6 +1897,16 @@ void CreateDirectLights (void)
 	{
 		e = &entities[i];
 		name = ValueForKey (e, "classname");
+		if (!strcmp(name, "light_bounce_vol"))
+			BounceVol_ParseVolumeEntity( e );
+	}
+	if ( BounceVol_HasVolumes() )
+		Msg( "light_bounce_vol: %d volume(s) parsed\n", BounceVol_VolumeCount() );
+
+	for (i=0 ; i<(unsigned)num_entities ; i++)
+	{
+		e = &entities[i];
+		name = ValueForKey (e, "classname");
 		if (strncmp (name, "light", 5))
 			continue;
 
@@ -1774,7 +1920,8 @@ void CreateDirectLights (void)
 			!strcmp(name, "light_environment_volume") ||
 			!strcmp(name, "light_ao") ||
 			!strcmp(name, "light_ao_vol") ||
-			!strcmp(name, "light_absorb"))
+			!strcmp(name, "light_absorb") ||
+			!strcmp(name, "light_bounce_vol"))
 			continue;
 
 		if (!strcmp (name, "light_spot"))
@@ -1986,7 +2133,10 @@ void GatherSampleSkyLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, i
 	bool bTraceDone = false;
 
 	// Soft sun: batch GPU closest-hits when enough samples.
-	if ( VRadGPU_HasScene() && nsamples >= 8 )
+	// Skip when -TextureShadows: GPU BVH is opaque-only (no alpha coverage /
+	// sky-camera recurse / prop skip) and produces jagged contact shadows at
+	// concave corners that stock TestLine_DoesHitSky does not.
+	if ( VRadGPU_HasScene() && nsamples >= 8 && !g_bTextureShadows )
 	{
 		std::vector<Vector> starts, ends;
 		starts.reserve( nsamples * 4 );
@@ -2457,13 +2607,10 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 {
 	bool bIgnoreNormals = ( nLFlags & GATHERLFLAGS_IGNORE_NORMALS ) != 0;
 
+	// Always use light.origin. (Old code only set src when facenum==-1, which
+	// broke classic gather once emit/pathtrace started stamping dl->facenum.)
 	FourVectors src;
-	src.DuplicateVector( vec3_origin );
-
-	if (dl->facenum == -1)
-	{
-		src.DuplicateVector( dl->light.origin );
-	}
+	src.DuplicateVector( dl->light.origin );
 
 	// Find light vector
 	FourVectors delta;
@@ -2701,7 +2848,10 @@ void GatherSampleLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, int 
 		                         iThread, nLFlags, static_prop_index_to_ignore, flEpsilon );
 		break;
 	case emit_skyambient:
-		if ( !GatherSampleAmbientSkySSE_GPU( out, dl, facenum, pos, pNormals, normalCount,
+		// GPU ambient skips TextureShadows / sky-camera / static-prop ignore and
+		// hardens concave corners into jagged luxel strips. Prefer stock CPU.
+		if ( g_bTextureShadows ||
+			 !GatherSampleAmbientSkySSE_GPU( out, dl, facenum, pos, pNormals, normalCount,
 											iThread, nLFlags, static_prop_index_to_ignore, flEpsilon ) )
 		{
 			GatherSampleAmbientSkySSE( out, dl, facenum, pos, pNormals, normalCount,

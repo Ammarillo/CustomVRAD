@@ -552,6 +552,15 @@ void CManifest::CordonWorld( )
 
 			if ( bRemove )
 			{
+				// Keep map light_environment even outside the cordon — outdoor/sky
+				// lighting must remain for the cordoned region (else VRAD blacks out).
+				const char *pszClass = ValueForKey( &g_MainMap->entities[i], "classname" );
+				if ( pszClass && !Q_stricmp( pszClass, "light_environment" ) )
+				{
+					Msg( "Cordon: keeping light_environment outside cordon (needed for sky/ambient).\n" );
+					continue;
+				}
+
 				g_MainMap->entities[ i ].numbrushes = 0;
 				g_MainMap->entities[ i ].epairs = NULL;
 			}

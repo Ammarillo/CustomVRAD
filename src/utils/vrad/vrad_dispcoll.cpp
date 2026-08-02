@@ -11,6 +11,7 @@
 #include "radial.h"
 #include "CollisionUtils.h"
 #include "tier0\dbg.h"
+#include "vrad_emit.h"
 
 #define SAMPLE_BBOX_SLOP		5.0f
 #define TRIEDGE_EPSILON			0.001f
@@ -177,17 +178,22 @@ void CVRADDispColl::BaseFacePlaneToDispUV( Vector const &vecPlanePt, Vector2D &d
 //-----------------------------------------------------------------------------
 void CVRADDispColl::DispUVToSurfPoint( Vector2D const &dispUV, Vector &vecPoint, float flPushEps )
 {
-	// Check to see that the point is on the surface.
-	if ( dispUV.x < 0.0f || dispUV.x > 1.0f || dispUV.y < 0.0f || dispUV.y > 1.0f )
-		return;
+	// Clamp onto the surface. Callers that pass UV slightly outside [0,1] (e.g. a
+	// mistaken half-step) used to early-out and leave vecPoint untouched/zero —
+	// that produced black lightmap edges on the max-U/max-V sides.
+	Vector2D uv = dispUV;
+	if ( uv.x < 0.0f ) uv.x = 0.0f;
+	else if ( uv.x > 1.0f ) uv.x = 1.0f;
+	if ( uv.y < 0.0f ) uv.y = 0.0f;
+	else if ( uv.y > 1.0f ) uv.y = 1.0f;
 
 	// Get the displacement power.
 	int nWidth = ( ( 1 << m_nPower ) + 1 );
 	int nHeight = nWidth;
 
 	// Scale the U, V coordinates to the displacement grid size.
-	float flU = dispUV.x * static_cast<float>( nWidth - 1.000001f );
-	float flV = dispUV.y * static_cast<float>( nHeight - 1.000001f );
+	float flU = uv.x * static_cast<float>( nWidth - 1.000001f );
+	float flV = uv.y * static_cast<float>( nHeight - 1.000001f );
 
 	// Find the base U, V.
 	int nSnapU = static_cast<int>( flU );
@@ -322,17 +328,19 @@ void CVRADDispColl::DispUVToSurf_TriBLToTR( Vector &vecPoint, float flPushEps,
 //-----------------------------------------------------------------------------
 void CVRADDispColl::DispUVToSurfNormal( Vector2D const &dispUV, Vector &vecNormal )
 {
-	// Check to see that the point is on the surface.
-	if ( dispUV.x < 0.0f || dispUV.x > 1.0f || dispUV.y < 0.0f || dispUV.y > 1.0f )
-		return;
+	Vector2D uv = dispUV;
+	if ( uv.x < 0.0f ) uv.x = 0.0f;
+	else if ( uv.x > 1.0f ) uv.x = 1.0f;
+	if ( uv.y < 0.0f ) uv.y = 0.0f;
+	else if ( uv.y > 1.0f ) uv.y = 1.0f;
 
 	// Get the displacement power.
 	int nWidth = ( ( 1 << m_nPower ) + 1 );
 	int nHeight = nWidth;
 
 	// Scale the U, V coordinates to the displacement grid size.
-	float flU = dispUV.x * static_cast<float>( nWidth - 1.000001f );
-	float flV = dispUV.y * static_cast<float>( nHeight - 1.000001f );
+	float flU = uv.x * static_cast<float>( nWidth - 1.000001f );
+	float flV = uv.y * static_cast<float>( nHeight - 1.000001f );
 
 	// Find the base U, V.
 	int nSnapU = static_cast<int>( flU );
@@ -891,6 +899,16 @@ bool CVRADDispColl::InitParentPatch( int iPatch, Vector *pPoints, float &flArea 
 	// Calculate the base light, area, and reflectivity.
 	BaseLightForFace( &g_pFaces[pPatch->faceNumber], pPatch->baselight, &pPatch->basearea, pPatch->reflectivity );
 
+	const char *pMatName = TexDataStringTable_GetString( dtexdata[pTexInfo->texdata].nameStringTableID );
+	if ( !VectorCompare( pPatch->baselight, vec3_origin ) || VRadEmit_MaterialEmits( pMatName ) )
+		pTexInfo->flags |= SURF_LIGHT;
+	if ( VRadEmit_MaterialEmits( pMatName ) )
+	{
+		const float dens = VRadEmit_GetDensity( pMatName );
+		if ( dens > 1.0f )
+			pPatch->chop = max( 1.0f, pPatch->chop / dens );
+	}
+
 	return true;
 }
 
@@ -1050,6 +1068,15 @@ bool CVRADDispColl::InitPatch( int iPatch, int iParentPatch, int iChild, Vector 
 	if ( !pParentPatch )
 	{
 		BaseLightForFace( &g_pFaces[pPatch->faceNumber], pPatch->baselight, &pPatch->basearea, pPatch->reflectivity );
+		const char *pMatName = TexDataStringTable_GetString( dtexdata[pTexInfo->texdata].nameStringTableID );
+		if ( !VectorCompare( pPatch->baselight, vec3_origin ) || VRadEmit_MaterialEmits( pMatName ) )
+			pTexInfo->flags |= SURF_LIGHT;
+		if ( VRadEmit_MaterialEmits( pMatName ) )
+		{
+			const float dens = VRadEmit_GetDensity( pMatName );
+			if ( dens > 1.0f )
+				pPatch->chop = max( 1.0f, pPatch->chop / dens );
+		}
 	}
 	else
 	{

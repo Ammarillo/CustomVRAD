@@ -98,6 +98,8 @@ struct directlight_t
 	float	m_flSunAngularExtent;
 	// light_volume: soft-sample sphere radius in world units (0 = hard point).
 	float	m_flVolumeRadius;
+	// Soft area falloff for emit_surface / texlights: cos/(dist²+R²). 0 = classic 1/r².
+	float	m_flAreaRadius2;
 
 	directlight_t(void)
 	{
@@ -107,6 +109,7 @@ struct directlight_t
 		m_nEnvId = -1;
 		m_flSunAngularExtent = 0.0f;
 		m_flVolumeRadius = 0.0f;
+		m_flAreaRadius2 = 0.0f;
 	}
 };
 
@@ -191,7 +194,7 @@ struct LightingValue_t
 };
 
 
-#define	MAX_PATCHES	(4*65536)
+#define	MAX_PATCHES	(32*65536)	// 2097152 — dense luxels / large maps (was 8*65536)
 
 struct CPatch
 {
@@ -254,6 +257,7 @@ struct CPatch
 
 
 extern CUtlVector<CPatch>	g_Patches;
+extern CUtlVector<Vector>	emitlight;
 extern CUtlVector<int>		g_FacePatches;		// constains all patches, children first
 extern CUtlVector<int>		faceParents;		// contains only root patches, use next parent to iterate
 extern CUtlVector<int>		clusterChildren;
@@ -301,6 +305,14 @@ extern bool g_bTextureShadows;
 extern bool g_bShowStaticPropNormals;
 extern bool g_bDisablePropSelfShadowing;
 extern bool g_bStitchSeams;			// blend lightmap luxels across coplanar VBSP face splits
+extern bool g_bTexturedBounce;		// sample $basetexture albedo for colored bounce
+extern float g_flBounceBoost;		// scale final bounced light (1 = stock)
+extern float g_flBounceChroma;		// early-bounce saturation boost (0 = off)
+extern bool g_bAdaptiveChop;		// subdivide more near sky visibility contrast
+extern bool g_bEnergyConserve;		// enclosure-aware cavity damp for bounce
+extern float g_flCavityScale;		// fully-enclosed gather scale (default 0.70)
+extern bool g_bEdgePull;			// pull edge sample positions toward face center
+extern float g_flEdgePullInset;		// luxel-space edge inset (default 0.5)
 
 extern CUtlVector<char const *> g_NonShadowCastingMaterialStrings;
 extern void ForceTextureShadowsOnModel( const char *pModelName );
@@ -311,6 +323,7 @@ extern bool IsModelTextureShadowsForced( const char *pModelName );
 #define TRACE_ID_SKY           0x01000000  // sky face ray blocker
 #define TRACE_ID_OPAQUE        0x02000000  // everyday light blocking face
 #define TRACE_ID_STATICPROP    0x04000000  // static prop - lower bits are prop ID
+#define TRACE_ID_FILTER        0x08000000  // colored glass ($vrad_filter); lower bits = face index
 extern RayTracingEnvironment g_RtEnv;
 
 #include "mpivrad.h"

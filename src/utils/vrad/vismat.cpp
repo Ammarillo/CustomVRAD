@@ -46,6 +46,11 @@ public:
 
 	FORCEINLINE void TestMakeTransfer( Vector start, Vector stop, int ndxShooter, int ndxReciever )
 	{
+		// Flush before overflow — one patch can queue more tests than MAX_PATCHES
+		// when the map has dense subdivision (luxel scale 2, etc.).
+		if ( m_nTests >= MAX_PATCHES )
+			Finish();
+
 		// Keep CPU SSE RayStream here: threaded BuildVisLeafs beats GPU for this workload
 		// (PCIe + OpenCL sync across many threads was much slower than Trace4Rays).
 		g_RtEnv.AddToRayStream( m_RayStream, start, stop, &m_pResults[m_nTests] );
@@ -72,6 +77,8 @@ CTransferMaker::CTransferMaker( transfer_t *all_transfers ) :
 	m_pResults = (RayTracingSingleResult *)calloc( 1, MAX_PATCHES * sizeof ( RayTracingSingleResult ) );
 	m_pShooterPatches = (int *)calloc( 1, MAX_PATCHES * sizeof( int ) );
 	m_pRecieverPatches = (int *)calloc( 1, MAX_PATCHES * sizeof( int ) );
+	if ( !m_pResults || !m_pShooterPatches || !m_pRecieverPatches )
+		Error( "BuildVisLeafs: out of memory allocating transfer buffers (MAX_PATCHES=%d)\n", MAX_PATCHES );
 }
 
 CTransferMaker::~CTransferMaker()
@@ -383,7 +390,10 @@ BuildVisLeafs
 
 transfer_t* BuildVisLeafs_Start()
 {
-	return (transfer_t *)calloc( 1,  MAX_PATCHES * sizeof( transfer_t ) );
+	transfer_t *p = (transfer_t *)calloc( 1,  MAX_PATCHES * sizeof( transfer_t ) );
+	if ( !p )
+		Error( "BuildVisLeafs: out of memory allocating transfer list (MAX_PATCHES=%d)\n", MAX_PATCHES );
+	return p;
 }
 
 

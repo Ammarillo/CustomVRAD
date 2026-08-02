@@ -6,6 +6,7 @@
 
 #include "vrad.h"
 #include "envvolume.h"
+#include "oklab.h"
 
 static LightEnvVolumeInfo_t s_Volumes[LIGHTENV_MAX_VOLUMES];
 static int s_nVolumes = 0;
@@ -407,17 +408,11 @@ void LightEnv_MaybeTintInboundBounce( int receiverEnvId, int emitterEnvId, Vecto
 	if ( lum < 1e-10f )
 		return;
 
+	float scale = 1.0f;
 	if ( vol.bInboundBounceUsesVolumeBrightness )
-	{
-		// Scale luminance by volume _light intensity vs default light_environment.
-		float scale = vol.bounceIntensity / s_flDefaultBounceIntensity;
-		light = vol.bounceTint * ( lum * scale );
-	}
-	else
-	{
-		// Preserve luminance, replace chromaticity with volume sun color.
-		light = vol.bounceTint * lum;
-	}
+		scale = vol.bounceIntensity / s_flDefaultBounceIntensity;
+
+	light = Oklab_ApplyTintPreserveL( light, vol.bounceTint, scale );
 }
 
 void LightEnv_BuildPatchEnvCache()

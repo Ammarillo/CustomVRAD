@@ -92,7 +92,11 @@
 #define	MAX_MAP_TEXTURES				1024
 #define MAX_MAP_WORLDLIGHTS				8192
 #define MAX_MAP_CUBEMAPSAMPLES			1024
-#define MAX_MAP_OVERLAYS				512 
+// Match Hammer/VBSP builds that allow more than stock Source (512).
+// Loading more overlays than this into the fixed g_Overlays[] array
+// silently overflows and corrupts adjacent globals — WriteBSPFile then
+// hangs / writes a multi‑GB BSP with an empty lump table.
+#define MAX_MAP_OVERLAYS				8192
 #define MAX_MAP_WATEROVERLAYS			16384
 #define MAX_MAP_TEXDATA_STRING_DATA		256000
 #define MAX_MAP_TEXDATA_STRING_TABLE	65536

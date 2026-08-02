@@ -15,11 +15,16 @@
 #include "tier1/strtools.h"
 #include "vmpi.h"
 #include "macro_texture.h"
+#include "bounce_albedo.h"
+#include "bounce_vol.h"
+#include "oklab.h"
 #include "vmpi_tools_shared.h"
 #include "leaf_ambient_lighting.h"
 #include "tools_minidump.h"
 #include "loadcmdline.h"
 #include "vrad_gpu.h"
+#include "pathtrace_dxr.h"
+#include "vrad_emit.h"
 #include "ao.h"
 #include "absorb.h"
 #include "radial.h"
@@ -125,6 +130,14 @@ bool        g_bStaticPropPolys = false;
 bool        g_bTextureShadows = false;
 bool        g_bDisablePropSelfShadowing = false;
 bool        g_bStitchSeams = true;		// blend lightmap luxels across coplanar VBSP face splits
+bool		g_bTexturedBounce = false;	// sample $basetexture albedo for bounce color bleed
+float		g_flBounceBoost = 1.0f;		// artistic scale of final bounced light (1 = stock)
+float		g_flBounceChroma = 0.0f;	// early-bounce saturation boost (0 = off)
+bool		g_bAdaptiveChop = false;	// refine chop near sun-visibility contrast
+bool		g_bEnergyConserve = false;	// enclosure-aware cavity damp (opt-in via -energy)
+float		g_flCavityScale = 0.70f;	// fully-enclosed gather weight vs stock (0.25–1)
+bool		g_bEdgePull = true;			// pull edge luxel samples inward (~½ luxel)
+float		g_flEdgePullInset = 0.5f;	// luxel-space inset from lightmap edges
 
 
 CUtlVector<byte> g_FacesVisibleToLights;
@@ -634,10 +647,18 @@ void MakePatchForFace (int fn, winding_t *w)
 	BaseLightForFace( f, patch->baselight, &patch->basearea, patch->reflectivity );
 
 	// Chop all texlights very fine.
-	if ( !VectorCompare( patch->baselight, vec3_origin ) )
+	const char *pMatName = TexDataStringTable_GetString( dtexdata[tx->texdata].nameStringTableID );
+	const bool bVmtEmit = VRadEmit_MaterialEmits( pMatName );
+	if ( !VectorCompare( patch->baselight, vec3_origin ) || bVmtEmit )
 	{
 		// patch->chop = do_extra ? maxchop / 2 : maxchop;
 		tx->flags |= SURF_LIGHT;
+	}
+	if ( bVmtEmit )
+	{
+		const float dens = VRadEmit_GetDensity( pMatName );
+		if ( dens > 1.0f )
+			patch->chop = max( minchop, patch->chop / dens );
 	}
 
 	// get rid of do extra functionality on displacement surfaces
@@ -890,6 +911,25 @@ void SubdividePatch( int ndxPatch )
 		}
 	}
 
+	// Adaptive chop: under -coarse, allow a finer floor (4) so edges near
+	// lighting discontinuities can still subdivide. Full sun-contrast probing
+	// needs activelights (created later); this keeps -adaptivechop meaningful.
+	if ( g_bAdaptiveChop && !patch->sky && widest_axis != -1 )
+	{
+		float adaptiveFloor = g_bVRadCoarsePatches ? 4.0f : minchop;
+		if ( patch->chop > adaptiveFloor &&
+			 ( total[widest_axis] >= adaptiveFloor ) )
+		{
+			// Prefer subdividing elongated patches that would otherwise stay coarse.
+			if ( total[widest_axis] > total[(widest_axis + 1) % 3] * 1.5f ||
+				 total[widest_axis] > total[(widest_axis + 2) % 3] * 1.5f )
+			{
+				bSubdivide = true;
+				patch->chop = max( adaptiveFloor, patch->chop / 2 );
+			}
+		}
+	}
+
 	if ( !bSubdivide )
 		return;
 
@@ -1048,6 +1088,17 @@ void SubdividePatches (void)
 	}
 
 	qprintf ("%i patches after subdivision\n", uiPatchCount);
+	if ( uiPatchCount > MAX_PATCHES )
+	{
+		Warning( "WARNING: %u patches exceeds MAX_PATCHES (%d) — VisLeafs will flush mid-row; "
+				 "consider -coarse or higher lightmap scales.\n",
+				 uiPatchCount, MAX_PATCHES );
+	}
+	else if ( uiPatchCount > 250000 && !g_bVRadCoarsePatches )
+	{
+		Msg( "Note: %u patches — add -coarse (or -maxtransfer 4096) to speed VisLeafs/bounce.\n",
+			 uiPatchCount );
+	}
 }
 
 
@@ -1238,11 +1289,41 @@ void MakeScales ( int ndxPatch, transfer_t *all_transfers )
 			total += t2->transfer;
 		}
 
-		// the total transfer should be PI, but we need to correct errors due to overlaping surfaces
-		if (total > M_PI)
-			total = 1.0f/total;
-		else	
-			total = 1.0f/M_PI;
+		// Stock: scale by 1/π (or 1/total if overcomplete) so a full hemisphere ≈ 1.
+		// Enclosed rooms approach full hemisphere (sky never transfers) and recirculate
+		// for many bounces → unnaturally bright cavities.
+		// Energy mode: keep stock far-field, damp gathers by enclosure² so closed
+		// areas stay darker while open/outdoor bounce is nearly unchanged.
+		// light_bounce_vol EnergyMode soft-blends 0 (-noenergy) .. 1 (-energy).
+		{
+			const float totalRaw = total;
+			float scale;
+			if ( totalRaw > M_PI )
+				scale = 1.0f / totalRaw;
+			else
+				scale = 1.0f / (float)M_PI;
+
+			float energy = g_bEnergyConserve ? 1.0f : 0.0f;
+			if ( BounceVol_HasVolumes() )
+			{
+				BounceVolSettings_t bounceSettings;
+				BounceVol_Resolve( patch->origin, bounceSettings );
+				energy = bounceSettings.energy;
+			}
+
+			if ( energy > 1e-6f )
+			{
+				float enclosure = totalRaw / (float)M_PI;
+				if ( enclosure > 1.0f )
+					enclosure = 1.0f;
+				const float cavity = ( g_flCavityScale < 0.25f ) ? 0.25f :
+					( ( g_flCavityScale > 1.0f ) ? 1.0f : g_flCavityScale );
+				const float dampEnergy = 1.0f - ( enclosure * enclosure ) * ( 1.0f - cavity );
+				const float damp = 1.0f + ( dampEnergy - 1.0f ) * energy;
+				scale *= damp;
+			}
+			total = scale;
+		}
 
 		t = patch->transfers;
 		t2 = all_transfers;
@@ -1673,6 +1754,105 @@ void GatherLight (int threadnum, void *pUserData)
 
 /*
 =============
+RefineTexturedBounceReflectivity
+
+Sample $basetexture albedo at each leaf patch origin (plus macro tint) for radiosity.
+Falls back to flat dtexdata.reflectivity when no texture data.
+One sample per patch — full face-sample averaging was O(patches × samples) and slow.
+=============
+*/
+static void RefineTexturedBounceReflectivity( void )
+{
+	if ( !g_bTexturedBounce || numbounce <= 0 )
+		return;
+
+	BounceAlbedo_EnsureCache();
+
+	int nRefined = 0;
+	int nSampledTex = 0;
+	unsigned int uiPatchCount = g_Patches.Size();
+	for ( unsigned int i = 0; i < uiPatchCount; i++ )
+	{
+		CPatch *patch = &g_Patches[i];
+		if ( patch->child1 != g_Patches.InvalidIndex() )
+			continue; // parents get children blended later
+		if ( patch->sky )
+			continue;
+
+		int facenum = patch->faceNumber;
+		if ( facenum < 0 || facenum >= numfaces )
+			continue;
+
+		Vector baseR = patch->reflectivity;
+		Vector r = baseR;
+		Vector albedo;
+		bool bAnyTexel = false;
+		if ( BounceAlbedo_SampleFace( facenum, patch->origin, albedo ) )
+		{
+			r = albedo * reflectivityScale;
+			bAnyTexel = true;
+		}
+		ApplyMacroTextures( facenum, patch->origin, r );
+
+		if ( bAnyTexel ||
+			 fabsf( r.x - baseR.x ) > 1e-5f || fabsf( r.y - baseR.y ) > 1e-5f || fabsf( r.z - baseR.z ) > 1e-5f )
+		{
+			patch->reflectivity = r;
+			for ( int c = 0; c < 3; c++ )
+			{
+				if ( patch->reflectivity[c] < 0.0f )
+					patch->reflectivity[c] = 0.0f;
+				if ( patch->reflectivity[c] > 0.99f )
+					patch->reflectivity[c] = 0.99f;
+			}
+			++nRefined;
+			if ( bAnyTexel )
+				++nSampledTex;
+		}
+	}
+
+	Msg( "Textured bounce (-texbounce): refined %d leaf patches (%d with $basetexture samples).\n",
+		 nRefined, nSampledTex );
+}
+
+
+/*
+=============
+BoostAddlightChroma
+
+Artistic early-bounce saturation in Oklab (scale a,b; keep L). Strongest on
+bounce #1, falls off later. Per-patch chroma from CLI and/or light_bounce_vol.
+=============
+*/
+static void BoostAddlightChroma( int bounceIndex, const float *pChromaPerPatch )
+{
+	const float falloff = 1.0f / ( 1.0f + (float)bounceIndex );
+	const unsigned int uiPatchCount = g_Patches.Size();
+	for ( unsigned int i = 0; i < uiPatchCount; ++i )
+	{
+		CPatch *patch = &g_Patches[i];
+		if ( patch->sky )
+			continue;
+
+		const float chroma = pChromaPerPatch ? pChromaPerPatch[i] : g_flBounceChroma;
+		if ( chroma <= 0.0f )
+			continue;
+		const float sat = 1.0f + chroma * falloff;
+		if ( sat <= 1.0001f )
+			continue;
+
+		const int normalCount = patch->needsBumpmap ? NUM_BUMP_VECTS + 1 : 1;
+		for ( int j = 0; j < normalCount; ++j )
+		{
+			Vector &c = addlight[i].light[j];
+			c = Oklab_ScaleChroma( c, sat );
+		}
+	}
+}
+
+
+/*
+=============
 BounceLight
 =============
 */
@@ -1734,6 +1914,35 @@ void BounceLight (void)
 
 	bool bGPUGatherReady = false;
 	CUtlVector<Vector> gpuAddOut;
+
+	// Per-patch artistic bounce overrides (CLI + light_bounce_vol).
+	CUtlVector<float> chromaPerPatch;
+	CUtlVector<float> boostPerPatch;
+	bool bAnyChroma = g_flBounceChroma > 0.0f;
+	bool bAnyBoost = ( g_flBounceBoost != 1.0f );
+	const bool bVol = BounceVol_HasVolumes();
+	if ( bVol || bAnyChroma || bAnyBoost )
+	{
+		chromaPerPatch.SetCount( (int)uiPatchCount );
+		boostPerPatch.SetCount( (int)uiPatchCount );
+		for ( unsigned int p = 0; p < uiPatchCount; ++p )
+		{
+			BounceVolSettings_t s;
+			BounceVol_Resolve( g_Patches[p].origin, s );
+			chromaPerPatch[p] = s.chroma;
+			boostPerPatch[p] = s.boost;
+			if ( s.chroma > 0.0f )
+				bAnyChroma = true;
+			if ( s.boost != 1.0f )
+				bAnyBoost = true;
+		}
+		if ( bVol )
+		{
+			Msg( "light_bounce_vol: %d volume(s) — per-patch bounce boost/chroma overrides active.\n",
+				 BounceVol_VolumeCount() );
+		}
+	}
+
 	if ( VRadGPU_IsActive() )
 	{
 		bool bAnyBump = false;
@@ -1784,6 +1993,7 @@ void BounceLight (void)
 	}
 
 	i = 0;
+	float firstBounceEnergy = 0.0f;
 	while ( bouncing )
 	{
 		// transfer light from to the leaf patches from other patches via transfers
@@ -1799,6 +2009,10 @@ void BounceLight (void)
 		if ( !bGPUGather )
 			RunThreadsOn( uiPatchCount, true, GatherLight );
 
+		// Optional artistic chroma boost on gathered bounce (before integrate/emit).
+		if ( bAnyChroma )
+			BoostAddlightChroma( (int)i, bVol || chromaPerPatch.Count() > 0 ? chromaPerPatch.Base() : NULL );
+
 		// move newly received light (addlight) to light to be sent out (emitlight)
 		// start at children and pull light up to parents
 		// light is always received to leaf patches
@@ -1806,14 +2020,52 @@ void BounceLight (void)
 
 		qprintf ("\tBounce #%i added RGB(%.0f, %.0f, %.0f)\n", i+1, added[0], added[1], added[2] );
 
-		if ( i+1 == numbounce || (added[0] < 1.0 && added[1] < 1.0 && added[2] < 1.0) )
+		const float bounceEnergy = max( added[0], max( added[1], added[2] ) );
+		if ( i == 0 )
+			firstBounceEnergy = bounceEnergy;
+
+		// Absolute floor (stock) plus relative early-out: stop once a bounce adds
+		// less than 0.15% of bounce #1. Cuts long tails (30–40+ iters) that do not
+		// change visible lighting on bright maps.
+		const float relativeEps = ( firstBounceEnergy > 0.0f ) ? ( firstBounceEnergy * 0.0015f ) : 0.0f;
+		const float bounceEps = max( 1.0f, relativeEps );
+		if ( i + 1 == numbounce || bounceEnergy < bounceEps )
+		{
+			if ( bounceEnergy < bounceEps && (unsigned)( i + 1 ) < numbounce && relativeEps > 1.0f )
+			{
+				Msg( "Bounce early-out at #%d (added %.0f < %.0f = 0.15%% of bounce #1).\n",
+					 i + 1, bounceEnergy, bounceEps );
+			}
 			bouncing = false;
+		}
 
 		i++;
 		if ( g_bDumpPatches && !bouncing && i != 1)
 		{
 			sprintf (name, "bounce%i.txt", i);
 			WriteWorld (name, 0);
+		}
+	}
+
+	// Artistic scale on integrated bounce only (direct was moved out before the loop).
+	if ( bAnyBoost )
+	{
+		if ( bVol )
+			Msg( "Applying per-patch bounce boost (CLI %.2f + light_bounce_vol overrides).\n", g_flBounceBoost );
+		else
+			Msg( "Applying bounce boost %.2f to integrated radiosity.\n", g_flBounceBoost );
+
+		for ( i = 0; i < uiPatchCount; i++ )
+		{
+			CPatch *patch = &g_Patches[i];
+			const float boost = ( boostPerPatch.Count() > 0 ) ? boostPerPatch[i] : g_flBounceBoost;
+			if ( boost == 1.0f )
+				continue;
+			const int normalCount = patch->needsBumpmap ? NUM_BUMP_VECTS + 1 : 1;
+			for ( int n = 0; n < normalCount; n++ )
+			{
+				VectorScale( patch->totallight.light[n], boost, patch->totallight.light[n] );
+			}
 		}
 	}
 }
@@ -1849,18 +2101,7 @@ void RadWorld_Start()
 
 	if (luxeldensity < 1.0)
 	{
-		// Remember the old lightmap vectors.
-		float oldLightmapVecs[MAX_MAP_TEXINFO][2][4];
-		for (i = 0; i < texinfo.Count(); i++)
-		{
-			for( int j=0; j < 2; j++ )
-			{
-				for( int k=0; k < 3; k++ )
-				{
-					oldLightmapVecs[i][j][k] = texinfo[i].lightmapVecsLuxelsPerWorldUnits[j][k];
-				}
-			}
-		}
+		Msg( "Luxel density (-luxeldensity): max scale %.4f (coarser lightmaps)\n", luxeldensity );
 
 		// rescale luxels to be no denser than "luxeldensity"
 		for (i = 0; i < texinfo.Count(); i++)
@@ -1872,8 +2113,9 @@ void RadWorld_Start()
 				Vector tmp( tx->lightmapVecsLuxelsPerWorldUnits[j][0], tx->lightmapVecsLuxelsPerWorldUnits[j][1], tx->lightmapVecsLuxelsPerWorldUnits[j][2] );
 				float scale = VectorNormalize( tmp );
 				// only rescale them if the current scale is "tighter" than the desired scale
-				// FIXME: since this writes out to the BSP file every run, once it's set high it can't be reset
-				// to a lower value.
+				// NOTE: coarsened texinfo is written to the BSP with matching face extents.
+				// To undo, re-run VBSP from the VMF (omitting -luxeldensity alone is not enough
+				// if a prior bake already wrote coarsened vectors into the BSP).
 				if (fabs( scale ) > luxeldensity)
 				{
 					if (scale < 0)
@@ -1891,7 +2133,7 @@ void RadWorld_Start()
 				}
 			}
 		}
-		
+
 		UpdateAllFaceLightmapExtents();
 	}
 
@@ -2111,18 +2353,29 @@ bool RadWorld_Go()
 		BuildFacesVisibleToLights( true );
 	}
 
-	// build initial facelights
+	// Optional DXR path-traced lightmaps replace stock BuildFacelights + BounceLight
+	// for world faces. On failure, fall back to the classic radiosity path.
+	const bool bPathTraced = PathTraceDXR_IsRequested() && PathTraceDXR_BakeWorldFaces();
+
+	if ( !bPathTraced )
+	{
+		// build initial facelights
 #ifdef MPI
-	if (g_bUseMPI) 
-	{
-		// RunThreadsOnIndividual (numfaces, true, BuildFacelights);
-		RunMPIBuildFacelights();
-	}
-	else 
+		if (g_bUseMPI)
+		{
+			// RunThreadsOnIndividual (numfaces, true, BuildFacelights);
+			RunMPIBuildFacelights();
+		}
+		else
 #endif
-	{
-		RunThreadsOnIndividual (numfaces, true, BuildFacelights);
+		{
+			RunThreadsOnIndividual (numfaces, true, BuildFacelights);
+		}
 	}
+
+	// $vrad_emit* self-illum. Pathtrace adds glow during luxel bake; classic needs this post-pass.
+	if ( !bPathTraced )
+		VRadEmit_AddSelfIllumToFaceLights();
 
 	// Was the process interrupted?
 	if( g_pIncremental && (g_iCurFace != numfaces) )
@@ -2151,6 +2404,11 @@ bool RadWorld_Go()
 			}
 		}
 
+		// Path tracer already includes multi-bounce GI in facelight samples.
+		int savedBounce = numbounce;
+		if ( bPathTraced )
+			numbounce = 0;
+
 		if (numbounce > 0)
 		{
 			// allocate memory for emitlight/addlight
@@ -2160,6 +2418,9 @@ bool RadWorld_Go()
 			memset( addlight.Base(), 0, g_Patches.Size() * sizeof( bumplights_t ) );
 
 			MakeAllScales ();
+
+			// Per-patch albedo from $basetexture (color bleed) before radiosity gather
+			RefineTexturedBounceReflectivity();
 
 			// spread light around
 			BounceLight ();
@@ -2187,7 +2448,8 @@ bool RadWorld_Go()
 			}
 			RunThreadsOnIndividual (numfaces, true, FinalLightFace);
 
-			if ( g_bStitchSeams )
+			// Seam stitch blurs pathtrace detail into blotches — skip when pathtraced.
+			if ( g_bStitchSeams && !bPathTraced )
 				StitchLightmapSeams();
 		}
 		
@@ -2197,6 +2459,9 @@ bool RadWorld_Go()
 #endif
 			
 		Msg("FinalLightFace Done\n"); fflush(stdout);
+
+		if ( bPathTraced )
+			numbounce = savedBounce;
 	}
 
 	return true;
@@ -2325,10 +2590,25 @@ void VRAD_LoadBSP( char const *pFilename )
 	if (g_bHDR)
 	{
 		g_pFaces = dfaces_hdr;
-		if (numfaces_hdr==0)
+		// Full rebake: always take lightmap layout from current VBSP faces.
+		// Stale LUMP_FACES_HDR extents (old scale / luxeldensity) cause blocky HDR bakes.
+		// Do NOT recompute extents from texinfo here — if texinfo was previously coarsened
+		// in the BSP, CalcFaceExtents would shrink faces and make it worse; VBSP dfaces
+		// are the authority after a proper VBSP run.
+		if ( numfaces_hdr == 0 || numfaces_hdr != numfaces || !g_pIncremental )
 		{
 			numfaces_hdr = numfaces;
 			memcpy( dfaces_hdr, dfaces, numfaces*sizeof(dfaces[0]) );
+		}
+		else
+		{
+			for ( int iFace = 0; iFace < numfaces; ++iFace )
+			{
+				dfaces_hdr[iFace].m_LightmapTextureMinsInLuxels[0] = dfaces[iFace].m_LightmapTextureMinsInLuxels[0];
+				dfaces_hdr[iFace].m_LightmapTextureMinsInLuxels[1] = dfaces[iFace].m_LightmapTextureMinsInLuxels[1];
+				dfaces_hdr[iFace].m_LightmapTextureSizeInLuxels[0] = dfaces[iFace].m_LightmapTextureSizeInLuxels[0];
+				dfaces_hdr[iFace].m_LightmapTextureSizeInLuxels[1] = dfaces[iFace].m_LightmapTextureSizeInLuxels[1];
+			}
 		}
 	}
 	else
@@ -2386,6 +2666,10 @@ void VRAD_LoadBSP( char const *pFilename )
 	// Capture tris for GPU BVH (sky occlusion / optional transfers) before KD convert.
 	if ( g_bVRadGPURequested )
 		VRadGPU_CaptureScene( g_RtEnv );
+
+	// Capture tris for DXR path tracer before KD convert (geometry format).
+	if ( PathTraceDXR_IsRequested() )
+		PathTraceDXR_CaptureScene( g_RtEnv );
 
 	// Build acceleration structure
 	printf ( "Setting up ray-trace acceleration structure... ");
@@ -2496,16 +2780,195 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 	int i;
 	for( i=1 ; i<argc ; i++ )
 	{
-		if ( !Q_stricmp( argv[i], "-gpu" ) )
+		if ( !Q_stricmp( argv[i], "-pathtrace" ) || !Q_stricmp( argv[i], "-dxr" ) )
 		{
-			VRadGPU_SetRequested( true );
-			Msg( "GPU acceleration requested (-gpu): bounce gather + batched sky occlusion.\n" );
+			PathTraceDXR_SetRequested( true );
+			Msg( "DXR path-traced lightmaps requested (-pathtrace): hardware RT bake for world faces.\n" );
 		}
-		else if ( !Q_stricmp( argv[i], "-gpu_transfers" ) )
+		else if ( !Q_stricmp( argv[i], "-pt_samples" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTraceSamples = atoi( argv[i] );
+				if ( g_nPathTraceSamples < 1 ) g_nPathTraceSamples = 1;
+				if ( g_nPathTraceSamples > 4096 ) g_nPathTraceSamples = 4096;
+				Msg( "PathTrace samples (-pt_samples): %d spp per luxel.\n", g_nPathTraceSamples );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_bounces" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTraceBounces = atoi( argv[i] );
+				if ( g_nPathTraceBounces < 1 ) g_nPathTraceBounces = 1;
+				if ( g_nPathTraceBounces > 16 ) g_nPathTraceBounces = 16;
+				Msg( "PathTrace bounces (-pt_bounces): %d.\n", g_nPathTraceBounces );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_aa" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTraceLuxelAA = atoi( argv[i] );
+				if ( g_nPathTraceLuxelAA < 1 ) g_nPathTraceLuxelAA = 1;
+				if ( g_nPathTraceLuxelAA > 5 ) g_nPathTraceLuxelAA = 5;
+				Msg( "PathTrace luxel AA (-pt_aa): %dx%d%s\n",
+					 g_nPathTraceLuxelAA, g_nPathTraceLuxelAA,
+					 ( g_nPathTraceLuxelAA <= 1 ) ? " (off)" : "" );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_lights" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTraceLightSamples = atoi( argv[i] );
+				if ( g_nPathTraceLightSamples < 0 ) g_nPathTraceLightSamples = 0;
+				if ( g_nPathTraceLightSamples > 256 ) g_nPathTraceLightSamples = 256;
+				if ( g_nPathTraceLightSamples == 0 )
+					Msg( "PathTrace lights (-pt_lights): all (exact NEE).\n" );
+				else
+					Msg( "PathTrace lights (-pt_lights): %d power-sampled locals per NEE (sky always all).\n",
+						 g_nPathTraceLightSamples );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_emit_samples" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTraceEmitSamples = atoi( argv[i] );
+				if ( g_nPathTraceEmitSamples < 0 ) g_nPathTraceEmitSamples = 0;
+				if ( g_nPathTraceEmitSamples > 512 ) g_nPathTraceEmitSamples = 512;
+				if ( g_nPathTraceEmitSamples == 0 )
+					Msg( "PathTrace emit samples (-pt_emit_samples): all tris (lowest noise).\n" );
+				else
+					Msg( "PathTrace emit samples (-pt_emit_samples): %d area NEE draws per vertex.\n",
+						 g_nPathTraceEmitSamples );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_lightradius" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_flPtLightRadius = (float)atof( argv[i] );
+				if ( g_flPtLightRadius < 0.0f ) g_flPtLightRadius = 0.0f;
+				if ( g_flPtLightRadius > 512.0f ) g_flPtLightRadius = 512.0f;
+				Msg( "PathTrace light soft radius (-pt_lightradius): %.1f%s\n",
+					 g_flPtLightRadius,
+					 ( g_flPtLightRadius <= 0.0f ) ? " (hard light/light_spot)" : "" );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_lightpenumbra" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_flPtLightPenumbra = (float)atof( argv[i] );
+				if ( g_flPtLightPenumbra < 0.0f ) g_flPtLightPenumbra = 0.0f;
+				if ( g_flPtLightPenumbra > 16.0f ) g_flPtLightPenumbra = 16.0f;
+				Msg( "PathTrace light penumbra scale (-pt_lightpenumbra): %.2f\n", g_flPtLightPenumbra );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_softsamples" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPtSoftSamples = atoi( argv[i] );
+				if ( g_nPtSoftSamples < 1 ) g_nPtSoftSamples = 1;
+				if ( g_nPtSoftSamples > 64 ) g_nPtSoftSamples = 64;
+				Msg( "PathTrace soft sample cap (-pt_softsamples): %d\n", g_nPtSoftSamples );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_softmode" ) )
+		{
+			if ( ++i < argc )
+			{
+				if ( !Q_stricmp( argv[i], "direct" ) || !Q_stricmp( argv[i], "0" ) )
+					g_nPtSoftMode = 0;
+				else if ( !Q_stricmp( argv[i], "all" ) || !Q_stricmp( argv[i], "1" ) )
+					g_nPtSoftMode = 1;
+				else
+					Warning( "Unknown -pt_softmode '%s' (use direct|all). Keeping %s.\n",
+							 argv[i], g_nPtSoftMode ? "all" : "direct" );
+				Msg( "PathTrace soft mode (-pt_softmode): %s\n",
+					 g_nPtSoftMode ? "all bounces" : "direct only (faster)" );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_device" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTraceDevice = atoi( argv[i] );
+				Msg( "PathTrace device (-pt_device): adapter %d.\n", g_nPathTraceDevice );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_gpu" ) )
+		{
+			g_bPathTraceGpu = true;
+			g_bPathTraceCpuForced = false;
+			Msg( "PathTrace GPU baker (-pt_gpu): on (DXR RayQuery luxel bake).\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_cpu" ) )
+		{
+			g_bPathTraceCpuForced = true;
+			g_bPathTraceGpu = false;
+			Msg( "PathTrace CPU baker (-pt_cpu): on (SSE path tracer + soft shadows).\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_denoise" ) )
+		{
+			g_bPathTraceDenoise = true;
+			Msg( "PathTrace denoise (-pt_denoise): on (mode=%s strength=%.2f)\n",
+				 PathTraceDenoise_Name(), g_flPathTraceDenoiseStrength );
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_denoiser" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_bPathTraceDenoise = true;
+				if ( !Q_stricmp( argv[i], "oidn" ) || !Q_stricmp( argv[i], "odin" ) )
+					g_PathTraceDenoiser = PT_DENOISER_OIDN;
+				else if ( !Q_stricmp( argv[i], "optix" ) )
+					g_PathTraceDenoiser = PT_DENOISER_OPTIX;
+				else if ( !Q_stricmp( argv[i], "sakai" ) || !Q_stricmp( argv[i], "stat" ) )
+					g_PathTraceDenoiser = PT_DENOISER_SAKAI;
+				else
+				{
+					Warning( "Unknown -pt_denoiser '%s' (use oidn|optix|sakai). Keeping %s.\n",
+							 argv[i], PathTraceDenoise_Name() );
+				}
+				Msg( "PathTrace denoiser (-pt_denoiser): %s\n", PathTraceDenoise_Name() );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_nodennoise" ) )
+		{
+			g_bPathTraceDenoise = false;
+			Msg( "PathTrace denoise (-pt_nodennoise): off\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_denoise_radius" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTraceDenoiseRadius = atoi( argv[i] );
+				g_bPathTraceDenoise = true;
+				if ( g_nPathTraceDenoiseRadius < 1 ) g_nPathTraceDenoiseRadius = 1;
+				if ( g_nPathTraceDenoiseRadius > 8 ) g_nPathTraceDenoiseRadius = 8;
+				Msg( "PathTrace denoise radius (-pt_denoise_radius): %d (Sakai spatial; ignored by OIDN/OptiX)\n",
+					 g_nPathTraceDenoiseRadius );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_denoise_strength" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_flPathTraceDenoiseStrength = (float)atof( argv[i] );
+				g_bPathTraceDenoise = true;
+				if ( g_flPathTraceDenoiseStrength < 0.0f ) g_flPathTraceDenoiseStrength = 0.0f;
+				if ( g_flPathTraceDenoiseStrength > 1.0f ) g_flPathTraceDenoiseStrength = 1.0f;
+				Msg( "PathTrace denoise strength (-pt_denoise_strength): %.2f\n", g_flPathTraceDenoiseStrength );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-gpu" ) )
 		{
 			VRadGPU_SetRequested( true );
-			VRadGPU_SetTransfersRequested( true );
-			Msg( "GPU transfers requested (-gpu_transfers): experimental, usually slower than CPU.\n" );
+			Msg( "GPU acceleration requested (-gpu): bounce gather; sky occlusion stays CPU with -TextureShadows.\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-gpu_maxtris" ) )
 		{
@@ -2523,10 +2986,40 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 				Msg( "GPU ray batch (-gpu_batch): %s\n", argv[i] );
 			}
 		}
+		else if ( !Q_stricmp( argv[i], "-texbounce" ) )
+		{
+			g_bTexturedBounce = true;
+			Msg( "Textured bounce (-texbounce): sample $basetexture albedo for color bleed.\n" );
+		}
 		else if ( !Q_stricmp( argv[i], "-nostitch" ) )
 		{
 			g_bStitchSeams = false;
 			Msg( "Lightmap seam stitching disabled (-nostitch).\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-noedgepull" ) )
+		{
+			g_bEdgePull = false;
+			Msg( "Edge sample pull-in disabled (-noedgepull).\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-edgepull" ) )
+		{
+			g_bEdgePull = true;
+			if ( i + 1 < argc && argv[i+1][0] != '-' )
+			{
+				++i;
+				g_flEdgePullInset = (float)atof( argv[i] );
+				if ( g_flEdgePullInset < 0.0f )
+					g_flEdgePullInset = 0.0f;
+				if ( g_flEdgePullInset > 2.0f )
+					g_flEdgePullInset = 2.0f;
+			}
+			Msg( "Edge sample pull-in (-edgepull): %.2f luxels from lightmap edges.\n",
+				 g_flEdgePullInset );
+		}
+		else if ( !Q_stricmp( argv[i], "-bounce_weld" ) )
+		{
+			g_bBounceWeld = true;
+			Msg( "Bounce weld (-bounce_weld): cull distant coplanar neighbor GI (can blotch ceilings).\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-coarse" ) )
 		{
@@ -2547,6 +3040,80 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 				Msg( "Bounce soft (-bounce_soft): radial scale %.2f (<1 tighter, >1 wider).\n",
 					 g_flBounceRadialScale );
 			}
+		}
+		else if ( !Q_stricmp( argv[i], "-bounce_boost" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_flBounceBoost = (float)atof( argv[i] );
+				if ( g_flBounceBoost < 0.0f )
+					g_flBounceBoost = 0.0f;
+				if ( g_flBounceBoost > 16.0f )
+					g_flBounceBoost = 16.0f;
+				Msg( "Bounce boost (-bounce_boost): scale final bounced light by %.2f (1=stock).\n",
+					 g_flBounceBoost );
+			}
+			else
+			{
+				Warning( "Error: expected a value after '-bounce_boost'\n" );
+				return -1;
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-bounce_chroma" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_flBounceChroma = (float)atof( argv[i] );
+				if ( g_flBounceChroma < 0.0f )
+					g_flBounceChroma = 0.0f;
+				if ( g_flBounceChroma > 8.0f )
+					g_flBounceChroma = 8.0f;
+				Msg( "Bounce chroma (-bounce_chroma): early-bounce saturation boost %.2f (0=off).\n",
+					 g_flBounceChroma );
+			}
+			else
+			{
+				Warning( "Error: expected a value after '-bounce_chroma'\n" );
+				return -1;
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-energy" ) )
+		{
+			g_bEnergyConserve = true;
+			Msg( "Cavity-damped radiosity (-energy): enclosed bounce darkened (cavity=%.2f).\n",
+				 g_flCavityScale );
+		}
+		else if ( !Q_stricmp( argv[i], "-noenergy" ) || !Q_stricmp( argv[i], "-valve" ) )
+		{
+			g_bEnergyConserve = false;
+			if ( !Q_stricmp( argv[i], "-valve" ) )
+				Msg( "Valve default lighting (-valve): stock Valve radiosity (no cavity damp).\n" );
+			else
+				Msg( "Stock radiosity (-noenergy): no enclosure cavity damp.\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-cavity" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_flCavityScale = (float)atof( argv[i] );
+				if ( g_flCavityScale < 0.25f )
+					g_flCavityScale = 0.25f;
+				if ( g_flCavityScale > 1.0f )
+					g_flCavityScale = 1.0f;
+				g_bEnergyConserve = true;
+				Msg( "Cavity scale (-cavity): fully-enclosed bounce gather = %.2f of stock (implies -energy).\n",
+					 g_flCavityScale );
+			}
+			else
+			{
+				Warning( "Error: expected a value after '-cavity'\n" );
+				return -1;
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-adaptivechop" ) )
+		{
+			g_bAdaptiveChop = true;
+			Msg( "Adaptive chop (-adaptivechop): finer patch floor near elongated / coarse patches.\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-maxtransfer" ) )
 		{
@@ -2802,6 +3369,14 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 				luxeldensity = (float)atof (argv[i]);
 				if (luxeldensity > 1.0)
 					luxeldensity = 1.0 / luxeldensity;
+				Msg( "Luxel density (-luxeldensity): %.4f (values >1 invert, e.g. 4 => 0.25 = 4x coarser)\n",
+					 luxeldensity );
+				if ( luxeldensity < 1.0f )
+				{
+					Warning( "WARNING: -luxeldensity makes lightmaps COARSER (blocky indoor GI). "
+							 "Do not use it to \"increase quality\". Prefer Hammer face lightmap scale. "
+							 "This also writes coarsened texinfo into the BSP — re-run VBSP to undo.\n" );
+				}
 			}
 			else
 			{
@@ -3031,10 +3606,16 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 #endif
 		else if ( mapArg == -1 )
 		{
+			if ( argv[i][0] == '-' )
+			{
+				Warning( "Unknown option '%s'\n", argv[i] );
+				return -1;
+			}
 			mapArg = i;
 		}
 		else
 		{
+			Warning( "Unknown option '%s' (map already set to '%s')\n", argv[i], argv[mapArg] );
 			return -1;
 		}
 	}
@@ -3124,13 +3705,43 @@ void PrintUsage( int argc, char **argv )
 		"  -textureshadows : Allows texture alpha channels to block light - rays intersecting alpha surfaces will sample the texture\n"
 		"  -noskyboxrecurse : Turn off recursion into 3d skybox (skybox shadows on world)\n"
 		"  -nossprops      : Globally disable self-shadowing on static props\n"
-		"  -gpu            : OpenCL bounce gather + batched ambient/sky occlusion.\n"
+		"  -gpu            : OpenCL bounce gather. Sky/ambient occlusion uses stock CPU when -TextureShadows is set.\n"
 		"  -gpu_maxtris N  : Optional GPU BVH triangle cap (default 0 = unlimited).\n"
 		"  -gpu_batch N    : Rays per OpenCL dispatch (default 32768; lower = safer).\n"
-		"  -gpu_transfers  : Experimental GPU transfer rays (usually slower; not recommended).\n"
+		"  -config/-cfg <file> : Load VRAD flags from a text preset (before -game / map).\n"
+		"                    Looks for file, file.cfg, file.txt; also next to vrad.exe\\configs\\.\n"
+		"  -pathtrace/-dxr : Path-traced world lightmaps (direct+GI+sky; soft area/sun).\n"
+		"  -pt_samples N   : Samples per luxel (default 4; 2 with -fast; 8 with -final; max 4096).\n"
+		"  -pt_bounces N   : PathTrace max path depth (default 2; 1 with -fast).\n"
+		"  -pt_aa N        : Luxel footprint AA grid 1..5 (1=off, 2=2x2 .. 5=5x5; default 3).\n"
+		"  -pt_lights N    : Local NEE light samples (0=all; N=power-sample N locals/sky always all).\n"
+		"  -pt_emit_samples N : $vrad_emit area NEE samples (0=all tris; default 64; higher=less noise).\n"
+		"  -pt_lightradius N : Soft disk radius for light/light_spot (0=hard; world units; CHSS).\n"
+		"  -pt_lightpenumbra N : Softness growth vs distance for soft lights (default 1).\n"
+		"  -pt_softsamples N : Max soft visibility rays per NEE (default 16; sun+locals).\n"
+		"  -pt_softmode X  : Soft shadows on direct|all path vertices (default direct = faster).\n"
+		"  -pt_device N    : Optional DXGI adapter index for PathTrace.\n"
+		"  -pt_gpu        : GPU RayQuery luxel baker (default when DXR ready; hard NEE).\n"
+		"  -pt_cpu        : Force CPU SSE path tracer (soft shadows / full feature path).\n"
+		"  -pt_denoise     : Enable pathtrace denoise (default OFF; mode via -pt_denoiser).\n"
+		"  -pt_denoiser X  : Denoiser oidn|optix|sakai (implies -pt_denoise; default oidn).\n"
+		"  -pt_nodennoise  : Disable PathTrace denoise.\n"
+		"  -pt_denoise_radius N : Sakai filter radius 1..8 (default 3; ignored by OIDN/OptiX).\n"
+		"  -pt_denoise_strength N : Blend 0..1 noisy→denoised (default 1; implies -pt_denoise).\n"
 		"  -coarse         : Larger lighting patches (chop 8) — faster VisLeafs/bounce.\n"
+		"  -adaptivechop   : Finer patch floor under -coarse (elongated patches).\n"
+		"  -texbounce      : Sample $basetexture albedo per patch for colored bounce.\n"
 		"  -bounce_soft N  : Bounce luxel splat scale (default 1=stock; <1 tighter; range 0.5..4).\n"
+		"  -bounce_boost N : Scale final bounced light (1=stock; 0..16). Direct lights unchanged.\n"
+		"  -bounce_chroma N: Early-bounce saturation boost (0=off; 0..8). Use with -texbounce.\n"
+		"  -bounce_weld    : Cull distant coplanar neighbor bounce (can blotch ceilings; off by default).\n"
+		"  -energy         : Cavity-damped radiosity — darkens enclosed bounce (off by default).\n"
+		"  -noenergy       : Stock Valve radiosity (no enclosure damp; default).\n"
+		"  -valve          : Same as -noenergy — stock Valve bounce look.\n"
+		"  -cavity N       : Fully-enclosed gather scale vs stock (default 0.70; range 0.25..1; implies -energy).\n"
 		"  -nostitch       : Disable lightmap seam stitching across coplanar face splits.\n"
+		"  -edgepull [N]   : Pull edge luxel samples inward (default ON, N=0.5 luxels). Helps thin walls.\n"
+		"  -noedgepull     : Disable edge sample pull-in (stock Valve sample positions).\n"
 		"  -maxtransfer N  : Skip patch transfers farther than N units (faster VisLeafs).\n"
 		"  -ao             : Bake cosine-weighted ambient occlusion into lightmaps.\n"
 		"  -ao_samples N   : AO rays per luxel (default 16). Implies -ao.\n"
@@ -3192,6 +3803,12 @@ int RunVRAD( int argc, char **argv )
 		CmdLib_Exit( 1 );
 	}
 
+	if ( g_bEnergyConserve )
+	{
+		Msg( "Cavity-damped radiosity: enclosed bounce gather ×%.2f (-noenergy for stock; -cavity N to tune).\n",
+			 g_flCavityScale );
+	}
+
 	// Initialize the filesystem, so additional commandline options can be loaded
 	Q_StripExtension( argv[ i ], source, sizeof( source ) );
 	CmdLib_InitFileSystem( argv[ i ] );
@@ -3213,6 +3830,7 @@ int RunVRAD( int argc, char **argv )
 #endif
 
 	VRadGPU_Shutdown();
+	PathTraceDXR_Shutdown();
 	DeleteCmdLine( argc, argv );
 	CmdLib_Cleanup();
 	return 0;
@@ -3224,6 +3842,9 @@ int VRAD_Main(int argc, char **argv)
 	g_pFileSystem = NULL;	// Safeguard against using it before it's properly initialized.
 
 	VRAD_Init();
+
+	// Expand -config presets before MPI / parsing (plain file IO, no FS yet).
+	ExpandConfigArgs( argc, argv );
 
 	// This must come first.
 #ifdef MPI

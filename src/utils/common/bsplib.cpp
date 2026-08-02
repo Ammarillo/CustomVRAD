@@ -26,6 +26,13 @@
 #include "lumpfiles.h"
 #include "lzma/lzma.h"
 #include "tier1/lzmaDecoder.h"
+#include "filesystem_tools.h"
+#include <stdio.h>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 //=============================================================================
 
@@ -722,6 +729,14 @@ static unsigned int AlignFilePosition( FileHandle_t hFile, int alignment )
 {
 	unsigned int currPosition = g_pFileSystem->Tell( hFile );
 
+	// Corrupt zip alignment (or memory smash) used to pad BSPs with
+	// gigabytes of zeros here — refuse absurd alignments.
+	if ( alignment > 1024 * 1024 )
+	{
+		Warning( "AlignFilePosition: refusing insane alignment %u, using 4\n", (unsigned)alignment );
+		alignment = 4;
+	}
+
 	if ( alignment >= 2 )
 	{
 		unsigned int newPosition = AlignValue( currPosition, alignment );
@@ -1318,6 +1333,16 @@ static void AddGameLumps( )
 	for( h = g_GameLumps.FirstGameLump(); h != g_GameLumps.InvalidGameLump(); h = g_GameLumps.NextGameLump( h ) )
 	{
 		unsigned int lumpsize = g_GameLumps.GameLumpSize(h);
+		if ( lumpsize > 512u * 1024u * 1024u )
+		{
+			Error( "AddGameLumps: game lump id %d has insane size %u\n",
+				(int)g_GameLumps.GetGameLumpId(h), lumpsize );
+		}
+		if ( lumpsize >= 8u * 1024u * 1024u )
+		{
+			Msg( "  writing game lump %d (%.1f MB)...\n",
+				(int)g_GameLumps.GetGameLumpId(h), lumpsize / (1024.0f * 1024.0f) );
+		}
 		if ( g_bSwapOnWrite )
 		{
 			g_GameLumps.SwapGameLump( g_GameLumps.GetGameLumpId(h), g_GameLumps.GetGameLumpVersion(h), (byte*)g_GameLumps.GetGameLump(h), (byte*)g_GameLumps.GetGameLump(h), lumpsize );
@@ -2272,6 +2297,21 @@ void LoadBSPFile( const char *filename )
 	if ( g_TexDataStringData.Count() > 0 && g_TexDataStringData.Tail() != 0 )
 		Error( "Cannot load corrupted bsp file %s", filename );
 
+	{
+		const int overlayCount = g_pBSPHeader->lumps[LUMP_OVERLAYS].filelen / (int)sizeof( doverlay_t );
+		if ( overlayCount > MAX_MAP_OVERLAYS )
+		{
+			Error( "Map has too many overlays (%d > MAX_MAP_OVERLAYS %d).\n"
+				"Rebuild VRAD with a matching limit, or reduce overlays in the map.\n",
+				overlayCount, MAX_MAP_OVERLAYS );
+		}
+		const int waterOverlayCount = g_pBSPHeader->lumps[LUMP_WATEROVERLAYS].filelen / (int)sizeof( dwateroverlay_t );
+		if ( waterOverlayCount > MAX_MAP_WATEROVERLAYS )
+		{
+			Error( "Map has too many water overlays (%d > MAX_MAP_WATEROVERLAYS %d).\n",
+				waterOverlayCount, MAX_MAP_WATEROVERLAYS );
+		}
+	}
 	g_nOverlayCount = CopyLump( LUMP_OVERLAYS, g_Overlays );
 	g_nWaterOverlayCount = CopyLump( LUMP_WATEROVERLAYS, g_WaterOverlays );
 	CopyLump( LUMP_OVERLAY_FADES, g_OverlayFades );
@@ -2549,6 +2589,19 @@ static void AddLumpInternal( int lumpnum, void *data, int len, int version )
 	lump->version = version;
 	lump->uncompressedSize = 0;
 
+	// Guard against memory-corruption lengths that used to write multi-GB "zero" BSPs.
+	const int kMaxReasonableLump = 512 * 1024 * 1024; // 512 MB
+	if ( len < 0 || len > kMaxReasonableLump )
+	{
+		Error( "AddLump: lump %d has insane size %d — aborting write (BSP left untouched if writing via temp file).\n",
+			lumpnum, len );
+	}
+
+	if ( len >= 8 * 1024 * 1024 )
+	{
+		Msg( "  writing lump %d (%.1f MB)...\n", lumpnum, len / (1024.0f * 1024.0f) );
+	}
+
 	SafeWrite( g_hBSPFile, data, len );
 
 	// pad out to the next dword
@@ -2636,7 +2689,13 @@ void WriteBSPFile( const char *filename, char *pUnused )
 	g_pBSPHeader->version = BSPVERSION;
 	g_pBSPHeader->mapRevision = g_MapRevision;
 
-	g_hBSPFile = SafeOpenWrite( filename );
+	// Write to a temp file first so killing VRAD mid-write cannot leave a
+	// truncated multi-GB BSP with an empty lump table in place of the real map.
+	char tempFilename[MAX_PATH];
+	V_strncpy( tempFilename, filename, sizeof( tempFilename ) );
+	V_strncat( tempFilename, ".writing", sizeof( tempFilename ) );
+
+	g_hBSPFile = SafeOpenWrite( tempFilename );
 	WriteData( g_pBSPHeader );	// overwritten later
 
 	AddLump( LUMP_PLANES, dplanes, numplanes );
@@ -2722,9 +2781,11 @@ void WriteBSPFile( const char *filename, char *pUnused )
 
 	AddLump( LUMP_LEAFMINDISTTOWATER, g_LeafMinDistToWater, numleafs );
 
+	Msg( "  writing game lumps...\n" );
 	AddGameLumps();
 
 	// Write pakfile lump to disk
+	Msg( "  writing pakfile lump...\n" );
 	WritePakFileLump();
 
 	// NOTE: Do NOT call AddLump after Lumps_Write() it writes all un-Added lumps
@@ -2734,6 +2795,30 @@ void WriteBSPFile( const char *filename, char *pUnused )
 	g_pFileSystem->Seek( g_hBSPFile, 0, FILESYSTEM_SEEK_HEAD );
 	WriteData( g_pBSPHeader );
 	g_pFileSystem->Close( g_hBSPFile );
+	g_hBSPFile = FILESYSTEM_INVALID_HANDLE;
+
+	// Atomically replace the real BSP only after a complete write.
+	if ( g_pFullFileSystem )
+	{
+		g_pFullFileSystem->RemoveFile( filename );
+		if ( !g_pFullFileSystem->RenameFile( tempFilename, filename ) )
+		{
+			Error( "WriteBSPFile: failed to rename %s -> %s\n", tempFilename, filename );
+		}
+	}
+	else
+	{
+#if defined(_WIN32)
+		_unlink( filename );
+#else
+		unlink( filename );
+#endif
+		if ( rename( tempFilename, filename ) != 0 )
+		{
+			Error( "WriteBSPFile: failed to rename %s -> %s\n", tempFilename, filename );
+		}
+	}
+	Msg( "  wrote %s\n", filename );
 }
 
 // Generate the next clear lump filename for the bsp file
@@ -3381,6 +3466,22 @@ void UpdateAllFaceLightmapExtents()
 			continue;		// non-lit texture
 
 		CalcFaceExtents( pFace, pFace->m_LightmapTextureMinsInLuxels, pFace->m_LightmapTextureSizeInLuxels );
+	}
+
+	// HDR VRAD bakes through dfaces_hdr (g_pFaces). Keep extents in sync after
+	// -luxeldensity / lightmap-vector rescale, otherwise HDR/pathtrace ignore it.
+	if ( numfaces_hdr > 0 )
+	{
+		const int n = ( numfaces_hdr < numfaces ) ? numfaces_hdr : numfaces;
+		for ( int i = 0; i < n; i++ )
+		{
+			dface_t *pFace = &dfaces_hdr[i];
+
+			if ( texinfo[pFace->texinfo].flags & (SURF_SKY|SURF_NOLIGHT) )
+				continue;
+
+			CalcFaceExtents( pFace, pFace->m_LightmapTextureMinsInLuxels, pFace->m_LightmapTextureSizeInLuxels );
+		}
 	}
 }
 

@@ -1733,8 +1733,15 @@ bool CVRadDispMgr::BuildDispSamplesAndLuxels_DoFast( lightinfo_t *pLightInfo, fa
 
 	float stepU = 1.0f / ( float )( width - 1 );
 	float stepV = 1.0f / ( float )( height - 1 );
-	float halfStepU = stepU * 0.5f;
-	float halfStepV = stepV * 0.5f;
+
+	// Match BuildDispLuxels: UV on [0,1] at luxel grid corners.
+	// Do NOT add halfStep — that pushes the last U/V row past 1.0, DispUVToSurfPoint
+	// early-outs without writing, and samples stay at (0,0,0) → black edges on 2 sides.
+	texinfo_t *pTex = &texinfo[pLightInfo->face->texinfo];
+	pFaceLight->worldAreaPerLuxel = 1.0 / ( sqrt( DotProduct( pTex->lightmapVecsLuxelsPerWorldUnits[0],
+															  pTex->lightmapVecsLuxelsPerWorldUnits[0] ) ) *
+											sqrt( DotProduct( pTex->lightmapVecsLuxelsPerWorldUnits[1],
+															  pTex->lightmapVecsLuxelsPerWorldUnits[1] ) ) );
 
 	for( int ndxV = 0; ndxV < height; ndxV++ )
 	{
@@ -1744,8 +1751,8 @@ bool CVRadDispMgr::BuildDispSamplesAndLuxels_DoFast( lightinfo_t *pLightInfo, fa
 
 			pFaceLight->sample[ndx].s = ndxU;
 			pFaceLight->sample[ndx].t = ndxV;
-			pFaceLight->sample[ndx].coord[0] = ( ndxU * stepU ) + halfStepU;
-			pFaceLight->sample[ndx].coord[1] = ( ndxV * stepV ) + halfStepV;
+			pFaceLight->sample[ndx].coord[0] = ndxU * stepU;
+			pFaceLight->sample[ndx].coord[1] = ndxV * stepV;
 
 			pDispTree->DispUVToSurfPoint( pFaceLight->sample[ndx].coord, pFaceLight->sample[ndx].pos, 1.0f );
 			pDispTree->DispUVToSurfNormal( pFaceLight->sample[ndx].coord, pFaceLight->sample[ndx].normal );			

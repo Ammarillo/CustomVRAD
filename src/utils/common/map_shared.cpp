@@ -133,4 +133,171 @@ bool LoadEntsFromMapFile( char const *pFilename )
 	}
 }
 
+static void FreeEntityEpairs( entity_t *pEnt )
+{
+	if ( !pEnt )
+		return;
+	epair_t *ep = pEnt->epairs;
+	while ( ep )
+	{
+		epair_t *pNext = ep->next;
+		free( ep->key );
+		free( ep->value );
+		free( ep );
+		ep = pNext;
+	}
+	pEnt->epairs = NULL;
+}
+
+static float LightEnvBrightness( entity_t *pEnt )
+{
+	// "_light" "r g b intensity"
+	char *p = ValueForKey( pEnt, "_light" );
+	if ( !p || !p[0] )
+		return 0.0f;
+	float r = 0, g = 0, b = 0, i = 0;
+	sscanf( p, "%f %f %f %f", &r, &g, &b, &i );
+	return ( 0.2126f * r + 0.7152f * g + 0.0722f * b ) * i;
+}
+
+struct LoadLightEnv_t
+{
+	entity_t	bestVisible;
+	entity_t	bestHidden;
+	bool		bHaveVisible;
+	bool		bHaveHidden;
+	float		flBestVisibleBright;
+	float		flBestHiddenBright;
+};
+
+static void ConsiderLightEnvCandidate( LoadLightEnv_t *pCtx, entity_t *pScratch, bool bHidden )
+{
+	const char *pszClass = ValueForKey( pScratch, "classname" );
+	if ( !pszClass || Q_stricmp( pszClass, "light_environment" ) )
+	{
+		FreeEntityEpairs( pScratch );
+		return;
+	}
+
+	const float bright = LightEnvBrightness( pScratch );
+	if ( !bHidden )
+	{
+		if ( !pCtx->bHaveVisible || bright >= pCtx->flBestVisibleBright )
+		{
+			if ( pCtx->bHaveVisible )
+				FreeEntityEpairs( &pCtx->bestVisible );
+			pCtx->bestVisible = *pScratch;
+			pScratch->epairs = NULL;
+			pCtx->bHaveVisible = true;
+			pCtx->flBestVisibleBright = bright;
+		}
+		else
+		{
+			FreeEntityEpairs( pScratch );
+		}
+	}
+	else
+	{
+		if ( !pCtx->bHaveHidden || bright >= pCtx->flBestHiddenBright )
+		{
+			if ( pCtx->bHaveHidden )
+				FreeEntityEpairs( &pCtx->bestHidden );
+			pCtx->bestHidden = *pScratch;
+			pScratch->epairs = NULL;
+			pCtx->bHaveHidden = true;
+			pCtx->flBestHiddenBright = bright;
+		}
+		else
+		{
+			FreeEntityEpairs( pScratch );
+		}
+	}
+}
+
+static ChunkFileResult_t LoadLightEnvEntityCallback( CChunkFile *pFile, LoadLightEnv_t *pCtx );
+
+// Depth: 0 = top-level entity, >0 = under hidden (Hammer visgroup-hidden ents).
+static int g_nLightEnvHiddenDepth = 0;
+
+static ChunkFileResult_t LoadLightEnvEntityCallback( CChunkFile *pFile, LoadLightEnv_t *pCtx )
+{
+	entity_t scratch;
+	memset( &scratch, 0, sizeof( scratch ) );
+
+	LoadEntity_t load;
+	load.pEntity = &scratch;
+	load.nBaseFlags = 0;
+	load.nBaseContents = 0;
+
+	ChunkFileResult_t eResult = pFile->ReadChunk( (KeyHandler_t)LoadEntityKeyCallback, &load );
+	if ( eResult != ChunkFile_Ok && eResult != ChunkFile_EOF )
+	{
+		FreeEntityEpairs( &scratch );
+		return eResult;
+	}
+
+	ConsiderLightEnvCandidate( pCtx, &scratch, g_nLightEnvHiddenDepth > 0 );
+	return ChunkFile_Ok;
+}
+
+static ChunkFileResult_t LoadLightEnvHiddenCallbackDepth( CChunkFile *pFile, LoadLightEnv_t *pCtx )
+{
+	++g_nLightEnvHiddenDepth;
+	CChunkHandlerMap Handlers;
+	Handlers.AddHandler( "entity", (ChunkHandler_t)LoadLightEnvEntityCallback, pCtx );
+	Handlers.AddHandler( "hidden", (ChunkHandler_t)LoadLightEnvHiddenCallbackDepth, pCtx );
+	pFile->PushHandlers( &Handlers );
+
+	ChunkFileResult_t eResult = ChunkFile_Ok;
+	while ( eResult == ChunkFile_Ok )
+		eResult = pFile->ReadChunk();
+
+	pFile->PopHandlers();
+	--g_nLightEnvHiddenDepth;
+	return ( eResult == ChunkFile_EOF ) ? ChunkFile_Ok : eResult;
+}
+
+bool LoadLightEnvironmentEntityFromVmf( const char *pFilename, entity_t *pOut )
+{
+	if ( !pFilename || !pFilename[0] || !pOut )
+		return false;
+
+	g_nMapFileVersion = 400;
+	g_nLightEnvHiddenDepth = 0;
+
+	CChunkFile File;
+	ChunkFileResult_t eResult = File.Open( pFilename, ChunkFile_Read );
+	if ( eResult != ChunkFile_Ok )
+		return false;
+
+	LoadLightEnv_t ctx;
+	memset( &ctx, 0, sizeof( ctx ) );
+
+	CChunkHandlerMap Handlers;
+	Handlers.AddHandler( "entity", (ChunkHandler_t)LoadLightEnvEntityCallback, &ctx );
+	Handlers.AddHandler( "hidden", (ChunkHandler_t)LoadLightEnvHiddenCallbackDepth, &ctx );
+	File.PushHandlers( &Handlers );
+
+	while ( eResult == ChunkFile_Ok )
+		eResult = File.ReadChunk();
+
+	File.PopHandlers();
+	g_nLightEnvHiddenDepth = 0;
+
+	memset( pOut, 0, sizeof( *pOut ) );
+	if ( ctx.bHaveVisible )
+	{
+		*pOut = ctx.bestVisible;
+		if ( ctx.bHaveHidden )
+			FreeEntityEpairs( &ctx.bestHidden );
+		return true;
+	}
+	if ( ctx.bHaveHidden )
+	{
+		*pOut = ctx.bestHidden;
+		return true;
+	}
+	return false;
+}
+
 

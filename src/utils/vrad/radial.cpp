@@ -19,8 +19,10 @@
 // Bounce luxel splat vs stock RADIALDIST. 1 = stock; <1 tighter; >1 wider.
 float g_flBounceRadialScale = 1.0f;
 
-// Cross-face bounce weld: coplanar neighbor patches near a shared edge
-// contribute with edge falloff (reduces rectangular GI seams).
+// Cross-face bounce weld (opt-in via -bounce_weld): coplanar neighbor patches
+// near a shared edge contribute with edge falloff. Off by default — culling
+// distant coplanar neighbors removes stock GI bleed and blotches ceilings.
+bool g_bBounceWeld = false;
 static const float BOUNCE_WELD_COPLANAR_DOT = 0.985f;	// ~10 deg
 static const float BOUNCE_WELD_EDGE_DIST = 24.0f;
 
@@ -58,6 +60,9 @@ static float DistPointToSegment( const Vector &p, const Vector &a, const Vector 
 // Non-coplanar neighbors return 1 (keep stock neighbor bleed).
 static float BounceWeldWeight( int facenum, int neighborFace, const Vector &patchOrigin, float patchRadius )
 {
+	if ( !g_bBounceWeld )
+		return 1.0f;
+
 	faceneighbor_t *fn = &faceneighbor[facenum];
 	faceneighbor_t *fnN = &faceneighbor[neighborFace];
 

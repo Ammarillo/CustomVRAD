@@ -71,8 +71,8 @@ if "%valveTmpIsReadOnlyLetter%"=="R" del /q "$(TargetDir)"$(TargetFileName)
     <ClCompile>
       <AdditionalOptions>/Zm200 /Gw /Zc:inline /Zc:threadSafeInit- /Wv:18 /Zc:__cplusplus</AdditionalOptions>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>..\..\common;..\..\public;..\..\public\tier0;..\..\public\tier1;..\common;..\vmpi;..\vmpi\mysql\mysqlpp\include;..\vmpi\mysql\include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>VPC;SOURCESDK;SOURCE_HAS_FREETYPE;WIN32;_WIN32;_DEBUG;DEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;_SCL_SECURE_NO_WARNINGS;%(PreprocessorDefinitions);PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64;PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64;COMPILER_MSVC;_DLL_EXT=.dll;DLLNAME=vrad_dll;DEV_BUILD;FRAME_POINTER_OMISSION_DISABLED;PROTECTED_THINGS_DISABLE;VRAD;_DLL_EXT=.dll;_DLL_PREFIX=;_EXTERNAL_DLL_EXT=.dll;PROJECTDIR=C:\Users\lumin\Desktop\SourceSDK2013-64-ficool\src\utils\vrad;VPCGAME=valve;VPCGAMECAPS=VALVE</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\..\common;..\..\public;..\..\public\tier0;..\..\public\tier1;..\common;..\vmpi;..\vmpi\mysql\mysqlpp\include;..\vmpi\mysql\include;C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;..\..\..\thirdparty\oidn\include</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>VPC;SOURCESDK;SOURCE_HAS_FREETYPE;WIN32;_WIN32;_DEBUG;DEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;_SCL_SECURE_NO_WARNINGS;%(PreprocessorDefinitions);PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64;PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64;COMPILER_MSVC;_DLL_EXT=.dll;DLLNAME=vrad_dll;DEV_BUILD;FRAME_POINTER_OMISSION_DISABLED;PROTECTED_THINGS_DISABLE;VRAD;VRAD_HAS_OPTIX;_DLL_EXT=.dll;_DLL_PREFIX=;_EXTERNAL_DLL_EXT=.dll;PROJECTDIR=C:\Users\lumin\Desktop\SourceSDK2013-64-ficool\src\utils\vrad;VPCGAME=valve;VPCGAMECAPS=VALVE</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <ExceptionHandling>false</ExceptionHandling>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
@@ -104,11 +104,11 @@ if "%valveTmpIsReadOnlyLetter%"=="R" del /q "$(TargetDir)"$(TargetFileName)
     <PreLinkEvent />
     <Link>
       <AdditionalOptions> /ignore:4221</AdditionalOptions>
-      <AdditionalDependencies>;shell32.lib;user32.lib;advapi32.lib;gdi32.lib;comdlg32.lib;ole32.lib;ws2_32.lib;OpenCL.lib</AdditionalDependencies>
+            <AdditionalDependencies>;shell32.lib;user32.lib;advapi32.lib;gdi32.lib;comdlg32.lib;ole32.lib;ws2_32.lib;OpenCL.lib;d3d12.lib;dxgi.lib;dxguid.lib;d3dcompiler.lib;OpenImageDenoise.lib;cudart.lib;cuda.lib</AdditionalDependencies>
       <ShowProgress>NotSet</ShowProgress>
       <OutputFile>$(OutDir)\vrad_dll.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
-      <AdditionalLibraryDirectories>..\..\lib\common\x64\2015\release;..\..\lib\public\x64</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\..\lib\common\x64\2015\release;..\..\lib\public\x64;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\lib\x64;..\..\..\thirdparty\oidn\lib</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>libc;libcd;libcmt;libcpmt;libcpmt1</IgnoreSpecificDefaultLibraries>
       <GenerateDebugInformation>DebugFull</GenerateDebugInformation>
       <ProgramDatabaseFile>$(IntDir)/$(TargetName).pdb</ProgramDatabaseFile>
@@ -159,8 +159,8 @@ exit 1
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <AdditionalIncludeDirectories>..\..\common;..\..\public;..\..\public\tier0;..\..\public\tier1;..\common;..\vmpi;..\vmpi\mysql\mysqlpp\include;..\vmpi\mysql\include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>VPC;SOURCESDK;SOURCE_HAS_FREETYPE;WIN32;_WIN32;NDEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_RUNTIME_LIBRARY_MISMATCH;_ALLOW_ITERATOR_DEBUG_LEVEL_MISMATCH;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions);PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64;PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64;COMPILER_MSVC;_DLL_EXT=.dll;DLLNAME=vrad_dll;DEV_BUILD;FRAME_POINTER_OMISSION_DISABLED;PROTECTED_THINGS_DISABLE;VRAD;_DLL_EXT=.dll;_DLL_PREFIX=;_EXTERNAL_DLL_EXT=.dll;PROJECTDIR=C:\Users\lumin\Desktop\SourceSDK2013-64-ficool\src\utils\vrad;VPCGAME=valve;VPCGAMECAPS=VALVE</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\..\common;..\..\public;..\..\public\tier0;..\..\public\tier1;..\common;..\vmpi;..\vmpi\mysql\mysqlpp\include;..\vmpi\mysql\include;C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;..\..\..\thirdparty\oidn\include</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>VPC;SOURCESDK;SOURCE_HAS_FREETYPE;WIN32;_WIN32;NDEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_RUNTIME_LIBRARY_MISMATCH;_ALLOW_ITERATOR_DEBUG_LEVEL_MISMATCH;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions);PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64;PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64;COMPILER_MSVC;_DLL_EXT=.dll;DLLNAME=vrad_dll;DEV_BUILD;FRAME_POINTER_OMISSION_DISABLED;PROTECTED_THINGS_DISABLE;VRAD;VRAD_HAS_OPTIX;_DLL_EXT=.dll;_DLL_PREFIX=;_EXTERNAL_DLL_EXT=.dll;PROJECTDIR=C:\Users\lumin\Desktop\SourceSDK2013-64-ficool\src\utils\vrad;VPCGAME=valve;VPCGAMECAPS=VALVE</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <ExceptionHandling>false</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -192,11 +192,11 @@ exit 1
     <PreLinkEvent />
     <Link>
       <AdditionalOptions> /ignore:4221</AdditionalOptions>
-      <AdditionalDependencies>;shell32.lib;user32.lib;advapi32.lib;gdi32.lib;comdlg32.lib;ole32.lib;ws2_32.lib;OpenCL.lib</AdditionalDependencies>
+            <AdditionalDependencies>;shell32.lib;user32.lib;advapi32.lib;gdi32.lib;comdlg32.lib;ole32.lib;ws2_32.lib;OpenCL.lib;d3d12.lib;dxgi.lib;dxguid.lib;d3dcompiler.lib;OpenImageDenoise.lib;cudart.lib;cuda.lib</AdditionalDependencies>
       <ShowProgress>NotSet</ShowProgress>
       <OutputFile>$(OutDir)\vrad_dll.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
-      <AdditionalLibraryDirectories>..\..\lib\common\x64\2015\release;..\..\lib\public\x64</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\..\lib\common\x64\2015\release;..\..\lib\public\x64;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\lib\x64;..\..\..\thirdparty\oidn\lib</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>libc;libcd;libcmtd;libcpmtd;libcpmtd0;libcpmtd1</IgnoreSpecificDefaultLibraries>
       <GenerateDebugInformation>DebugFull</GenerateDebugInformation>
       <ProgramDatabaseFile>$(IntDir)/$(TargetName).pdb</ProgramDatabaseFile>
@@ -221,9 +221,16 @@ exit 1
       <OutputFile>$(OutDir)/vrad_dll.bsc</OutputFile>
     </Bscmake>
     <PostBuildEvent>
-      <Message>Publishing to ..\..\..\game\bin\x64</Message>
-      <Command>
-      </Command>
+      <Message>Copy OIDN DLLs next to vrad_dll</Message>
+      <Command>xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\OpenImageDenoise*.dll" "$(OutDir)"
+xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbb12.dll" "$(OutDir)"
+xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(OutDir)"
+if not exist "$(ProjectDir)..\..\..\game\bin\x64" mkdir "$(ProjectDir)..\..\..\game\bin\x64"
+xcopy /Y /D "$(OutDir)vrad_dll.dll" "$(ProjectDir)..\..\..\game\bin\x64\"
+xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\OpenImageDenoise*.dll" "$(ProjectDir)..\..\..\game\bin\x64\"
+xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbb12.dll" "$(ProjectDir)..\..\..\game\bin\x64\"
+xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectDir)..\..\..\game\bin\x64\"
+</Command>
     </PostBuildEvent>
     <CustomBuildStep />
   </ItemDefinitionGroup>
@@ -244,6 +251,13 @@ exit 1
     <ClInclude Include="vrad_gpu.h" />
     <ClInclude Include="ao.h" />
     <ClInclude Include="absorb.h" />
+    <ClInclude Include="pathtrace_dxr.h" />
+    <ClInclude Include="pathtrace_dxr_device.h" />
+    <ClInclude Include="pathtrace_oidn.h" />
+    <ClInclude Include="pathtrace_denoise.h" />
+    <ClInclude Include="pathtrace_optix_denoise.h" />
+    <ClInclude Include="pathtrace_sakai.h" />
+    <ClInclude Include="skyambient.h" />
     <ClInclude Include="iincremental.h" />
     <ClInclude Include="imagepacker.h" />
     <ClInclude Include="incremental.h" />
@@ -251,6 +265,11 @@ exit 1
     <ClInclude Include="envvolume.h" />
     <ClInclude Include="lightmap.h" />
     <ClInclude Include="macro_texture.h" />
+    <ClInclude Include="bounce_albedo.h" />
+    <ClInclude Include="bounce_vol.h" />
+    <ClInclude Include="vrad_emit.h" />
+    <ClInclude Include="vrad_emit_area.h" />
+    <ClInclude Include="vrad_filter.h" />
     <ClInclude Include="..\..\public\map_utils.h" />
     <ClInclude Include="radial.h" />
     <ClInclude Include="..\..\public\bitmap\tgawriter.h" />
@@ -364,7 +383,19 @@ exit 1
     <ClCompile Include="envvolume.cpp" />
     <ClCompile Include="vrad_gpu.cpp" />
     <ClCompile Include="ao.cpp" />
+    <ClCompile Include="bounce_albedo.cpp" />
+    <ClCompile Include="bounce_vol.cpp" />
+    <ClCompile Include="vrad_emit.cpp" />
+    <ClCompile Include="vrad_emit_area.cpp" />
+    <ClCompile Include="vrad_filter.cpp" />
     <ClCompile Include="absorb.cpp" />
+    <ClCompile Include="pathtrace_dxr.cpp" />
+    <ClCompile Include="pathtrace_dxr_device.cpp" />
+    <ClCompile Include="pathtrace_oidn.cpp" />
+    <ClCompile Include="pathtrace_denoise.cpp" />
+    <ClCompile Include="pathtrace_optix_denoise.cpp" />
+    <ClCompile Include="pathtrace_sakai.cpp" />
+    <ClCompile Include="skyambient.cpp" />
     <ClCompile Include="lightmap.cpp" />
     <ClCompile Include="..\..\public\loadcmdline.cpp" />
     <ClCompile Include="..\..\public\lumpfiles.cpp" />

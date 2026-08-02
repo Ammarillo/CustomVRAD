@@ -24,6 +24,8 @@
 
 // CustomVRAD: scales bounce-only splat radius (softens patch GI seams). 1 = stock.
 extern float g_flBounceRadialScale;
+// Opt-in coplanar neighbor weld (-bounce_weld). Default off = stock bleed.
+extern bool g_bBounceWeld;
 
 #define WEIGHT_EPS	0.00001f
 

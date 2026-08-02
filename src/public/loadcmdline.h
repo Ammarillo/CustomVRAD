@@ -12,6 +12,13 @@
 #endif
 
 //-----------------------------------------------------------------------------
+// Purpose: Expand -config / -cfg <path> into argv tokens from a text preset file.
+//          Uses plain file IO (no Valve FS) so it can run before -game / filesystem init.
+//          Safe to call multiple times; owns argv memory after the first expansion.
+//-----------------------------------------------------------------------------
+void ExpandConfigArgs( int &argc, char **&argv );
+
+//-----------------------------------------------------------------------------
 // Purpose: Loads additional commandline arguments from a config file for an app.
 // keyname: Name of the block containing the key/args pairs (ie map or model name)
 // appname: Keyname for the commandline arguments to be loaded - typically the exe name.

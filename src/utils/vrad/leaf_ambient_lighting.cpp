@@ -141,6 +141,7 @@ void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vect
 	// Figure out the color that rays hit when shot out from this position.
 	Vector radcolor[NUMVERTEXNORMALS];
 	float tanTheta = tan(VERTEXNORMAL_CONE_INNER_ANGLE);
+	bool sampled[NUMVERTEXNORMALS];
 
 	// volume-blended sky ambient at this sample point (light_env_vol aware)
 	Vector vSkyAmbient;
@@ -148,14 +149,22 @@ void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vect
 
 	for ( int i = 0; i < NUMVERTEXNORMALS; i++ )
 	{
+		radcolor[i].Init();
+		sampled[i] = false;
+
+		// -fastambient: every other sphere direction (~2× faster leaf cubes).
+		if ( g_bFastAmbient && ( i & 1 ) )
+			continue;
+
 		Vector vEnd = vStart + g_anorms[i] * (COORD_EXTENT * 1.74);
 
 		// Now that we've got a ray, see what surface we've hit
 		Vector lightStyleColors[MAX_LIGHTSTYLES];
 		lightStyleColors[0].Init();	// We only care about light style 0 here.
 		CalcRayAmbientLighting( iThread, vStart, vEnd, tanTheta, lightStyleColors, &vSkyAmbient );
-	
+
 		radcolor[i] = lightStyleColors[0];
+		sampled[i] = true;
 	}
 
 	// accumulate samples into radiant box
@@ -167,6 +176,8 @@ void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vect
 
 		for (int i = 0; i < NUMVERTEXNORMALS; i++)
 		{
+			if ( !sampled[i] )
+				continue;
 			float c = DotProduct( g_anorms[i], g_BoxDirections[j] );
 			if (c > 0)
 			{
@@ -174,8 +185,9 @@ void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vect
 				lightBoxColor[j] += radcolor[i] * c;
 			}
 		}
-		
-		lightBoxColor[j] *= 1/t;
+
+		if ( t > 0.0f )
+			lightBoxColor[j] *= 1/t;
 	}
 
 	// Now add direct light from the emit_surface lights. These go in the ambient cube because

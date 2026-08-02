@@ -14,6 +14,7 @@
 #include "Cmodel.h"
 #include "mathlib/vmatrix.h"
 #include "envvolume.h"
+#include "vrad_filter.h"
 
 
 //=============================================================================
@@ -530,6 +531,22 @@ void AddBrushToRaytraceEnvironment( dbrush_t *pBrush, const VMatrix &xform )
 	if ( !( pBrush->contents & MASK_OPAQUE ) )
 		return;
 
+	// If any side is $vrad_filter glass, skip the whole brush as opaque.
+	// Typical Hammer glass = filter front + nodraw back; the nodraw face would
+	// otherwise stay TRACE_ID_OPAQUE and hard-block light through the pane.
+	bool bHasFilterSide = false;
+	for ( int i = 0; i < pBrush->numsides; i++ )
+	{
+		texinfo_t *tx = &texinfo[dbrushsides[pBrush->firstside + i].texinfo];
+		if ( VRadFilter_TexdataFilters( tx->texdata ) )
+		{
+			bHasFilterSide = true;
+			break;
+		}
+	}
+	if ( bHasFilterSide )
+		return;
+
 	Vector v0, v1, v2;
 	for (int i = 0; i < pBrush->numsides; i++ )
 	{
@@ -633,6 +650,9 @@ void AddBrushesForRayTrace( void )
 	if ( !nummodels )
 		return;
 
+	// So AddBrushToRaytraceEnvironment can skip $vrad_filter sides as opaque.
+	VRadFilter_EnsureCache();
+
 	VMatrix identity;
 	identity.Identity();
 	
@@ -685,5 +705,47 @@ void AddBrushesForRayTrace( void )
 			fullCoverage.x = 1.0f;
 			g_RtEnv.AddTriangle ( TRACE_ID_SKY, points[0], points[j - 1], points[j], fullCoverage );
 		}
+	}
+
+	// Colored glass ($vrad_filter*): add translucent panes as TRACE_ID_FILTER | faceIndex.
+	// Ordinary WINDOW glass without the VMT stays out of the RT (light passes unfiltered).
+	VRadFilter_EnsureCache();
+	if ( VRadFilter_HasAny() )
+	{
+		int nFilterTris = 0;
+		int nFilterFaces = 0;
+		for ( int i = 0; i < numfaces; ++i )
+		{
+			if ( !VRadFilter_FaceFilters( i ) )
+				continue;
+			dface_t *face = &g_pFaces[i];
+			if ( texinfo[face->texinfo].flags & SURF_SKY )
+				continue;
+			if ( face->dispinfo != -1 )
+				continue; // displacements: rare for glass; skip for now
+
+			Vector origin = face_offset[i];
+			Vector points[MAX_POINTS_ON_WINDING];
+			int nPts = face->numedges;
+			if ( nPts > MAX_POINTS_ON_WINDING )
+				nPts = MAX_POINTS_ON_WINDING;
+			for ( int j = 0; j < nPts; ++j )
+			{
+				int surfEdge = dsurfedges[face->firstedge + j];
+				unsigned short v = ( surfEdge < 0 ) ? dedges[-surfEdge].v[1] : dedges[surfEdge].v[0];
+				points[j] = dvertexes[v].point + origin;
+			}
+			const unsigned id = TRACE_ID_FILTER | ( (unsigned)i & 0x00FFFFFFu );
+			Vector fullCoverage;
+			fullCoverage.x = 1.0f;
+			for ( int j = 2; j < nPts; ++j )
+			{
+				g_RtEnv.AddTriangle( id, points[0], points[j - 1], points[j], fullCoverage );
+				++nFilterTris;
+			}
+			++nFilterFaces;
+		}
+		if ( nFilterFaces > 0 )
+			Msg( "Colored glass ($vrad_filter): %d face(s), %d RT triangle(s).\n", nFilterFaces, nFilterTris );
 	}
 }

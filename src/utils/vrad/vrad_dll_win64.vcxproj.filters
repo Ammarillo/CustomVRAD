@@ -80,6 +80,33 @@
     <ClInclude Include="absorb.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="pathtrace_dxr.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="pathtrace_dxr_device.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="pathtrace_oidn.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="skyambient.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="bounce_albedo.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="bounce_vol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="vrad_emit.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="vrad_emit_area.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="vrad_filter.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="lightmap.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -418,7 +445,34 @@
     <ClCompile Include="ao.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="bounce_albedo.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="bounce_vol.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="vrad_emit.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="vrad_emit_area.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="vrad_filter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="absorb.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="pathtrace_dxr.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="pathtrace_dxr_device.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="pathtrace_oidn.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="skyambient.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="lightmap.cpp">
