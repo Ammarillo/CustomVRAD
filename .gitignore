@@ -126,7 +126,6 @@ _bench_*.txt
 *.vrb
 *.bcf
 *.run.xml
-docs/*.pdf
 /algorithms.pdf
 
 # Downloaded third-party SDKs (fetch locally; see thirdparty READMEs)
