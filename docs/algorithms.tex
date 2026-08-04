@@ -1,0 +1,875 @@
+% CustomVRAD — Algorithm Reference
+% Compile: pdflatex algorithms.tex  (×2 for TOC/refs)
+% Requires: amsmath, booktabs, hyperref, listings, microtype, tcolorbox (optional)
+\documentclass[11pt,a4paper]{article}
+
+% ─── Modern layout ───────────────────────────────────────────────────────────
+\usepackage[margin=2.4cm,marginparwidth=2cm]{geometry}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{setspace}
+\setstretch{1.08}
+
+% ─── Math & symbols ──────────────────────────────────────────────────────────
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+
+% ─── Figures, tables, code ───────────────────────────────────────────────────
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+
+% ─── Algorithms ──────────────────────────────────────────────────────────────
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+% ─── Boxes / callouts ────────────────────────────────────────────────────────
+\usepackage[most]{tcolorbox}
+\tcbuselibrary{breakable,skins}
+
+% ─── Hyperlinks & meta ───────────────────────────────────────────────────────
+\usepackage[hidelinks,colorlinks=true,linkcolor=cvLink,citecolor=cvLink,urlcolor=cvLink]{hyperref}
+\usepackage{cleveref}
+
+% ─── Colors ──────────────────────────────────────────────────────────────────
+\definecolor{cvBlue}{HTML}{1B4F72}
+\definecolor{cvAccent}{HTML}{C0392B}
+\definecolor{cvMuted}{HTML}{5D6D7E}
+\definecolor{cvBg}{HTML}{F4F6F7}
+\definecolor{cvCodeBg}{HTML}{F8F9F9}
+\definecolor{cvLink}{HTML}{1A5276}
+\definecolor{cvRule}{HTML}{D5D8DC}
+
+% ─── Title style ─────────────────────────────────────────────────────────────
+\usepackage{titlesec}
+\titleformat{\section}
+  {\Large\bfseries\color{cvBlue}}{\thesection}{0.8em}{}[\vspace{-0.3em}{\color{cvRule}\titlerule}]
+\titleformat{\subsection}
+  {\large\bfseries\color{cvBlue}}{\thesubsection}{0.7em}{}
+\titleformat{\subsubsection}
+  {\normalsize\bfseries\color{cvMuted}}{\thesubsubsection}{0.6em}{}
+
+% ─── Custom boxes ────────────────────────────────────────────────────────────
+\newtcolorbox{notebox}[1][Note]{
+  breakable, enhanced, colback=cvBg, colframe=cvBlue,
+  fonttitle=\bfseries, title=#1, boxrule=0.6pt,
+  left=6pt, right=6pt, top=4pt, bottom=4pt
+}
+\newtcolorbox{warnbox}[1][Caveat]{
+  breakable, enhanced, colback=cvBg, colframe=cvAccent,
+  fonttitle=\bfseries\color{cvAccent}, title=#1, boxrule=0.6pt,
+  left=6pt, right=6pt, top=4pt, bottom=4pt
+}
+\newtcolorbox{eqbox}{
+  breakable, enhanced, colback=cvCodeBg, colframe=cvRule,
+  boxrule=0.4pt, left=8pt, right=8pt, top=4pt, bottom=4pt,
+  sharp corners
+}
+
+% ─── Listings ────────────────────────────────────────────────────────────────
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{cvCodeBg},
+  frame=single, rulecolor=\color{cvRule},
+  breaklines=true, columns=false,
+  xleftmargin=4pt, xrightmargin=4pt,
+  aboveskip=0.6em, belowskip=0.6em
+}
+
+% ─── Misc ────────────────────────────────────────────────────────────────────
+\newcommand{\flag}[1]{\texttt{\bfseries #1}}
+\newcommand{\vmt}[1]{\texttt{\$#1}}
+\newcommand{\ent}[1]{\texttt{#1}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\vect}[1]{\bm{#1}}
+
+\title{%
+  \vspace{-1.2em}
+  {\color{cvBlue}\Huge\bfseries CustomVRAD}\\[0.35em]
+  {\Large Algorithm Reference}\\[0.5em]
+  {\normalsize\color{cvMuted} Path-traced and radiosity lightmap baking for Source~SDK~2013 / Garry's~Mod}
+}
+\author{CustomVRAD contributors}
+\date{\today}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+\noindent
+CustomVRAD is a drop-in 64-bit replacement for Valve's VRAD lightmap compiler.
+It extends the classic patch radiosity pipeline with an optional DirectX~Raytracing
+(DXR) path tracer, hero-wavelength spectral transport, contact-hardening soft shadows,
+textured emissive and filter materials, volume overrides, multi-scale ambient occlusion,
+and several lightmap-quality post-processes.
+This document describes the implemented algorithms, their mathematical formulation,
+parameter semantics, and the relationship between the classic and path-traced bake modes.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{System overview}
+%═══════════════════════════════════════════════════════════════════════════════
+
+CustomVRAD produces HDR (and LDR) lightmaps compatible with the Source engine.
+Two mutually exclusive world-face lighting pipelines exist:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{Classic radiosity} --- stock VRAD \code{BuildFacelights} plus iterative
+        patch gather, optionally accelerated by OpenCL (\flag{-gpu}).
+  \item \textbf{Path tracing} --- D3D12 DXR baker activated by \flag{-pathtrace} /
+        \flag{-dxr}. On success it replaces world-face direct lighting \emph{and}
+        radiosity bounce. Static props can share the same integrator under
+        \flag{-StaticPropLighting}.
+\end{enumerate}
+
+Leaf ambient cubes, detail props, and engine-exported worldlights remain on stock
+paths (with CustomVRAD volume-aware extensions where noted).
+Failure of DXR init or bake falls back to classic radiosity for world faces
+(and CPU prop gather for props).
+
+\begin{notebox}[Two GPU paths]
+  \flag{-pt\_gpu} drives the DXR RayQuery luxel baker.
+  \flag{-gpu} is an independent OpenCL path that accelerates classic radiosity
+  gather and batched AO occlusion. They are not interchangeable.
+\end{notebox}
+
+\subsection{Data flow}
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item Load BSP, materials (VMT/VTF), entities, static props.
+  \item Build ray-tracing acceleration (CPU KD-tree and/or DXR TLAS/BLAS).
+  \item Direct lighting (classic) \emph{or} PathLi bake (pathtrace).
+  \item Radiosity bounce (classic only, if \flag{-bounce}~$N>0$).
+  \item Optional AO, denoise, seam stitch, edge-pull-aware sampling.
+  \item Write lightmaps / prop vertex colours into the BSP.
+\end{enumerate}
+
+\subsection{Notation}
+
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+  \toprule
+  Symbol & Meaning \\
+  \midrule
+  $\vect{x},\vect{n}$ & Sample position and shading normal \\
+  $\rho$ & Diffuse albedo (linear RGB or spectral reflectance) \\
+  $\beta$ & Path throughput \\
+  $L_e$ & Emitted radiance \\
+  $V$ & Binary (or soft) visibility \\
+  $N$ & \flag{-pt\_bounces} --- number of \emph{indirect} hops \\
+  $M$ & Path depth $= N+1$ (primary vertex $+$ $N$ bounces) \\
+  \bottomrule
+\end{tabularx}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Path tracing (DXR)}
+\label{sec:pathtrace}
+%═══════════════════════════════════════════════════════════════════════════════
+
+The path tracer is a unidirectional Lambertian integrator with next-event
+estimation (NEE) at every path vertex. It is implemented twice:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{GPU} (\flag{-pt\_gpu}, default): compute shader using DXR~1.1
+        \code{RayQuery}, TLAS over world + optional prop BLASes
+        (\code{pathtrace\_dxr\_gpu\_bake.inl}).
+  \item \textbf{CPU} (\flag{-pt\_cpu}): threaded SSE reference
+        (\code{PtPathLi} in \code{pathtrace\_dxr.cpp}). RGB-only; no spectral.
+\end{itemize}
+
+\subsection{PathLi estimator}
+
+At luxel (or prop sample) $(\vect{x}_0,\vect{n}_0)$ the estimator is
+\begin{equation}
+  \hat{L}
+  =
+  \sum_{k=0}^{m}
+  \beta_k\, L_{\mathrm{NEE}}(\vect{x}_k,\vect{n}_k)
+  \;+\;
+  \beta_{m'}\, L_{\mathrm{sky}}(\vect{x}_{m'}),
+  \label{eq:pathli}
+\end{equation}
+where $m$ is the last surface vertex before termination, and the sky term is
+added when a BSDF sample escapes to the sky (ambient sky is \emph{not} NEE-sampled).
+
+\paragraph{BSDF.}
+Surfaces are Lambertian,
+\begin{equation}
+  f_r(\omega_i,\omega_o)=\frac{\rho}{\pi},
+  \qquad
+  p_{\mathrm{bsdf}}(\omega)=\frac{\cos\theta}{\pi}.
+\end{equation}
+After a non-sky hit the throughput update simplifies to
+\begin{equation}
+  \beta_{k+1} = \beta_k\,\rho_k
+  \qquad\text{(albedo clamped channelwise to $[0,1]$).}
+\end{equation}
+
+\paragraph{Russian roulette.}
+Starting at bounce index $k\ge 1$,
+\begin{equation}
+  q = \min\!\bigl(0.95,\;\max(\beta_r,\beta_g,\beta_b)\bigr)
+  \quad\text{(spectral: mean of four $\beta_\lambda$)}.
+\end{equation}
+Terminate if $u>q$; otherwise $\beta\leftarrow\beta/q$.
+
+\subsection{Bounce semantics}
+\label{sec:bounces}
+
+\begin{eqbox}
+\begin{equation*}
+  \boxed{\;\text{pathDepth}=N+1,\quad N=\texttt{-pt\_bounces}\;}
+\end{equation*}
+\end{eqbox}
+
+$N$ counts \textbf{indirect hops after the luxel}. Vertex $k=0$ is always the
+receiving sample (primary NEE $=$ direct lighting). Therefore:
+
+\begin{center}
+\begin{tabular}{@{}cll@{}}
+  \toprule
+  $N$ & Path depth & Effect \\
+  \midrule
+  $0$ & $1$ & Direct lights $+$ sky escape; \textbf{no GI} \\
+  $1$ & $2$ & One bounce of reflected light \\
+  $6$ & $7$ & Typical indoor quality (config sheet) \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Defaults: $N=3$ when unset; $N=1$ under \flag{-fast}; clamp $[0,16]$.
+Unset is distinguished from explicit zero by an internal sentinel ($-1$).
+\flag{-pt\_prop\_bounces} mirrors this for vertex prop quality
+(auto $=$ world $N$).
+
+\subsection{Next-event estimation}
+
+At every vertex the integrator evaluates (or samples) lights:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Sun / sky disc} --- always evaluated; Veach power-heuristic MIS
+        vs.\ cosine BSDF for the angular sun.
+  \item \textbf{Point / spot} --- all lights when \flag{-pt\_lights}~$0$;
+        otherwise power-proportional CDF sample of $K$ locals with weight
+        $1/(p_i K)$. Bounce~$0$ always evaluates all locals on GPU.
+  \item \textbf{\vmt{vrad\_emit} area triangles} --- power-weighted triangle
+        selection $+$ uniform area sample (PBRT-style).
+  \item \textbf{Legacy \code{emit\_surface}} --- NEE-only proxies (no BSDF hit
+        contribution; avoids double-counting).
+\end{itemize}
+
+\paragraph{Sun MIS.}
+For sun solid angle $\Omega=2\pi(1-\cos\theta_{\max})$,
+\begin{equation}
+  p_{\mathrm{light}}=\frac{1}{\Omega},
+  \qquad
+  w_{\mathrm{light}}
+  =
+  \frac{p_{\mathrm{light}}^{2}}
+       {p_{\mathrm{light}}^{2}+p_{\mathrm{bsdf}}^{2}}.
+\end{equation}
+
+\paragraph{Point / spot attenuation.}
+\begin{equation}
+  A(d)=\frac{1}{c+\ell d+q d^{2}},
+\end{equation}
+with optional hard distance cap and quintic smootherstep fade
+$s(t)=t^{3}(6t^{2}-15t+10)$.
+
+\paragraph{Area emission contribution} (triangle sample with density $p_A$):
+\begin{equation}
+  L_{\mathrm{area}}
+  =
+  L_e\,
+  \frac
+  {(\vect{n}_r\cdot\omega)\,(-\vect{n}_e\cdot\omega)\,V}
+  {d^{2}\,p_A}.
+\end{equation}
+
+\subsection{Soft shadows and contact hardening}
+\label{sec:chss}
+
+Local lights may use a soft disk of radius $r$ (\flag{-pt\_lightradius}, or
+entity \ent{light\_volume} \code{Radius}). The sun uses an angular cap
+(\flag{-softsun} / entity \code{SunSpreadAngle}).
+
+Adaptive sample count (CHSS-style) from a probe blocker distance $t_{\mathrm{hit}}$
+and light distance $d$:
+\begin{equation}
+  w_{\mathrm{pen}}
+  =
+  \frac{t_{\mathrm{hit}}\, r\, s_p}
+       {\max(d-t_{\mathrm{hit}},10^{-3})},
+  \qquad
+  n
+  =
+  \mathrm{clamp}\!\left(
+    1+\bigl\lfloor 0.35\,w_{\mathrm{pen}}+0.5\bigr\rfloor,\;
+    1,\; n_{\max}
+  \right),
+\end{equation}
+where $s_p=\texttt{-pt\_lightpenumbra}$ (default~$1$) and
+$n_{\max}=\texttt{-pt\_softsamples}$ (default~$16$, clamp $1$--$64$).
+Unoccluded lights use a cheap angular estimate, capped at four rays.
+
+\flag{-pt\_softmode}~\code{direct} (default) enables soft sampling only at the
+luxel; \code{all} enables it at every path vertex.
+
+\subsection{Firefly clamp}
+
+Hue-preserving max-channel clamp with cap $C_{\max}=2500$:
+\begin{equation}
+  C'
+  =
+  \begin{cases}
+    C\cdot C_{\max}/\max(C) & \text{if }\max(C)>C_{\max},\\
+    C & \text{otherwise.}
+  \end{cases}
+\end{equation}
+
+\subsection{Sampling and luxel AA}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \flag{-pt\_samples}~$S$: spp per luxel (quality-derived if unset;
+        clamp $1$--$4096$). GPU uses fixed $S$; CPU may adaptively raise spp
+        (up to $4\times$, cap~$64$) when coefficient of variation is high.
+  \item \flag{-pt\_aa}~$A$: deterministic $A\times A$ footprint grid over the
+        luxel ($A\in[1,5]$, default~$3$). Spatial AA, not a multiplicative spp loop.
+\end{itemize}
+
+\subsection{Post-bake lightmap cleanup}
+
+After PathLi accumulation the baker:
+\begin{enumerate}[leftmargin=1.6em]
+  \item Fills chart holes / invalid samples.
+  \item Dilates suspicious dark edge outliers (sample-in-solid).
+  \item Optionally denoises (\cref{sec:denoise}).
+  \item Always applies two FXAA-like $3\times3$ high-contrast evening passes
+        (blend starts near $25\%$ relative luminance jump, full near $55\%$,
+        neighbour blend capped at $65\%$).
+\end{enumerate}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Spectral transport}
+\label{sec:spectral}
+%═══════════════════════════════════════════════════════════════════════════════
+
+Default on GPU: \flag{-pt\_spectral}. Disable with \flag{-pt\_nospectral}.
+CPU PathLi remains linear RGB.
+
+\subsection{Hero wavelengths}
+
+Four stratified wavelengths per path over $[380,780]\,\mathrm{nm}$:
+\begin{equation}
+  \lambda_i
+  =
+  380 + (i+\xi_i)\,\frac{400}{4},
+  \qquad i=0,1,2,3.
+\end{equation}
+
+\subsection{RGB $\leftrightarrow$ spectrum}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Upsampling:} Smits~(1999) bases as tabulated in PBRT-v3
+        ($32$ samples over the visible range) --- separate bases for reflectance
+        and illuminants.
+  \item \textbf{Transport:} illumination adds and reflectance multiplies in
+        $\lambda$-space.
+  \item \textbf{Projection:} Wyman analytic CIE~1931 $2^\circ$ CMFs $\to$ XYZ,
+        then IEC~61966-2-1 / Rec.~709 matrix to linear sRGB.
+\end{itemize}
+
+Monte Carlo reconstruction weight uses the CIE $Y$ integral
+$Y_{\mathrm{int}}=106.856895$:
+\begin{equation}
+  (X,Y,Z)
+  \;+\!=\;
+  \frac{L(\lambda)}{p_\lambda\, Y_{\mathrm{int}}}
+  \bigl(\bar{x}(\lambda),\bar{y}(\lambda),\bar{z}(\lambda)\bigr).
+\end{equation}
+
+\begin{warnbox}
+  Spectral mode is implemented in the GPU HLSL baker only.
+  \flag{-pt\_cpu} ignores \flag{-pt\_spectral} and transports in linear RGB.
+\end{warnbox}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Classic radiosity}
+\label{sec:radiosity}
+%═══════════════════════════════════════════════════════════════════════════════
+
+Used when pathtrace is off or fails. \flag{-bounce}~$0$ skips the entire bounce
+stage (direct only) --- the classic analogue of \flag{-pt\_bounces}~$0$.
+
+\subsection{Patches and form factors}
+
+Faces are subdivided into patches (unless bounce count is zero). Visibility is
+PVS-pruned and ray-tested. Far-field differential form factor:
+\begin{equation}
+  F_{1\leftrightarrow 2}
+  =
+  \frac{(-\hat{d}\cdot\vect{n}_1)\,(\hat{d}\cdot\vect{n}_2)}
+       {\|\vect{x}_1-\vect{x}_2\|^{2}}.
+\end{equation}
+Polygon-to-differential form factors are used when patch size invalidates the
+far-field approximation. Raw transfer $=$ source area $\times$ form factor.
+Receiver lists are normalised:
+\begin{equation}
+  s
+  =
+  \begin{cases}
+    1/T & T>\pi,\\
+    1/\pi & T\le\pi,
+  \end{cases}
+  \qquad
+  T=\sum_j t_j.
+\end{equation}
+
+\subsection{Gather iteration}
+
+Emitted light $E_j$ and patch reflectance $\rho_j$ gather as
+\begin{equation}
+  A_i = \sum_j E_j \odot \rho_j\, t_{ij}.
+\end{equation}
+Parent patches are area-weighted averages of children. Iteration stops after
+\flag{-bounce} rounds (default~$100$) or when added energy falls below
+$\max(1,\;0.0015\,E_{\mathrm{bounce\,1}})$.
+
+\subsection{Textured bounce (\flag{-texbounce})}
+
+Samples \vmt{basetexture} at each leaf-patch origin for colour bleed.
+Reflectance is clamped to $[0,0.99]$. Supports VTF~$7.5$; falls back to flat
+texdata average.
+
+\subsection{Cavity-damped energy (\flag{-energy} / \flag{-cavity})}
+
+Opt-in. Enclosure estimate $e=\min(1,T/\pi)$ yields
+\begin{equation}
+  d_E = 1 - e^{2}(1-C),
+  \qquad
+  d = 1+(d_E-1)\,\alpha,
+\end{equation}
+where $C\in[0.25,1]$ is the fully enclosed scale (default~$0.70$) and $\alpha$
+is the global or volume \code{EnergyMode} blend. Open areas stay near stock;
+closed rooms recirculate less.
+
+\subsection{Artistic bounce controls}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \flag{-bounce\_boost}~$B$: scales \emph{integrated bounce only} after
+        all iterations ($B\in[0,16]$; direct unchanged).
+  \item \flag{-bounce\_chroma}~$C$: Oklab saturation of gathered bounce,
+        strongest on early bounces:
+        \begin{equation}
+          (a,b)\leftarrow(a,b)\Bigl(1+\tfrac{C}{1+k}\Bigr),
+          \qquad k=\text{0-based bounce index},
+        \end{equation}
+        keeping perceptual lightness $L$. Requires \flag{-texbounce}.
+\end{itemize}
+
+\begin{warnbox}
+  Pathtrace ignores \flag{-bounce\_chroma} (non-physical). Bounce volumes may
+  still apply boost to pathtrace albedo/throughput.
+\end{warnbox}
+
+\subsection{Radial splat and bounce weld}
+
+Bounce is written to luxels with radial kernel radius scaled by
+\flag{-bounce\_soft} (default~$1$, range $0.5$--$4$).
+
+\flag{-bounce\_weld} (off by default) restricts coplanar neighbour-face GI to a
+shared-edge band (normal $\cdot\ge 0.985$; falloff beyond $\sim 24$ patch radii).
+Reduces rectangular GI smear across coplanar VBSP splits; can blotch ceilings.
+
+\subsection{OpenCL gather (\flag{-gpu})}
+
+Median-split BVH ($\le 8$ tris/leaf). Kernels batch visibility and non-bump
+bounce gather over a CSR-like transfer graph (same $E_j\rho_j t_{ij}$ math).
+Bump gathers stay on CPU. Default batch $32768$ rays; errors fall back to CPU.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Materials}
+\label{sec:materials}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Emissive surfaces (\vmt{vrad\_emit*})}
+
+Enabled by \vmt{vrad\_emit}~$1$ or \vmt{vrad\_emitstrength}${}>0$
+(default strength~$200$ when flag-only). Colour from
+\vmt{vrad\_emitmap}/\vmt{vrad\_emissivemap}, else \vmt{basetexture}; optional
+grayscale \vmt{vrad\_emitmask}.
+
+Texture RGB is linearised approximately as $x^{2.2}$, then scaled by strength
+and \code{lightscale}. Pathtrace builds a fan-triangulated mesh and uses area
+NEE; \flag{-pt\_emit\_samples}~$0$ evaluates all triangles (default~$64$
+power samples). Classic mode aggregates to a softened area proxy plus a later
+self-illumination pass.
+
+\subsection{Colored glass filters (\vmt{vrad\_filter*})}
+\label{sec:filter}
+
+Pathtrace-only thin-sheet transmission. Ordinary \vmt{translucent} glass does
+\emph{not} tint light unless \vmt{vrad\_filter}~$1$.
+
+\paragraph{Transmittance construction.}
+\begin{enumerate}[leftmargin=1.6em]
+  \item Sample filter map (or basetexture); square RGB for linearisation.
+  \item Thickness: $T\leftarrow T^{\mathrm{thickness}}$ (Beer-like artistic).
+  \item Strength: Oklab lerp white $\to$ filter.
+  \item Opacity: multiply by $(1-\mathrm{opacity})$.
+\end{enumerate}
+Rays may traverse up to $64$ filter hits, deduplicating brush-sheet
+entrance/exit pairs within $12$ world units. Default two-sided; \vmt{vrad\_filter\_onesided}~$1$ = front only.
+
+\paragraph{Stacked panes (Oklab).}
+Energy transport stays linear; stacking is perceptual:
+\begin{equation}
+  L'=L_0 L_1,
+  \qquad
+  a'=a_0+a_1,
+  \qquad
+  b'=b_0+b_1.
+\end{equation}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Oklab perceptual ops}
+\label{sec:oklab}
+%═══════════════════════════════════════════════════════════════════════════════
+
+Björn Ottosson's Oklab is used wherever artistic colour mixing must stay
+perceptually coherent. Linear sRGB $\leftrightarrow$ Oklab follows the standard
+LMS cube-root pipeline (coefficients in \code{oklab.h}).
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  Use site & Operation \\
+  \midrule
+  Filter strength & Oklab lerp(white, $T$, strength) \\
+  Stacked filters & $L$ multiply, $a,b$ add \\
+  \flag{-bounce\_chroma} & Scale $a,b$; keep $L$ \\
+  Env-vol inbound tint & Keep light $L$; take tint $a,b$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+NEE intensities and $\rho\times L$ products remain in linear RGB (or $\lambda$).
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Volume entities}
+\label{sec:volumes}
+%═══════════════════════════════════════════════════════════════════════════════
+
+All brush volumes share soft AABB membership: soft-min signed distance, quintic
+smootherstep blend shell (\code{BlendDistance} / \code{BlendMode}), and
+priority resolution (higher wins; ties $\to$ smaller AABB). Neighbour volumes
+use a soft Voronoi split so outside halos do not tint each other.
+
+\subsection{\ent{light\_env\_vol}}
+
+Local sky / sun / ambient override. Volume lights are bake-only (not exported
+as engine worldlights). Leaf ambient cubes accumulate volume-blended sun when
+samples see the sun through sky. Shadow filters use the hard AABB via
+\code{OutsideCastShadowIn} / \code{InsideCastShadowOut}.
+
+Optional \code{BounceVolColor} / \code{BounceVolBright} recolour bounced light
+inside the core to the volume's \code{\_light} hue.
+
+\subsection{\ent{light\_absorb}}
+
+Direct multiplier $1-w$ when \code{AbsorbDirect}; bounce multiplier
+$1-\max(w_e,w_r)$ when \code{AbsorbBounce} (default on; strength default~$0.5$).
+
+\subsection{\ent{light\_bounce\_vol}}
+
+Local overrides for \code{BounceBoost}, \code{BounceChroma}, and
+\code{EnergyMode}, soft-blended with CLI globals.
+
+\subsection{\ent{light\_volume}}
+
+Soft sphere point light: low-discrepancy samples inside radius $R$ (default~$16$).
+Sample count scales with $R$ ($\sim\!16$ at default, cap~$40$; reduced with
+\flag{-fast}). Early-out when fully lit/shadowed. Exported as a hard point light
+at the centre (softness is bake-only).
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Ambient occlusion}
+\label{sec:ao}
+%═══════════════════════════════════════════════════════════════════════════════
+
+Multi-scale hemisphere AO in \code{FinalLightFace}, enabled by \flag{-ao} /
+\flag{-ao\_*} or entities \ent{light\_ao} / \ent{light\_ao\_vol}.
+
+\begin{equation}
+  AO(\vect{x})
+  =
+  \frac{\sum_i w_i V_i}{\sum_i w_i},
+  \qquad
+  w_i=\max(\vect{n}\cdot\omega_i,\,0.08).
+\end{equation}
+Directions with $\vect{n}\cdot\omega<-0.25$ are rejected (small wrapped
+hemisphere for contact darkening). Ray origin:
+\begin{equation}
+  \vect{x}_0
+  =
+  \vect{x}+\vect{n}\,b+\omega\max(0.05,\,0.5 b).
+\end{equation}
+Final multiplier $M=\max(0,\,1-S+S\cdot AO)$ with strength $S\in[0,8]$.
+
+Defaults: samples~$16$, distance~$48$, strength~$1$, bias~$0.25$.
+Optional bilateral luxel denoise:
+\begin{equation}
+  w
+  =
+  \exp\!\Biggl[
+    -\frac{\|\Delta x\|^{2}}{2\sigma_s^{2}}
+    -\frac{(AO_j-AO_i)^{2}}{2(0.12)^{2}}
+  \Biggr].
+\end{equation}
+With \flag{-gpu}, AO can use batched OpenCL occlusion.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Soft sun}
+\label{sec:softsun}
+%═══════════════════════════════════════════════════════════════════════════════
+
+Replaces stock's fixed $30$ random cone rays:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item Low-discrepancy golden-angle spiral in the sun cone.
+  \item Adaptive count $\sim\!9$ at $2^\circ$ up to $\sim\!40$ at $50^\circ$.
+  \item Early-out after a short probe when fully lit or fully shadowed.
+\end{itemize}
+$0^\circ$ $=$ hard sun. Typical soft look: $0.5^\circ$--$3^\circ$.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Denoising}
+\label{sec:denoise}
+%═══════════════════════════════════════════════════════════════════════════════
+
+Opt-in via \flag{-pt\_denoise}; select backend with \flag{-pt\_denoiser}.
+
+\subsection{OIDN (default)}
+
+Intel Open Image Denoise \code{RTLightmap} model on CPU. One thread-local
+filter per bake worker (pinned to avoid oversubscription). Charts smaller than
+$16^{2}$ are edge-clamp padded.
+
+\subsection{OptiX}
+
+NVIDIA CUDA HDR denoiser (no albedo/normal guides). Shared serialised GPU
+resources; same $16^{2}$ padding.
+
+\subsection{Sakai (statistical)}
+
+Sakai et~al.\ (2024)--inspired Welch-gated repeated $5\times5$ filter using
+variance of the mean where available:
+\begin{equation}
+  t
+  =
+  \frac{|L_i-L_j|}
+       {\sqrt{\mathrm{Var}(\bar L_i)+\mathrm{Var}(\bar L_j)
+              +(0.04 L_{\mathrm{ref}})^{2}+\varepsilon}}.
+\end{equation}
+If $t>1.35$, neighbour weight is attenuated by
+$\exp\!\bigl[-1.5\bigl((t-1.35)/1.35\bigr)^{2}\bigr]$.
+Runs $1+\texttt{radius}$ passes, then two low-gradient $3\times3$ evening
+passes. \flag{-pt\_denoise\_radius} / \flag{-pt\_denoise\_strength} apply here
+(OIDN/OptiX largely ignore radius).
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Static prop lighting}
+\label{sec:props}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Classic speedups}
+
+Four-wide SSE direct gather; with \flag{-gpu}, bounce rays that miss / hit sky
+skip the BSP lightmap walk.
+
+\subsection{Pathtrace props}
+
+Under \flag{-pathtrace} $+$ \flag{-StaticPropLighting}:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Prop lightmap texels} --- same spp / bounces / NEE as world.
+  \item \textbf{Vertex lighting} --- virtual per-triangle lightmap with edge
+        subdivision \flag{-pt\_prop\_vertgrid}~$G$ (default~$4$):
+        \begin{equation}
+          \#\text{samples/triangle}
+          =
+          \frac{(G+1)(G+2)}{2}.
+        \end{equation}
+        Lattice samples scatter to the three vertices by barycentric weights;
+        each vertex normalises by accumulated weight. Unlit verts inherit from
+        nearest lit. $G=0$ $=$ old one-sample-per-vertex.
+\end{itemize}
+Override quality with \flag{-pt\_prop\_samples} /
+\flag{-pt\_prop\_bounces} (defaults: $\max(8,S/4)$ spp; bounces $=$ world).
+Multi-LOD models share lit colours across LODs.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Lightmap sample quality}
+\label{sec:luxelq}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Edge pull}
+
+Default on (inset $0.5$ luxels; range $0$--$2$ via \flag{-edgepull}).
+For chart width $W$, sample coordinate $s$ is clamped to $[i,\,W-1-i]$
+(similarly $t$). Moves edge samples off adjacent solids --- thin walls, jambs,
+floor/wall scallops. \flag{-noedgepull} restores stock positions.
+
+\subsection{Seam stitching}
+
+On by default after \code{FinalLightFace}. Coplanar faces that share an edge
+(VBSP splits) blend near-edge luxels toward the neighbour value at the same
+world position so both sides converge to a common average. Per lightstyle and
+bump layer; displacements skipped. Disable with \flag{-nostitch}.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Reference integrator (pseudocode)}
+\label{sec:pseudocode}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\begin{algorithm}[H]
+\caption{PathLi --- one spp at a surface sample}
+\begin{algorithmic}[1]
+\Require position $\vect{x}$, normal $\vect{n}$, bounce limit $N$, seed
+\State $\beta \leftarrow \mathbf{1}$;\; $L\leftarrow\mathbf{0}$;\;
+       $\mathrm{depth}\leftarrow N+1$
+\For{$k\leftarrow 0$ \textbf{to} $\mathrm{depth}-1$}
+  \State $L \leftarrow L + \beta\cdot\mathrm{NEE}(\vect{x},\vect{n},k)$
+         \Comment{soft only if $k=0$ or softmode=all}
+  \State $\omega\leftarrow\mathrm{CosineHemisphere}(\vect{n})$
+  \State trace closest hit along $\omega$, applying filter panes to $\beta$
+  \If{miss or sky}
+    \State $L\leftarrow L+\beta\cdot L_{\mathrm{sky}}(\vect{x})$;\;
+           \textbf{break}
+  \EndIf
+  \State $\beta\leftarrow\beta\cdot\rho_{\mathrm{hit}}$
+         \Comment{or spectral Reflect($\lambda$)}
+  \If{$k\ge 1$}
+    \State Russian roulette on $\beta$
+  \EndIf
+  \State $\vect{x},\vect{n}\leftarrow$ hit point / oriented normal
+\EndFor
+\State \Return firefly-clamp$(L)$
+\end{algorithmic}
+\end{algorithm}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Parameter cheat sheet}
+\label{sec:params}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{5.8cm}@{}}
+  \toprule
+  Flag & Default & Role \\
+  \midrule
+  \flag{-pathtrace} & off & Enable DXR baker \\
+  \flag{-pt\_gpu}/\flag{-pt\_cpu} & GPU & Integrator backend \\
+  \flag{-pt\_samples}~$S$ & quality & spp per luxel \\
+  \flag{-pt\_bounces}~$N$ & $3$ ($1$ fast) & Indirect hops; $0$=direct+sky \\
+  \flag{-pt\_aa}~$A$ & $3$ & Luxel footprint grid \\
+  \flag{-pt\_spectral} & on & Hero-$\lambda$ GPU transport \\
+  \flag{-pt\_lights}~$K$ & $0$=all & Local NEE samples (bounce$>0$) \\
+  \flag{-pt\_emit\_samples} & $64$ & Area-emit NEE draws ($0$=all) \\
+  \flag{-pt\_lightradius} & $0$ & Soft disk for point/spot \\
+  \flag{-pt\_lightpenumbra} & $1$ & CHSS scale \\
+  \flag{-pt\_softsamples} & $16$ & Soft ray cap \\
+  \flag{-pt\_softmode} & direct & Soft at luxel / all vertices \\
+  \flag{-pt\_denoise} & off & Enable denoise \\
+  \flag{-pt\_denoiser} & oidn & oidn $\mid$ optix $\mid$ sakai \\
+  \flag{-pt\_prop\_vertgrid} & $4$ & Prop vertex lattice \\
+  \flag{-bounce}~$N$ & $100$ & Classic radiosity rounds ($0$=direct) \\
+  \flag{-texbounce} & off & Textured radiosity albedo \\
+  \flag{-energy}/\flag{-cavity} & off / $0.70$ & Cavity damp \\
+  \flag{-bounce\_boost} & $1$ & Artistic bounce scale \\
+  \flag{-bounce\_chroma} & $0$ & Early-bounce Oklab sat \\
+  \flag{-bounce\_weld} & off & Coplanar edge GI weld \\
+  \flag{-gpu} & off & OpenCL classic gather \\
+  \flag{-ao} & off & Hemisphere AO pass \\
+  \flag{-edgepull} & $0.5$ & Luxel edge inset \\
+  \flag{-nostitch} & --- & Disable seam stitch \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\begin{notebox}[Config presets]
+  Hammer-friendly flag sheets live under \texttt{configs/} and load via
+  \flag{-config}~\texttt{full} (searches \texttt{.cfg}/.txt next to the binary).
+  Do not put \flag{-game} / map path inside the config file.
+\end{notebox}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Implementation map}
+\label{sec:files}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  Module & Responsibility \\
+  \midrule
+  \code{pathtrace\_dxr.cpp} & CPU PathLi, bake orchestration, AA, cleanup \\
+  \code{pathtrace\_dxr\_gpu\_bake.inl} & HLSL PathLi (spectral, NEE, filters) \\
+  \code{pathtrace\_dxr\_device.*} & D3D12 / DXR device, AS, dispatches \\
+  \code{pt\_spectral.h} & Smits bases, CIE CMFs, RGB$\leftrightarrow\lambda$ \\
+  \code{oklab.h} & Perceptual colour ops \\
+  \code{vrad\_emit*.cpp} & Textured emission + area mesh \\
+  \code{vrad\_filter.cpp} & Colored glass transmittance \\
+  \code{vrad.cpp} / \code{vismat.cpp} & Classic radiosity loop \\
+  \code{radial.cpp} & Bounce splat / weld \\
+  \code{vrad\_gpu.*} & OpenCL BVH + gather \\
+  \code{ao.cpp} & Multi-scale AO \\
+  \code{absorb.cpp} / \code{bounce\_vol.cpp} & Volume effects \\
+  \code{pathtrace\_*denoise*} & OIDN / OptiX / Sakai \\
+  \code{vradstaticprops.cpp} & Prop SSE + pathtrace vertgrid \\
+  \code{lightmap.cpp} & Edge pull, final face lighting \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section*{References \& provenance}
+%═══════════════════════════════════════════════════════════════════════════════
+
+\begin{itemize}[leftmargin=1.4em]
+  \item Kajiya, J.~T.\ --- The rendering equation (SIGGRAPH 1986).
+  \item Veach, E.\ --- Robust Monte Carlo methods for light transport (PhD, 1997):
+        power-heuristic MIS.
+  \item Smits, B.\ --- An RGB to spectrum conversion for reflectances (JGTools 1999);
+        PBRT-v3 tabulated bases.
+  \item Wyman, C.\ et~al.\ --- Analytic CIE~1931 CMF fits.
+  \item Ottosson, B.\ --- Oklab (2020).
+  \item Pharr, Jakob, Humphreys --- \emph{Physically Based Rendering} (area lights, spectra).
+  \item Sakai et~al.\ --- Statistical lightmap filtering (2024 inspiration for the Sakai denoiser).
+  \item Intel Open Image Denoise --- \code{RTLightmap} model.
+  \item NVIDIA OptiX --- HDR AI denoiser.
+  \item Valve Source SDK 2013 --- stock VRAD radiosity / lightmap pipeline.
+\end{itemize}
+
+\vspace{1.5em}
+{\color{cvMuted}\footnotesize
+\noindent
+This document describes algorithms as implemented in the CustomVRAD tree.
+Defaults and clamps may change; the CLI help from \texttt{vrad.exe} and
+\texttt{configs/full.cfg} are authoritative for shipping presets.
+}
+
+\end{document}

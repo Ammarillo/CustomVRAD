@@ -460,12 +460,15 @@ bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLi
 		return false;
 
 	const unsigned char *p = &pTex->rgba[nOff];
-	// Match Valve texdata reflectivity: approximate sRGB -> linear via square
-	float r = p[0] * ( 1.0f / 255.0f );
-	float g = p[1] * ( 1.0f / 255.0f );
-	float b = p[2] * ( 1.0f / 255.0f );
-	outLinearRGB.x = r * r;
-	outLinearRGB.y = g * g;
-	outLinearRGB.z = b * b;
+	// IEC 61966-2-1 sRGB → linear (PBRT ColorEncoding::sRGB). Albedo must be linear
+	// reflectance for physically based bounce; using encoded bytes as-is over-brightens GI.
+	auto srgbToLinear = []( float u ) -> float
+	{
+		u = max( 0.0f, min( 1.0f, u ) );
+		return ( u <= 0.04045f ) ? ( u / 12.92f ) : powf( ( u + 0.055f ) / 1.055f, 2.4f );
+	};
+	outLinearRGB.x = srgbToLinear( p[0] * ( 1.0f / 255.0f ) );
+	outLinearRGB.y = srgbToLinear( p[1] * ( 1.0f / 255.0f ) );
+	outLinearRGB.z = srgbToLinear( p[2] * ( 1.0f / 255.0f ) );
 	return true;
 }

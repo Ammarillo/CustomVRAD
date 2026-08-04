@@ -35,6 +35,8 @@
 #include "tier1/utlsymbol.h"
 #include "bitmap/tgawriter.h"
 
+#include "pathtrace_dxr.h"
+#include "pathtrace_dxr_device.h"
 #include "messbuf.h"
 #include "vmpi.h"
 #include "vmpi_distribute_work.h"
@@ -233,7 +235,7 @@ static void ConvertTexelDataToTexture(unsigned int _resX, unsigned int _resY, Im
 // Such a monstrosity. :(
 static void GenerateLightmapSamplesForMesh( const matrix3x4_t& _matPos, const matrix3x4_t& _matNormal, int _iThread, int _skipProp, int _nFlags, int _lightmapResX, int _lightmapResY, 
 											studiohdr_t* _pStudioHdr, mstudiomodel_t* _pStudioModel, OptimizedModel::ModelHeader_t* _pVtxModel, int _meshID, 
-											CComputeStaticPropLightingResults *_pResults );
+											CComputeStaticPropLightingResults *_pResults, bool _bComputeLighting = true );
 
 // Debug function, converts lightmaps to linear space then dumps them out. 
 // TODO: Write out the file in a .dds instead of a .tga, in whatever format we're supposed to use.
@@ -338,6 +340,7 @@ private:
 	bool m_bIgnoreStaticPropTrace;
 
 	void ComputeLighting( CStaticProp &prop, int iThread, int prop_index, CComputeStaticPropLightingResults *pResults );
+	bool ComputeLightingPathTraceGPU();
 	void ApplyLightingToStaticProp( int iStaticProp, CStaticProp &prop, const CComputeStaticPropLightingResults *pResults );
 
 	void SerializeLighting();
@@ -1289,6 +1292,8 @@ static void ComputeDirectLightingAtPoints4( const Vector *positions, const Vecto
 
 //-----------------------------------------------------------------------------
 // Takes the results from a ComputeLighting call and applies it to the static prop in question.
+// Vertex colors are computed once against the shared studio vertex pool; every VTX LOD
+// inherits those colors via origMeshVertID (same light for LOD0 / LOD1 / …).
 //-----------------------------------------------------------------------------
 void CVradStaticPropMgr::ApplyLightingToStaticProp( int iStaticProp, CStaticProp &prop, const CComputeStaticPropLightingResults *pResults )
 {
@@ -1299,6 +1304,8 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp( int iStaticProp, CStaticProp
 	studiohdr_t	*pStudioHdr = dict.m_pStudioHdr;
 	OptimizedModel::FileHeader_t *pVtxHdr = (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
 	Assert( pStudioHdr && pVtxHdr );
+
+	prop.m_MeshData.RemoveAll();
 
 	int iCurColorVertsArray = 0;
 	int iCurColorTexelsArray = 0;
@@ -1315,12 +1322,14 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp( int iStaticProp, CStaticProp
 						
 			const CUtlVector<colorVertex_t> *colorVerts = pResults->m_ColorVertsArrays.Count() ? pResults->m_ColorVertsArrays[iCurColorVertsArray++] : nullptr;
 			const CUtlVector<colorTexel_t> *colorTexels = pResults->m_ColorTexelsArrays.Count() ? pResults->m_ColorTexelsArrays[iCurColorTexelsArray++] : nullptr;
-			
-			for ( int nLod = 0; nLod < pVtxHdr->numLODs; nLod++ )
+
+			const int nLods = min( pVtxHdr->numLODs, pVtxModel->numLODs );
+			for ( int nLod = 0; nLod < nLods; nLod++ )
 			{
 				OptimizedModel::ModelLODHeader_t *pVtxLOD = pVtxModel->pLOD( nLod );
+				const int nMeshes = min( pStudioModel->nummeshes, pVtxLOD->numMeshes );
 
-				for ( int nMesh = 0; nMesh < pStudioModel->nummeshes; ++nMesh )
+				for ( int nMesh = 0; nMesh < nMeshes; ++nMesh )
 				{
 					mstudiomesh_t* pMesh = pStudioModel->pMesh( nMesh );
 					OptimizedModel::MeshHeader_t* pVtxMesh = pVtxLOD->pMesh( nMesh );
@@ -1340,13 +1349,16 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp( int iStaticProp, CStaticProp
 								int nIndex = pMesh->vertexoffset + pStripGroup->pVertex( nVertex )->origMeshVertID;
 
 								Assert( nIndex < pStudioModel->numvertices );
-								prop.m_MeshData[nMeshIdx].m_VertexColors[nVertex] = (*colorVerts)[nIndex].m_Color;
+								if ( nIndex >= 0 && nIndex < colorVerts->Count() )
+									prop.m_MeshData[nMeshIdx].m_VertexColors[nVertex] = (*colorVerts)[nIndex].m_Color;
+								else
+									prop.m_MeshData[nMeshIdx].m_VertexColors[nVertex].Init();
 							}
 						}
 
 						if (colorTexels)
 						{
-							// TODO: Consider doing this work in the worker threads, because then we distribute it.
+							// Same lightmap for every LOD — lower LODs inherit LOD0 texel lighting.
 							ConvertTexelDataToTexture(prop.m_LightmapImageWidth, prop.m_LightmapImageHeight, prop.m_LightmapImageFormat, (*colorTexels), &prop.m_MeshData[nMeshIdx].m_TexelsEncoded);
 
 							if (g_bDumpPropLightmaps)
@@ -1868,6 +1880,791 @@ void CVradStaticPropMgr::ThreadComputeStaticPropLighting( int iThread, void *pUs
 }
 
 //-----------------------------------------------------------------------------
+// Pathtrace GPU bake for static props (same PathLi as world luxels).
+//-----------------------------------------------------------------------------
+struct PtPropVertTemplate
+{
+	CUtlVector<Vector> localPos;
+	CUtlVector<Vector> localNrm;
+};
+
+struct PtPropTexelTemplate
+{
+	int resX = 0;
+	int resY = 0;
+	CUtlVector<Vector> localPos;
+	CUtlVector<Vector> localNrm;
+	CUtlVector<bool> valid;
+	CUtlVector<bool> interesting;
+};
+
+struct PtPropModelTemplate
+{
+	CUtlVector<PtPropVertTemplate> vertSections; // one per body×model
+	CUtlVector<PtPropTexelTemplate> texelSections; // one per body×model (may be empty)
+};
+
+static unsigned int PtPropSampleSeed( const Vector &pos, int propIndex )
+{
+	unsigned int h = (unsigned int)propIndex * 747796405u;
+	h ^= (unsigned int)( pos.x * 12.9898f + pos.y * 78.233f + pos.z * 37.719f );
+	h *= 1597334677u;
+	return h;
+}
+
+static void PtPackBakeLuxel( PtGpuBakeLuxel &job, const Vector &pos, const Vector &nrm, int skipProp, int propIndex )
+{
+	memset( &job, 0, sizeof( job ) );
+	job.pos[0] = pos.x; job.pos[1] = pos.y; job.pos[2] = pos.z;
+	job.luxelWorld = 2.0f;
+	Vector n = nrm;
+	if ( n.LengthSqr() < 1e-8f )
+		n.Init( 0, 0, 1 );
+	else
+		n.NormalizeInPlace();
+	job.normal[0] = n.x; job.normal[1] = n.y; job.normal[2] = n.z;
+	job.seed = PtPropSampleSeed( pos, propIndex );
+	job.faceNum = -1;
+	job.aaN = 1;
+	job.skipPropIndex = skipProp;
+}
+
+// Lower LODs share the studio vertex pool. Verts never hit by the LOD0 sample grid
+// (or only used by higher LODs) inherit color from the nearest lit vertex.
+static void PtInheritUnlitPropVertColors( CUtlVector<colorVertex_t> &verts,
+										  const CUtlVector<float> &weights,
+										  const CUtlVector<Vector> &localPos )
+{
+	const int n = verts.Count();
+	if ( n <= 0 || weights.Count() < n || localPos.Count() < n )
+		return;
+
+	CUtlVector<int> lit;
+	lit.EnsureCapacity( n );
+	for ( int i = 0; i < n; ++i )
+	{
+		if ( weights[i] > 1e-8f && verts[i].m_Color.LengthSqr() > 0.0f )
+			lit.AddToTail( i );
+	}
+	if ( lit.Count() <= 0 )
+		return;
+
+	for ( int i = 0; i < n; ++i )
+	{
+		if ( weights[i] > 1e-8f )
+			continue;
+		float best = FLT_MAX;
+		int bestIdx = lit[0];
+		const Vector &p = localPos[i];
+		for ( int k = 0; k < lit.Count(); ++k )
+		{
+			const int j = lit[k];
+			const float d = ( localPos[j] - p ).LengthSqr();
+			if ( d < best )
+			{
+				best = d;
+				bestIdx = j;
+			}
+		}
+		verts[i].m_Color = verts[bestIdx].m_Color;
+		verts[i].m_bValid = verts[bestIdx].m_bValid;
+	}
+}
+
+static void PtDilatePropTexels( CUtlVector<colorTexel_t> &texels, int resX, int resY )
+{
+	if ( resX <= 0 || resY <= 0 || texels.Count() != resX * resY )
+		return;
+
+	// Two passes: fill interesting neighbors from valid, then any remaining holes from lit neighbors.
+	for ( int pass = 0; pass < 2; ++pass )
+	{
+		CUtlVector<Vector> staged;
+		CUtlVector<int> stagedIdx;
+		for ( int y = 0; y < resY; ++y )
+		{
+			for ( int x = 0; x < resX; ++x )
+			{
+				const int i = y * resX + x;
+				colorTexel_t &ct = texels[i];
+				if ( ct.m_bValid )
+					continue;
+				if ( pass == 0 && !ct.m_bPossiblyInteresting )
+					continue;
+				if ( ct.m_Color.LengthSqr() > 1e-12f )
+					continue;
+
+				Vector sum( 0, 0, 0 );
+				int n = 0;
+				for ( int dy = -1; dy <= 1; ++dy )
+				{
+					for ( int dx = -1; dx <= 1; ++dx )
+					{
+						if ( !dx && !dy )
+							continue;
+						const int nx = x + dx, ny = y + dy;
+						if ( nx < 0 || ny < 0 || nx >= resX || ny >= resY )
+							continue;
+						const colorTexel_t &nb = texels[ny * resX + nx];
+						if ( !nb.m_bValid && nb.m_Color.LengthSqr() < 1e-12f )
+							continue;
+						sum += nb.m_Color;
+						++n;
+					}
+				}
+				if ( n > 0 )
+				{
+					staged.AddToTail( sum * ( 1.0f / (float)n ) );
+					stagedIdx.AddToTail( i );
+				}
+			}
+		}
+		for ( int k = 0; k < stagedIdx.Count(); ++k )
+			texels[stagedIdx[k]].m_Color = staged[k];
+	}
+}
+
+bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
+{
+	if ( !PathTraceDXR_CanBakeProps() )
+		return false;
+
+	const int count = m_StaticProps.Count();
+	if ( count <= 0 )
+		return false;
+
+	Msg( "[PathTrace-DXR] Static prop lighting via GPU pathtrace...\n" );
+	fflush( stdout );
+
+	CUtlVector<PtPropModelTemplate *> templates;
+	templates.SetSize( m_StaticPropDict.Count() );
+	for ( int i = 0; i < templates.Count(); ++i )
+		templates[i] = nullptr;
+
+	CUtlVector<CComputeStaticPropLightingResults *> allResults;
+	allResults.SetSize( count );
+	for ( int i = 0; i < count; ++i )
+		allResults[i] = new CComputeStaticPropLightingResults;
+
+	CUtlVector<PtGpuBakeLuxel> texelJobs;
+	CUtlVector<PtGpuBakeLuxel> vertJobs;
+	struct SampleMap_t { int prop; int section; int index; bool texel; };
+	struct VertScatter_t { int prop; int section; int v0, v1, v2; float b0, b1, b2; };
+	CUtlVector<SampleMap_t> texelMaps;
+	CUtlVector<VertScatter_t> vertScatters;
+	// Cap resident jobs — 17M verts * ~72B ≈ 1.2GB and was OOMing into Map() AVs.
+	const int kJobChunk = 262144;
+	texelJobs.EnsureCapacity( kJobChunk );
+	vertJobs.EnsureCapacity( kJobChunk );
+	texelMaps.EnsureCapacity( kJobChunk );
+	vertScatters.EnsureCapacity( kJobChunk );
+
+	// Weighted radiance sums for vertex lighting (barycentric scatter from tri grids).
+	CUtlVector<CUtlVector<CUtlVector<Vector>> *> vertColorSum;
+	CUtlVector<CUtlVector<CUtlVector<float>> *> vertWeightSum;
+	vertColorSum.SetSize( count );
+	vertWeightSum.SetSize( count );
+	for ( int i = 0; i < count; ++i )
+	{
+		vertColorSum[i] = nullptr;
+		vertWeightSum[i] = nullptr;
+	}
+
+	matrix3x4_t identityPos, identityNrm;
+	SetIdentityMatrix( identityPos );
+	SetIdentityMatrix( identityNrm );
+
+	int sessionKind = -1; // -1 none, 0 verts, 1 lightmap texels
+
+	auto ensureVertAccum = [&]( int propIndex, int section, int nVerts )
+	{
+		CComputeStaticPropLightingResults *pRes = allResults[propIndex];
+		while ( pRes->m_ColorVertsArrays.Count() <= section )
+		{
+			CUtlVector<colorVertex_t> *pArr = new CUtlVector<colorVertex_t>;
+			pRes->m_ColorVertsArrays.AddToTail( pArr );
+		}
+		CUtlVector<colorVertex_t> &verts = *pRes->m_ColorVertsArrays[section];
+		if ( verts.Count() < nVerts )
+		{
+			verts.SetCount( nVerts );
+			memset( verts.Base(), 0, verts.Count() * sizeof( colorVertex_t ) );
+		}
+		if ( !vertColorSum[propIndex] )
+		{
+			vertColorSum[propIndex] = new CUtlVector<CUtlVector<Vector>>;
+			vertWeightSum[propIndex] = new CUtlVector<CUtlVector<float>>;
+		}
+		CUtlVector<CUtlVector<Vector>> &sums = *vertColorSum[propIndex];
+		CUtlVector<CUtlVector<float>> &ws = *vertWeightSum[propIndex];
+		while ( sums.Count() <= section )
+		{
+			sums.AddToTail();
+			ws.AddToTail();
+		}
+		if ( sums[section].Count() < nVerts )
+		{
+			sums[section].SetCount( nVerts );
+			ws[section].SetCount( nVerts );
+			memset( sums[section].Base(), 0, nVerts * sizeof( Vector ) );
+			memset( ws[section].Base(), 0, nVerts * sizeof( float ) );
+		}
+	};
+
+	auto writeBackTexels = [&]( const CUtlVector<SampleMap_t> &maps, const CUtlVector<PtGpuBakeResult> &results )
+	{
+		for ( int i = 0; i < maps.Count(); ++i )
+		{
+			const SampleMap_t &m = maps[i];
+			const PtGpuBakeResult &r = results[i];
+			Vector col( r.radiance[0], r.radiance[1], r.radiance[2] );
+			if ( !_finite( col.x ) || !_finite( col.y ) || !_finite( col.z ) )
+				col.Init();
+			CComputeStaticPropLightingResults *pRes = allResults[m.prop];
+			if ( m.section < pRes->m_ColorTexelsArrays.Count() )
+				( *pRes->m_ColorTexelsArrays[m.section] )[m.index].m_Color = col;
+		}
+	};
+
+	auto writeBackVertScatters = [&]( const CUtlVector<VertScatter_t> &scatters, const CUtlVector<PtGpuBakeResult> &results )
+	{
+		for ( int i = 0; i < scatters.Count(); ++i )
+		{
+			const VertScatter_t &s = scatters[i];
+			const PtGpuBakeResult &r = results[i];
+			Vector col( r.radiance[0], r.radiance[1], r.radiance[2] );
+			if ( !_finite( col.x ) || !_finite( col.y ) || !_finite( col.z ) )
+				col.Init();
+			if ( !vertColorSum[s.prop] || s.section >= vertColorSum[s.prop]->Count() )
+				continue;
+			CUtlVector<Vector> &sum = ( *vertColorSum[s.prop] )[s.section];
+			CUtlVector<float> &w = ( *vertWeightSum[s.prop] )[s.section];
+			auto add = [&]( int vi, float bw )
+			{
+				if ( vi < 0 || vi >= sum.Count() || bw <= 1e-8f )
+					return;
+				sum[vi] += col * bw;
+				w[vi] += bw;
+			};
+			add( s.v0, s.b0 );
+			add( s.v1, s.b1 );
+			add( s.v2, s.b2 );
+		}
+	};
+
+	auto flushTexelJobs = [&]( bool bEndSession, unsigned &doneOut, unsigned progressTotal ) -> bool
+	{
+		const char *tag = "prop lightmaps";
+		const int kind = 1;
+		if ( texelJobs.Count() <= 0 )
+		{
+			if ( bEndSession && PathTraceDXR_GpuBakeIsActive() && sessionKind == kind )
+			{
+				PathTraceDXR_PropBakeClose( tag, progressTotal > 0 ? progressTotal : doneOut );
+				sessionKind = -1;
+			}
+			return true;
+		}
+		if ( PathTraceDXR_GpuBakeIsActive() && sessionKind != kind )
+		{
+			PathTraceDXR_PropBakeSuspend( sessionKind == 1 ? "prop lightmaps" : "prop verts" );
+			sessionKind = -1;
+		}
+		CUtlVector<PtGpuBakeResult> results;
+		results.SetCount( texelJobs.Count() );
+		const unsigned base = doneOut;
+		const bool baked = PathTraceDXR_BakePropSamples( texelJobs.Base(), (unsigned)texelJobs.Count(),
+														 results.Base(), true, bEndSession,
+														 base, progressTotal );
+		if ( baked )
+		{
+			writeBackTexels( texelMaps, results );
+			doneOut += (unsigned)texelJobs.Count();
+		}
+		if ( !baked || bEndSession )
+			sessionKind = -1;
+		else
+			sessionKind = kind;
+		texelJobs.RemoveAll();
+		texelMaps.RemoveAll();
+		return baked;
+	};
+
+	auto flushVertJobs = [&]( bool bEndSession, unsigned &doneOut, unsigned progressTotal ) -> bool
+	{
+		const char *tag = "prop verts";
+		const int kind = 0;
+		if ( vertJobs.Count() <= 0 )
+		{
+			if ( bEndSession && PathTraceDXR_GpuBakeIsActive() && sessionKind == kind )
+			{
+				PathTraceDXR_PropBakeClose( tag, progressTotal > 0 ? progressTotal : doneOut );
+				sessionKind = -1;
+			}
+			return true;
+		}
+		if ( PathTraceDXR_GpuBakeIsActive() && sessionKind != kind )
+		{
+			PathTraceDXR_PropBakeSuspend( sessionKind == 1 ? "prop lightmaps" : "prop verts" );
+			sessionKind = -1;
+		}
+		CUtlVector<PtGpuBakeResult> results;
+		results.SetCount( vertJobs.Count() );
+		const unsigned base = doneOut;
+		const bool baked = PathTraceDXR_BakePropSamples( vertJobs.Base(), (unsigned)vertJobs.Count(),
+														 results.Base(), false, bEndSession,
+														 base, progressTotal );
+		if ( baked )
+		{
+			writeBackVertScatters( vertScatters, results );
+			doneOut += (unsigned)vertJobs.Count();
+		}
+		if ( !baked || bEndSession )
+			sessionKind = -1;
+		else
+			sessionKind = kind;
+		vertJobs.RemoveAll();
+		vertScatters.RemoveAll();
+		return baked;
+	};
+
+	// Rough totals for one progress line (solid-culled samples may be slightly lower).
+	unsigned estTexels = 0;
+	unsigned estVerts = 0;
+	for ( int propIndex = 0; propIndex < count; ++propIndex )
+	{
+		CStaticProp &prop = m_StaticProps[propIndex];
+		StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
+		studiohdr_t *pStudioHdr = dict.m_pStudioHdr;
+		if ( !pStudioHdr )
+			continue;
+		const bool withVertexLighting = ( prop.m_Flags & STATIC_PROP_NO_PER_VERTEX_LIGHTING ) == 0;
+		const bool withTexelLighting = ( prop.m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING ) == 0;
+		if ( withTexelLighting )
+			estTexels += (unsigned)prop.m_LightmapImageWidth * (unsigned)prop.m_LightmapImageHeight;
+		if ( withVertexLighting )
+		{
+			for ( int bodyID = 0; bodyID < pStudioHdr->numbodyparts; ++bodyID )
+			{
+				mstudiobodyparts_t *pBodyPart = pStudioHdr->pBodypart( bodyID );
+				for ( int modelID = 0; modelID < pBodyPart->nummodels; ++modelID )
+					estVerts += (unsigned)pBodyPart->pModel( modelID )->numvertices;
+			}
+		}
+	}
+	if ( g_nPathTracePropVertGrid > 0 )
+	{
+		// Rough: ~2 tris/vert × lattice samples/tri.
+		const unsigned spTri = (unsigned)( ( g_nPathTracePropVertGrid + 1 ) * ( g_nPathTracePropVertGrid + 2 ) / 2 );
+		estVerts = estVerts * 2u * spTri / 3u;
+	}
+
+	Msg( "[PathTrace-DXR] Prop lighting: ~%u texel samples, ~%u vert-grid samples (chunks of %d)...\n",
+		 estTexels, estVerts, kJobChunk );
+	fflush( stdout );
+
+	bool ok = true;
+	int totalTexelJobs = 0;
+	int totalVertJobs = 0;
+	unsigned doneTexels = 0;
+	unsigned doneVerts = 0;
+
+	auto ensureTemplate = [&]( int modelIdx, studiohdr_t *pStudioHdr,
+							   OptimizedModel::FileHeader_t *pVtxHdr,
+							   bool withTexelLighting, unsigned lightmapW, unsigned lightmapH )
+	{
+		if ( templates[modelIdx] )
+			return;
+		PtPropModelTemplate *tmpl = new PtPropModelTemplate;
+		templates[modelIdx] = tmpl;
+		for ( int bodyID = 0; bodyID < pStudioHdr->numbodyparts; ++bodyID )
+		{
+			OptimizedModel::BodyPartHeader_t *pVtxBodyPart = pVtxHdr->pBodyPart( bodyID );
+			mstudiobodyparts_t *pBodyPart = pStudioHdr->pBodypart( bodyID );
+			for ( int modelID = 0; modelID < pBodyPart->nummodels; ++modelID )
+			{
+				OptimizedModel::ModelHeader_t *pVtxModel = pVtxBodyPart->pModel( modelID );
+				mstudiomodel_t *pStudioModel = pBodyPart->pModel( modelID );
+
+				int sec = tmpl->vertSections.AddToTail();
+				PtPropVertTemplate &vt = tmpl->vertSections[sec];
+				vt.localPos.SetCount( pStudioModel->numvertices );
+				vt.localNrm.SetCount( pStudioModel->numvertices );
+				int vertCursor = 0;
+				for ( int meshID = 0; meshID < pStudioModel->nummeshes; ++meshID )
+				{
+					mstudiomesh_t *pStudioMesh = pStudioModel->pMesh( meshID );
+					const mstudio_meshvertexdata_t *vertData = pStudioMesh->GetVertexData( (void *)pStudioHdr );
+					for ( int vertexID = 0; vertexID < pStudioMesh->numvertices; ++vertexID )
+					{
+						vt.localPos[vertCursor] = *vertData->Position( vertexID );
+						vt.localNrm[vertCursor] = *vertData->Normal( vertexID );
+						++vertCursor;
+					}
+				}
+
+				int tsec = tmpl->texelSections.AddToTail();
+				PtPropTexelTemplate &tt = tmpl->texelSections[tsec];
+				if ( withTexelLighting )
+				{
+					CComputeStaticPropLightingResults tmpRes;
+					CUtlVector<colorTexel_t> *pArr = new CUtlVector<colorTexel_t>;
+					tmpRes.m_ColorTexelsArrays.AddToTail( pArr );
+					for ( int meshID = 0; meshID < pStudioModel->nummeshes; ++meshID )
+					{
+						GenerateLightmapSamplesForMesh( identityPos, identityNrm, 0, -1, 0,
+							lightmapW, lightmapH,
+							pStudioHdr, pStudioModel, pVtxModel, meshID, &tmpRes, false );
+					}
+					CUtlVector<colorTexel_t> &texels = *tmpRes.m_ColorTexelsArrays[0];
+					tt.resX = lightmapW;
+					tt.resY = lightmapH;
+					tt.localPos.SetCount( texels.Count() );
+					tt.localNrm.SetCount( texels.Count() );
+					tt.valid.SetCount( texels.Count() );
+					tt.interesting.SetCount( texels.Count() );
+					for ( int i = 0; i < texels.Count(); ++i )
+					{
+						tt.localPos[i] = texels[i].m_WorldPosition;
+						tt.localNrm[i] = texels[i].m_WorldNormal;
+						tt.valid[i] = texels[i].m_bValid;
+						tt.interesting[i] = texels[i].m_bPossiblyInteresting;
+					}
+				}
+			}
+		}
+	};
+
+	// ----- Phase 1: lightmap texels only (never start vert GPU session) -----
+	for ( int propIndex = 0; propIndex < count && ok; ++propIndex )
+	{
+		CStaticProp &prop = m_StaticProps[propIndex];
+		StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
+		studiohdr_t *pStudioHdr = dict.m_pStudioHdr;
+		OptimizedModel::FileHeader_t *pVtxHdr = (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
+		if ( !pStudioHdr || !pVtxHdr )
+			continue;
+
+		const bool withVertexLighting = ( prop.m_Flags & STATIC_PROP_NO_PER_VERTEX_LIGHTING ) == 0;
+		const bool withTexelLighting = ( prop.m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING ) == 0;
+		if ( !withVertexLighting && !withTexelLighting )
+			continue;
+
+		const int skip_prop = ( g_bDisablePropSelfShadowing || ( prop.m_Flags & STATIC_PROP_NO_SELF_SHADOWING ) ) ? propIndex : -1;
+		ensureTemplate( prop.m_ModelIdx, pStudioHdr, pVtxHdr, withTexelLighting,
+						prop.m_LightmapImageWidth, prop.m_LightmapImageHeight );
+
+		PtPropModelTemplate *tmpl = templates[prop.m_ModelIdx];
+		CComputeStaticPropLightingResults *pResults = allResults[propIndex];
+		matrix3x4_t matPos, matNormal;
+		AngleMatrix( prop.m_Angles, prop.m_Origin, matPos );
+		AngleMatrix( prop.m_Angles, matNormal );
+
+		int section = 0;
+		for ( int bodyID = 0; bodyID < pStudioHdr->numbodyparts && ok; ++bodyID )
+		{
+			mstudiobodyparts_t *pBodyPart = pStudioHdr->pBodypart( bodyID );
+			for ( int modelID = 0; modelID < pBodyPart->nummodels && ok; ++modelID, ++section )
+			{
+				if ( section >= tmpl->vertSections.Count() )
+					break;
+
+				if ( withTexelLighting )
+				{
+					CUtlVector<colorTexel_t> *pColorTexelArray = new CUtlVector<colorTexel_t>;
+					pResults->m_ColorTexelsArrays.AddToTail( pColorTexelArray );
+					PtPropTexelTemplate &tt = tmpl->texelSections[section];
+					pColorTexelArray->SetCount( tt.localPos.Count() );
+					for ( int i = 0; i < tt.localPos.Count(); ++i )
+					{
+						colorTexel_t &ct = ( *pColorTexelArray )[i];
+						VectorTransform( tt.localPos[i], matPos, ct.m_WorldPosition );
+						VectorRotate( tt.localNrm[i], matNormal, ct.m_WorldNormal );
+						ct.m_WorldNormal.NormalizeInPlace();
+						ct.m_bValid = tt.valid[i];
+						ct.m_bPossiblyInteresting = tt.interesting[i];
+						ct.m_fDistanceToTri = 0;
+						ct.m_Color.Init();
+						if ( ct.m_bValid && !PositionInSolid( ct.m_WorldPosition ) )
+						{
+							SampleMap_t m = { propIndex, section, i, true };
+							texelMaps.AddToTail( m );
+							PtGpuBakeLuxel job;
+							PtPackBakeLuxel( job, ct.m_WorldPosition, ct.m_WorldNormal, skip_prop, propIndex );
+							texelJobs.AddToTail( job );
+							++totalTexelJobs;
+							if ( texelJobs.Count() >= kJobChunk )
+								ok = flushTexelJobs( false, doneTexels, estTexels );
+						}
+					}
+				}
+				// Vert color arrays are allocated in phase 2 — keeps ~18M verts off the heap
+				// during lightmap GpuBakeBegin (was causing intermittent Map/OOM AVs).
+			}
+		}
+	}
+
+	if ( totalTexelJobs > 0 )
+		estTexels = (unsigned)totalTexelJobs;
+	if ( ok )
+		ok = flushTexelJobs( true, doneTexels, estTexels );
+
+	const int vertGrid = g_nPathTracePropVertGrid;
+	if ( vertGrid > 0 )
+	{
+		Msg( "[PathTrace-DXR] Prop vertex lighting: virtual tri lightmap edge subdiv=%d (~%d samples/tri, barycentric → verts).\n",
+			 vertGrid, ( vertGrid + 1 ) * ( vertGrid + 2 ) / 2 );
+		fflush( stdout );
+	}
+
+	// ----- Phase 2: allocate + bake vertex samples (chunked) -----
+	for ( int propIndex = 0; propIndex < count && ok; ++propIndex )
+	{
+		CStaticProp &prop = m_StaticProps[propIndex];
+		StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
+		studiohdr_t *pStudioHdr = dict.m_pStudioHdr;
+		OptimizedModel::FileHeader_t *pVtxHdr = (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
+		if ( !pStudioHdr || !pVtxHdr )
+			continue;
+		const bool withVertexLighting = ( prop.m_Flags & STATIC_PROP_NO_PER_VERTEX_LIGHTING ) == 0;
+		const bool withTexelLighting = ( prop.m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING ) == 0;
+		if ( !withVertexLighting )
+			continue;
+
+		ensureTemplate( prop.m_ModelIdx, pStudioHdr, pVtxHdr, withTexelLighting,
+						prop.m_LightmapImageWidth, prop.m_LightmapImageHeight );
+		if ( !templates[prop.m_ModelIdx] )
+			continue;
+
+		const int skip_prop = ( g_bDisablePropSelfShadowing || ( prop.m_Flags & STATIC_PROP_NO_SELF_SHADOWING ) ) ? propIndex : -1;
+		PtPropModelTemplate *tmpl = templates[prop.m_ModelIdx];
+		CComputeStaticPropLightingResults *pResults = allResults[propIndex];
+		matrix3x4_t matPos, matNormal;
+		AngleMatrix( prop.m_Angles, prop.m_Origin, matPos );
+		AngleMatrix( prop.m_Angles, matNormal );
+
+		int section = 0;
+		for ( int bodyID = 0; bodyID < pStudioHdr->numbodyparts && ok; ++bodyID )
+		{
+			OptimizedModel::BodyPartHeader_t *pVtxBodyPart = pVtxHdr->pBodyPart( bodyID );
+			mstudiobodyparts_t *pBodyPart = pStudioHdr->pBodypart( bodyID );
+			for ( int modelID = 0; modelID < pBodyPart->nummodels && ok; ++modelID, ++section )
+			{
+				if ( section >= tmpl->vertSections.Count() )
+					break;
+
+				OptimizedModel::ModelHeader_t *pVtxModel = pVtxBodyPart->pModel( modelID );
+				mstudiomodel_t *pStudioModel = pBodyPart->pModel( modelID );
+				PtPropVertTemplate &vt = tmpl->vertSections[section];
+				ensureVertAccum( propIndex, section, vt.localPos.Count() );
+
+				CUtlVector<colorVertex_t> &colorVerts = *pResults->m_ColorVertsArrays[section];
+				for ( int i = 0; i < vt.localPos.Count(); ++i )
+				{
+					colorVertex_t &cv = colorVerts[i];
+					VectorTransform( vt.localPos[i], matPos, cv.m_Position );
+					cv.m_bValid = !PositionInSolid( cv.m_Position );
+					cv.m_Color.Init();
+				}
+
+				if ( vertGrid <= 0 )
+				{
+					// Legacy: one PathLi sample per unique vertex.
+					for ( int i = 0; i < vt.localPos.Count() && ok; ++i )
+					{
+						colorVertex_t &cv = colorVerts[i];
+						if ( !cv.m_bValid )
+							continue;
+						Vector nrm;
+						VectorRotate( vt.localNrm[i], matNormal, nrm );
+						nrm.NormalizeInPlace();
+						VertScatter_t sc = { propIndex, section, i, i, i, 1.0f, 0.0f, 0.0f };
+						vertScatters.AddToTail( sc );
+						PtGpuBakeLuxel job;
+						PtPackBakeLuxel( job, cv.m_Position, nrm, skip_prop, propIndex );
+						vertJobs.AddToTail( job );
+						++totalVertJobs;
+						if ( vertJobs.Count() >= kJobChunk )
+							ok = flushVertJobs( false, doneVerts, estVerts );
+					}
+					continue;
+				}
+
+				// Virtual lightmap on LOD0 triangles (shared studio vertex pool).
+				// ApplyLightingToStaticProp maps every LOD strip via origMeshVertID so
+				// LOD1+ inherit the same colors; unlit holes get nearest-lit fill below.
+				OptimizedModel::ModelLODHeader_t *pVtxLOD = pVtxModel->pLOD( 0 );
+				const int nMeshes = min( pStudioModel->nummeshes, pVtxLOD->numMeshes );
+				int meshVertBase = 0;
+				for ( int meshID = 0; meshID < nMeshes && ok; ++meshID )
+				{
+					mstudiomesh_t *pStudioMesh = pStudioModel->pMesh( meshID );
+					OptimizedModel::MeshHeader_t *pVtxMesh = pVtxLOD->pMesh( meshID );
+					const mstudio_meshvertexdata_t *vertData = pStudioMesh->GetVertexData( (void *)pStudioHdr );
+					if ( !vertData )
+					{
+						meshVertBase += pStudioMesh->numvertices;
+						continue;
+					}
+
+					for ( int nGroup = 0; nGroup < pVtxMesh->numStripGroups && ok; ++nGroup )
+					{
+						OptimizedModel::StripGroupHeader_t *pStripGroup = pVtxMesh->pStripGroup( nGroup );
+						for ( int nStrip = 0; nStrip < pStripGroup->numStrips && ok; ++nStrip )
+						{
+							OptimizedModel::StripHeader_t *pStrip = pStripGroup->pStrip( nStrip );
+							if ( !( pStrip->flags & OptimizedModel::STRIP_IS_TRILIST ) )
+								continue;
+
+							for ( int ii = 0; ii < pStrip->numIndices && ok; ii += 3 )
+							{
+								const int idx = pStrip->indexOffset + ii;
+								const int mv0 = pStripGroup->pVertex( *pStripGroup->pIndex( idx ) )->origMeshVertID;
+								const int mv1 = pStripGroup->pVertex( *pStripGroup->pIndex( idx + 1 ) )->origMeshVertID;
+								const int mv2 = pStripGroup->pVertex( *pStripGroup->pIndex( idx + 2 ) )->origMeshVertID;
+								const int v0 = meshVertBase + mv0;
+								const int v1 = meshVertBase + mv1;
+								const int v2 = meshVertBase + mv2;
+								if ( v0 < 0 || v1 < 0 || v2 < 0 ||
+									 v0 >= vt.localPos.Count() || v1 >= vt.localPos.Count() || v2 >= vt.localPos.Count() )
+									continue;
+
+								Vector lp0 = vt.localPos[v0], lp1 = vt.localPos[v1], lp2 = vt.localPos[v2];
+								Vector ln0 = vt.localNrm[v0], ln1 = vt.localNrm[v1], ln2 = vt.localNrm[v2];
+								Vector wp0, wp1, wp2, wn0, wn1, wn2;
+								VectorTransform( lp0, matPos, wp0 );
+								VectorTransform( lp1, matPos, wp1 );
+								VectorTransform( lp2, matPos, wp2 );
+								VectorRotate( ln0, matNormal, wn0 );
+								VectorRotate( ln1, matNormal, wn1 );
+								VectorRotate( ln2, matNormal, wn2 );
+
+								const float invN = 1.0f / (float)vertGrid;
+								for ( int bi = 0; bi <= vertGrid && ok; ++bi )
+								{
+									for ( int bj = 0; bj <= vertGrid - bi && ok; ++bj )
+									{
+										const float b0 = (float)bi * invN;
+										const float b1 = (float)bj * invN;
+										const float b2 = 1.0f - b0 - b1;
+										Vector pos = wp0 * b0 + wp1 * b1 + wp2 * b2;
+										Vector nrm = wn0 * b0 + wn1 * b1 + wn2 * b2;
+										if ( nrm.LengthSqr() < 1e-10f )
+											continue;
+										nrm.NormalizeInPlace();
+										pos += nrm * 0.25f;
+										if ( PositionInSolid( pos ) )
+											continue;
+
+										VertScatter_t sc = { propIndex, section, v0, v1, v2, b0, b1, b2 };
+										vertScatters.AddToTail( sc );
+										PtGpuBakeLuxel job;
+										PtPackBakeLuxel( job, pos, nrm, skip_prop, propIndex );
+										vertJobs.AddToTail( job );
+										++totalVertJobs;
+										if ( vertJobs.Count() >= kJobChunk )
+											ok = flushVertJobs( false, doneVerts, estVerts );
+									}
+								}
+							}
+						}
+					}
+					meshVertBase += pStudioMesh->numvertices;
+				}
+			}
+		}
+	}
+
+	if ( totalVertJobs > 0 )
+		estVerts = (unsigned)totalVertJobs;
+	if ( ok )
+		ok = flushVertJobs( true, doneVerts, estVerts );
+	if ( PathTraceDXR_GpuBakeIsActive() )
+	{
+		PathTraceDXR_PropBakeClose( sessionKind == 1 ? "prop lightmaps" : "prop verts",
+									sessionKind == 1 ? doneTexels : doneVerts );
+		sessionKind = -1;
+	}
+
+	// Normalize barycentric-weighted vertex colors; unlit verts inherit nearest lit
+	// (covers verts only referenced by lower LODs / missed by the LOD0 sample grid).
+	if ( ok )
+	{
+		for ( int pi = 0; pi < count; ++pi )
+		{
+			if ( !vertColorSum[pi] )
+				continue;
+			CComputeStaticPropLightingResults *pRes = allResults[pi];
+			CUtlVector<CUtlVector<Vector>> &sums = *vertColorSum[pi];
+			CUtlVector<CUtlVector<float>> &ws = *vertWeightSum[pi];
+			PtPropModelTemplate *tmpl = templates[m_StaticProps[pi].m_ModelIdx];
+			for ( int s = 0; s < sums.Count() && s < pRes->m_ColorVertsArrays.Count(); ++s )
+			{
+				CUtlVector<colorVertex_t> &verts = *pRes->m_ColorVertsArrays[s];
+				for ( int vi = 0; vi < sums[s].Count() && vi < verts.Count(); ++vi )
+				{
+					if ( ws[s][vi] > 1e-8f )
+						verts[vi].m_Color = sums[s][vi] * ( 1.0f / ws[s][vi] );
+				}
+				if ( tmpl && s < tmpl->vertSections.Count() )
+					PtInheritUnlitPropVertColors( verts, ws[s], tmpl->vertSections[s].localPos );
+			}
+		}
+	}
+
+	if ( ok )
+		Msg( "[PathTrace-DXR] Prop lighting baked: %d lightmap texels, %d vertex-grid samples.\n",
+			 totalTexelJobs, totalVertJobs );
+
+	if ( ok && totalTexelJobs == 0 && totalVertJobs == 0 )
+		ok = true;
+
+	if ( ok )
+	{
+		for ( int pi = 0; pi < count; ++pi )
+		{
+			CComputeStaticPropLightingResults *pRes = allResults[pi];
+			if ( !pRes )
+				continue;
+			const CStaticProp &prop = m_StaticProps[pi];
+			for ( int s = 0; s < pRes->m_ColorTexelsArrays.Count(); ++s )
+			{
+				PtDilatePropTexels( *pRes->m_ColorTexelsArrays[s],
+									(int)prop.m_LightmapImageWidth,
+									(int)prop.m_LightmapImageHeight );
+			}
+		}
+	}
+
+	if ( ok )
+	{
+		for ( int i = 0; i < count; ++i )
+		{
+			ApplyLightingToStaticProp( i, m_StaticProps[i], allResults[i] );
+			delete allResults[i];
+			allResults[i] = nullptr;
+		}
+		SerializeLighting();
+	}
+	else
+	{
+		for ( int i = 0; i < count; ++i )
+			delete allResults[i];
+	}
+
+	for ( int i = 0; i < templates.Count(); ++i )
+		delete templates[i];
+	for ( int i = 0; i < count; ++i )
+	{
+		delete vertColorSum[i];
+		delete vertWeightSum[i];
+	}
+
+	return ok;
+}
+
+
+//-----------------------------------------------------------------------------
 // Computes lighting for the static props.
 // Must be after all other surface lighting has been computed for the indirect sampling.
 //-----------------------------------------------------------------------------
@@ -1886,6 +2683,23 @@ void CVradStaticPropMgr::ComputeLighting( int iThread )
 	// ensure any traces against us are ignored because we have no inherit lighting contribution
 	m_bIgnoreStaticPropTrace = true;
 
+	bool bGpuProps = false;
+#ifdef MPI
+	if ( !g_bUseMPI )
+#endif
+	{
+		if ( PathTraceDXR_CanBakeProps() )
+		{
+			SuppressPacifier( true );
+			bGpuProps = ComputeLightingPathTraceGPU();
+			SuppressPacifier( false );
+			if ( !bGpuProps )
+				Warning( "[PathTrace-DXR] Prop GPU bake failed — falling back to stock CPU prop lighting.\n" );
+		}
+	}
+
+	if ( !bGpuProps )
+	{
 #ifdef MPI
 	if ( g_bUseMPI )
 	{
@@ -1908,6 +2722,11 @@ void CVradStaticPropMgr::ComputeLighting( int iThread )
 
 	// save data to bsp
 	SerializeLighting();
+	}
+	else
+	{
+		m_bIgnoreStaticPropTrace = false;
+	}
 
 	EndPacifier( true );
 }
@@ -1924,6 +2743,13 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 		return;
 	}
 
+	PathTraceDXR_ClearPropInstances();
+	const bool bRegisterDxr = PathTraceDXR_IsRequested();
+	static CUtlVector<int> s_registeredPhys;
+	static CUtlVector<int> s_registeredStudio;
+	s_registeredPhys.RemoveAll();
+	s_registeredStudio.RemoveAll();
+
 	// Triangle coverage of 1 (full coverage)
 	Vector fullCoverage;
 	fullCoverage.x = 1.0f;
@@ -1936,11 +2762,50 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 		if ( prop.m_Flags & STATIC_PROP_NO_SHADOW )
 			continue;
 
+		// Phase-2 DXR: one local BLAS per unique model + TLAS instance.
+		if ( bRegisterDxr )
+		{
+			matrix3x4_t matrix;
+			AngleMatrix( prop.m_Angles, prop.m_Origin, matrix );
+			PathTraceDXR_RegisterPropInstance( nProp, prop.m_ModelIdx, matrix.m_flMatVal );
+		}
+
 		// If not using static prop polys, use AABB
 		if ( !g_bStaticPropPolys )
 		{
 			if ( dict.m_pModel )
 			{
+				if ( bRegisterDxr )
+				{
+					// Register local-space VPhysics tris once per model.
+					bool already = false;
+					for ( int i = 0; i < s_registeredPhys.Count(); ++i )
+					{
+						if ( s_registeredPhys[i] == prop.m_ModelIdx ) { already = true; break; }
+					}
+					if ( !already )
+					{
+						CUtlVector<Vector> localVerts;
+						ICollisionQuery *queryModel = s_pPhysCollision->CreateQueryModel( dict.m_pModel );
+						for ( int nConvex = 0; nConvex < queryModel->ConvexCount(); ++nConvex )
+						{
+							for ( int nTri = 0; nTri < queryModel->TriangleCount( nConvex ); ++nTri )
+							{
+								Vector verts[3];
+								queryModel->GetTriangleVerts( nConvex, nTri, verts );
+								localVerts.AddToTail( verts[0] );
+								localVerts.AddToTail( verts[1] );
+								localVerts.AddToTail( verts[2] );
+							}
+						}
+						s_pPhysCollision->DestroyQueryModel( queryModel );
+						if ( localVerts.Count() >= 3 )
+						{
+							PathTraceDXR_RegisterPropModel( prop.m_ModelIdx, localVerts.Base(), localVerts.Count() / 3 );
+							s_registeredPhys.AddToTail( prop.m_ModelIdx );
+						}
+					}
+				}
 				VMatrix xform;
 				xform.SetupMatrixOrgAngles ( prop.m_Origin, prop.m_Angles );
 				ICollisionQuery *queryModel = s_pPhysCollision->CreateQueryModel( dict.m_pModel );
@@ -1977,6 +2842,22 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 		// only init the triangle table the first time
 		bool bInitTriangles = dict.m_triangleMaterialIndex.Count() ? false : true;
 		int triangleIndex = 0;
+
+		CUtlVector<Vector> *pLocalDxr = nullptr;
+		CUtlVector<Vector> localDxrVerts;
+		if ( bRegisterDxr )
+		{
+			bool already = false;
+			for ( int i = 0; i < s_registeredStudio.Count(); ++i )
+			{
+				if ( s_registeredStudio[i] == prop.m_ModelIdx ) { already = true; break; }
+			}
+			if ( !already )
+			{
+				pLocalDxr = &localDxrVerts;
+				s_registeredStudio.AddToTail( prop.m_ModelIdx );
+			}
+		}
 
 		// meshes are deeply hierarchial, divided between three stores, follow the white rabbit
 		// body parts -> models -> lod meshes -> strip groups -> strips
@@ -2049,6 +2930,13 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 									int vertex2 = pStripGroup->pVertex( i2 )->origMeshVertID;
 									int vertex3 = pStripGroup->pVertex( i3 )->origMeshVertID;
 
+									if ( pLocalDxr )
+									{
+										pLocalDxr->AddToTail( *vertData->Position( vertex1 ) );
+										pLocalDxr->AddToTail( *vertData->Position( vertex2 ) );
+										pLocalDxr->AddToTail( *vertData->Position( vertex3 ) );
+									}
+
 									// transform position into world coordinate system
 									matrix3x4_t	matrix;
 									AngleMatrix( prop.m_Angles, prop.m_Origin, matrix );
@@ -2112,6 +3000,8 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 				}
 			}
 		}
+		if ( pLocalDxr && localDxrVerts.Count() >= 3 )
+			PathTraceDXR_RegisterPropModel( prop.m_ModelIdx, localDxrVerts.Base(), localDxrVerts.Count() / 3 );
 	}
 }
 
@@ -2381,7 +3271,7 @@ inline float ComputeBarycentricDistanceToTri( Vector _barycentricCoord, Vector2D
 }
 
 // ------------------------------------------------------------------------------------------------
-static void GenerateLightmapSamplesForMesh( const matrix3x4_t& _matPos, const matrix3x4_t& _matNormal, int _iThread, int _skipProp, int _flags, int _lightmapResX, int _lightmapResY, studiohdr_t* _pStudioHdr, mstudiomodel_t* _pStudioModel, OptimizedModel::ModelHeader_t* _pVtxModel, int _meshID, CComputeStaticPropLightingResults *_outResults )
+static void GenerateLightmapSamplesForMesh( const matrix3x4_t& _matPos, const matrix3x4_t& _matNormal, int _iThread, int _skipProp, int _flags, int _lightmapResX, int _lightmapResY, studiohdr_t* _pStudioHdr, mstudiomodel_t* _pStudioModel, OptimizedModel::ModelHeader_t* _pVtxModel, int _meshID, CComputeStaticPropLightingResults *_outResults, bool _bComputeLighting )
 {
 	// Could iterate and gen this if needed.
 	int nLod = 0;
@@ -2530,17 +3420,20 @@ static void GenerateLightmapSamplesForMesh( const matrix3x4_t& _matPos, const ma
 
 			if (shouldProcess)
 			{
-				Vector directColor(0, 0, 0),
-					   indirectColor(0, 0, 0);
+				if ( _bComputeLighting )
+				{
+					Vector directColor(0, 0, 0),
+						   indirectColor(0, 0, 0);
 
 
-				ComputeDirectLightingAtPoint( colorTexels[linearPos].m_WorldPosition, colorTexels[linearPos].m_WorldNormal, directColor, _iThread, _skipProp, _flags);
+					ComputeDirectLightingAtPoint( colorTexels[linearPos].m_WorldPosition, colorTexels[linearPos].m_WorldNormal, directColor, _iThread, _skipProp, _flags);
 
-				if (numbounce >= 1) {
-					ComputeIndirectLightingAtPoint( colorTexels[linearPos].m_WorldPosition, colorTexels[linearPos].m_WorldNormal, indirectColor, _iThread, true, (_flags & GATHERLFLAGS_IGNORE_NORMALS) != 0 );
+					if (numbounce >= 1) {
+						ComputeIndirectLightingAtPoint( colorTexels[linearPos].m_WorldPosition, colorTexels[linearPos].m_WorldNormal, indirectColor, _iThread, true, (_flags & GATHERLFLAGS_IGNORE_NORMALS) != 0 );
+					}
+
+					VectorAdd(directColor, indirectColor, colorTexels[linearPos].m_Color);
 				}
-
-				VectorAdd(directColor, indirectColor, colorTexels[linearPos].m_Color);
 			}
 
 			++linearPos;

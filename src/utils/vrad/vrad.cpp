@@ -2800,9 +2800,42 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 			if ( ++i < argc )
 			{
 				g_nPathTraceBounces = atoi( argv[i] );
-				if ( g_nPathTraceBounces < 1 ) g_nPathTraceBounces = 1;
+				if ( g_nPathTraceBounces < 0 ) g_nPathTraceBounces = 0;
 				if ( g_nPathTraceBounces > 16 ) g_nPathTraceBounces = 16;
-				Msg( "PathTrace bounces (-pt_bounces): %d.\n", g_nPathTraceBounces );
+				Msg( "PathTrace bounces (-pt_bounces): %d%s.\n", g_nPathTraceBounces,
+					 g_nPathTraceBounces == 0 ? " (direct+sky only)" : "" );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_prop_samples" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTracePropSamples = atoi( argv[i] );
+				if ( g_nPathTracePropSamples < 1 ) g_nPathTracePropSamples = 1;
+				if ( g_nPathTracePropSamples > 4096 ) g_nPathTracePropSamples = 4096;
+				Msg( "PathTrace prop samples (-pt_prop_samples): %d spp.\n", g_nPathTracePropSamples );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_prop_bounces" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTracePropBounces = atoi( argv[i] );
+				if ( g_nPathTracePropBounces < 0 ) g_nPathTracePropBounces = 0;
+				if ( g_nPathTracePropBounces > 16 ) g_nPathTracePropBounces = 16;
+				Msg( "PathTrace prop bounces (-pt_prop_bounces): %d%s.\n", g_nPathTracePropBounces,
+					 g_nPathTracePropBounces == 0 ? " (direct+sky only)" : "" );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_prop_vertgrid" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTracePropVertGrid = atoi( argv[i] );
+				if ( g_nPathTracePropVertGrid < 0 ) g_nPathTracePropVertGrid = 0;
+				if ( g_nPathTracePropVertGrid > 16 ) g_nPathTracePropVertGrid = 16;
+				Msg( "PathTrace prop vert grid (-pt_prop_vertgrid): %d (0=per-vert, N=virtual tri lightmap).\n",
+					 g_nPathTracePropVertGrid );
 			}
 		}
 		else if ( !Q_stricmp( argv[i], "-pt_aa" ) )
@@ -2830,6 +2863,16 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 					Msg( "PathTrace lights (-pt_lights): %d power-sampled locals per NEE (sky always all).\n",
 						 g_nPathTraceLightSamples );
 			}
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_spectral" ) )
+		{
+			g_bPathTraceSpectral = true;
+			Msg( "PathTrace spectral (-pt_spectral): 4λ stratified RGB-lobe+CIE ON.\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_nospectral" ) )
+		{
+			g_bPathTraceSpectral = false;
+			Msg( "PathTrace spectral (-pt_nospectral): RGB transport.\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-pt_emit_samples" ) )
 		{
@@ -3712,10 +3755,15 @@ void PrintUsage( int argc, char **argv )
 		"                    Looks for file, file.cfg, file.txt; also next to vrad.exe\\configs\\.\n"
 		"  -pathtrace/-dxr : Path-traced world lightmaps (direct+GI+sky; soft area/sun).\n"
 		"  -pt_samples N   : Samples per luxel (default 4; 2 with -fast; 8 with -final; max 4096).\n"
-		"  -pt_bounces N   : PathTrace max path depth (default 2; 1 with -fast).\n"
+		"  -pt_bounces N   : Indirect hops after luxel (0=direct+sky only; default 3; 1 with -fast; max 16).\n"
+		"  -pt_prop_samples N : Prop spp (default max(8, pt_samples/4); props are cheaper than world).\n"
+		"  -pt_prop_bounces N : Prop indirect hops (0=direct+sky; default = -pt_bounces).\n"
+		"  -pt_prop_vertgrid N: Virtual per-triangle lightmap edge subdiv for vertex lighting (default 4; 0=old per-vert).\n"
 		"  -pt_aa N        : Luxel footprint AA grid 1..5 (1=off, 2=2x2 .. 5=5x5; default 3).\n"
 		"  -pt_lights N    : Local NEE light samples (0=all; N=power-sample N locals/sky always all).\n"
 		"  -pt_emit_samples N : $vrad_emit area NEE samples (0=all tris; default 64; higher=less noise).\n"
+		"  -pt_spectral    : Hero-wavelength spectral transport (Smits RGB→SPD + CIE; default ON).\n"
+		"  -pt_nospectral  : Disable spectral; linear RGB path transport.\n"
 		"  -pt_lightradius N : Soft disk radius for light/light_spot (0=hard; world units; CHSS).\n"
 		"  -pt_lightpenumbra N : Softness growth vs distance for soft lights (default 1).\n"
 		"  -pt_softsamples N : Max soft visibility rays per NEE (default 16; sun+locals).\n"

@@ -50,6 +50,8 @@ cbuffer CB : register(b0)
 	uint BounceVolCount;
 	float CliBounceBoost;
 	float CliBounceChroma;
+	uint UseInstancedAS;
+	uint SpectralMode;	// 1 = hero-wavelength Smits+CIE spectral transport
 };
 
 #ifndef PT_ENABLE_VOLUMES
@@ -57,6 +59,7 @@ cbuffer CB : register(b0)
 #endif
 
 static const uint TRACE_ID_SKY = 0x01000000u;
+static const uint TRACE_ID_STATICPROP = 0x04000000u;
 static const uint TRACE_ID_FILTER = 0x08000000u;
 static const float PI = 3.14159265f;
 static const float INV_PI = 0.318309886f;
@@ -65,6 +68,8 @@ static const int MAX_FILTER_HITS = 64;
 static const float FILTER_ADVANCE = 0.15f;
 // Max world-unit gap between enter/exit of the same thin brush sheet.
 static const float FILTER_SHEET_THICK = 12.0f;
+
+// ---- SPECTRAL_INSERT ----
 
 // ---- Oklab (Björn Ottosson) https://bottosson.github.io/posts/oklab/ ----
 float3 LinearToOklab( float3 c )
@@ -143,6 +148,8 @@ float Hash01( uint x )
 
 float3 ClampFirefly( float3 v, float cap )
 {
+	// Luminance-preserving clamp (PBRT / Veach practice): scale RGB together so
+	// saturated colored lights keep hue when limited — never crush a single channel alone.
 	float m = max( v.x, max( v.y, v.z ) );
 	if ( m > cap && m > 0 )
 		v *= ( cap / m );
@@ -169,32 +176,78 @@ float3 CosineHemi( float3 n, float u1, float u2 )
 	return normalize( d );
 }
 
-bool TraceClosest( float3 o, float3 d, float tmin, float tmax, out float tHit, out uint flags, out uint prim, out float3 nHit )
+bool ShouldSkipStaticProp( uint flags, int skipProp )
 {
-	RayDesc ray;
-	ray.Origin = o;
-	ray.Direction = d;
-	ray.TMin = tmin;
-	ray.TMax = tmax;
-	RayQuery<RAY_FLAG_NONE> q;
-	q.TraceRayInline( Scene, RAY_FLAG_NONE, 0xFF, ray );
-	q.Proceed();
+	if ( skipProp < 0 )
+		return false;
+	if ( ( flags & TRACE_ID_STATICPROP ) == 0 )
+		return false;
+	return (int)( flags & 0x00FFFFFFu ) == skipProp;
+}
+
+// UseInstancedAS / PrimBase: Phase-2 multi-BLAS (world + unique models). Flat AS uses identity.
+StructuredBuffer<uint> PrimBase : register(t20);
+
+bool TraceClosest( float3 o, float3 d, float tmin, float tmax, int skipProp,
+				   out float tHit, out uint flags, out uint prim, out float3 nHit )
+{
 	tHit = -1;
 	flags = 0;
 	prim = 0;
 	nHit = float3( 0, 0, 1 );
-	if ( q.CommittedStatus() != COMMITTED_TRIANGLE_HIT )
-		return false;
-	tHit = q.CommittedRayT();
-	prim = q.CommittedPrimitiveIndex();
-	flags = TriFlags.Load( prim * 4 );
-	float3 a = Verts[prim * 3 + 0];
-	float3 b = Verts[prim * 3 + 1];
-	float3 c = Verts[prim * 3 + 2];
-	nHit = normalize( cross( b - a, c - a ) );
-	if ( dot( nHit, d ) > 0 )
-		nHit = -nHit;
-	return true;
+	float curT = tmin;
+	[loop] for ( int skipPass = 0; skipPass < 8; ++skipPass )
+	{
+		if ( tmax <= curT + 1e-4f )
+			return false;
+		RayDesc ray;
+		ray.Origin = o;
+		ray.Direction = d;
+		ray.TMin = curT;
+		ray.TMax = tmax;
+		RayQuery<RAY_FLAG_NONE> q;
+		q.TraceRayInline( Scene, RAY_FLAG_NONE, 0xFF, ray );
+		q.Proceed();
+		if ( q.CommittedStatus() != COMMITTED_TRIANGLE_HIT )
+			return false;
+		tHit = q.CommittedRayT();
+		uint localPrim = q.CommittedPrimitiveIndex();
+		uint inst = q.CommittedInstanceIndex();
+		uint iid = q.CommittedInstanceID();
+		if ( UseInstancedAS != 0 )
+		{
+			prim = PrimBase[inst] + localPrim;
+			flags = TriFlags.Load( prim * 4 );
+			if ( ( flags & TRACE_ID_STATICPROP ) != 0 )
+				flags = ( flags & 0xFF000000u ) | ( iid & 0x00FFFFFFu );
+			float3x4 M = q.CommittedObjectToWorld3x4();
+			float3 a = Verts[prim * 3 + 0];
+			float3 b = Verts[prim * 3 + 1];
+			float3 c = Verts[prim * 3 + 2];
+			float3 aw = mul( M, float4( a, 1 ) );
+			float3 bw = mul( M, float4( b, 1 ) );
+			float3 cw = mul( M, float4( c, 1 ) );
+			nHit = normalize( cross( bw - aw, cw - aw ) );
+		}
+		else
+		{
+			prim = localPrim;
+			flags = TriFlags.Load( prim * 4 );
+			float3 a = Verts[prim * 3 + 0];
+			float3 b = Verts[prim * 3 + 1];
+			float3 c = Verts[prim * 3 + 2];
+			nHit = normalize( cross( b - a, c - a ) );
+		}
+		if ( ShouldSkipStaticProp( flags, skipProp ) )
+		{
+			curT = tHit + max( 0.15f, abs( tHit ) * 1e-5f + 1e-3f );
+			continue;
+		}
+		if ( dot( nHit, d ) > 0 )
+			nHit = -nHit;
+		return true;
+	}
+	return false;
 }
 
 #if PT_ENABLE_VOLUMES
@@ -465,19 +518,14 @@ void ResolveBounceVol( float3 pos, out float boost, out float chroma )
 
 float3 ApplyBounceVolAlbedo( float3 hitPos, float3 albedo, uint bounce )
 {
-	// Fast path: no volumes and identity CLI → skip resolve entirely.
-	if ( BounceVolCount == 0 && CliBounceBoost == 1.0f && CliBounceChroma <= 0.0f )
+	// Energy scale only (CLI / light_bounce_vol boost). Chroma is artistic — skipped.
+	(void)bounce;
+	if ( BounceVolCount == 0 && CliBounceBoost == 1.0f )
 		return albedo;
 	float boost, chroma;
 	ResolveBounceVol( hitPos, boost, chroma );
-	albedo *= boost;
-	if ( chroma > 0.0f )
-	{
-		float falloff = 1.0f / ( 1.0f + (float)bounce );
-		float sat = 1.0f + chroma * falloff;
-		albedo = OklabScaleChroma( albedo, sat );
-	}
-	return albedo;
+	(void)chroma;
+	return albedo * boost;
 }
 
 bool PointInEnvVol( uint i, float3 p )
@@ -516,14 +564,9 @@ float EnvWeight( int envId, float3 pos )
 }
 float3 ApplyBounceVolAlbedo( float3 hitPos, float3 albedo, uint bounce )
 {
-	albedo *= CliBounceBoost;
-	if ( CliBounceChroma > 0.0f )
-	{
-		float falloff = 1.0f / ( 1.0f + (float)bounce );
-		float sat = 1.0f + CliBounceChroma * falloff;
-		albedo = OklabScaleChroma( albedo, sat );
-	}
-	return albedo;
+	(void)hitPos;
+	(void)bounce;
+	return albedo * CliBounceBoost;
 }
 #endif
 )HLSL"
@@ -619,7 +662,7 @@ bool FilterIsSheetExit( float t, float3 faceN, float lastT, float3 lastN )
 }
 
 // RGB transmittance (1 = clear). Stacked panes: photographic gel multiply T0*T1*…
-float3 VisRGB( float3 from, float3 to )
+float3 VisRGB( float3 from, float3 to, int skipProp )
 {
 	float3 delta = to - from;
 	float dist = length( delta );
@@ -640,7 +683,7 @@ float3 VisRGB( float3 from, float3 to )
 		if ( tmax <= tmin + 1e-4f )
 			break;
 		float t; uint flags, prim; float3 nHit;
-		if ( !TraceClosest( from, delta, tmin, tmax, t, flags, prim, nHit ) )
+		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, t, flags, prim, nHit ) )
 			return T;
 		if ( flags & TRACE_ID_SKY )
 			return T;
@@ -679,13 +722,13 @@ float3 VisRGB( float3 from, float3 to )
 	return T;
 }
 
-bool Occluded( float3 from, float3 to )
+bool Occluded( float3 from, float3 to, int skipProp )
 {
-	float3 T = VisRGB( from, to );
+	float3 T = VisRGB( from, to, skipProp );
 	return max( T.x, max( T.y, T.z ) ) < 1e-5f;
 }
 
-float3 SunVisRGB( float3 pos, float3 axis )
+float3 SunVisRGB( float3 pos, float3 axis, int skipProp )
 {
 	float tmin = OccludeBias;
 	float3 T = 1;
@@ -696,7 +739,7 @@ float3 SunVisRGB( float3 pos, float3 axis )
 	[loop] for ( int pass = 0; pass < MAX_FILTER_HITS + 1; ++pass )
 	{
 		float t; uint flags, prim; float3 nHit;
-		if ( !TraceClosest( pos, axis, tmin, MaxTrace, t, flags, prim, nHit ) )
+		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, t, flags, prim, nHit ) )
 			return T;
 		if ( flags & TRACE_ID_SKY )
 			return T;
@@ -734,9 +777,9 @@ float3 SunVisRGB( float3 pos, float3 axis )
 	return T;
 }
 
-bool SunBlocked( float3 pos, float3 axis )
+bool SunBlocked( float3 pos, float3 axis, int skipProp )
 {
-	float3 T = SunVisRGB( pos, axis );
+	float3 T = SunVisRGB( pos, axis, skipProp );
 	return max( T.x, max( T.y, T.z ) ) < 1e-5f;
 }
 
@@ -837,7 +880,7 @@ void SoftSunDir( float3 axis, float sinExtent, uint i, uint nSoft, uint seed, ou
 }
 
 // Shadow that also returns hit distance (for PCSS). Skips $vrad_filter panes.
-bool OccludedT( float3 from, float3 to, out float tHit )
+bool OccludedT( float3 from, float3 to, int skipProp, out float tHit )
 {
 	tHit = 0;
 	float3 delta = to - from;
@@ -855,7 +898,7 @@ bool OccludedT( float3 from, float3 to, out float tHit )
 		if ( tmax <= tmin + 1e-4f )
 			return false;
 		float t; uint flags, prim; float3 nHit;
-		if ( !TraceClosest( from, delta, tmin, tmax, t, flags, prim, nHit ) )
+		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, t, flags, prim, nHit ) )
 			return false;
 		if ( flags & TRACE_ID_SKY )
 			return false;
@@ -880,7 +923,7 @@ bool OccludedT( float3 from, float3 to, out float tHit )
 	return false;
 }
 
-bool SunBlockedT( float3 pos, float3 axis, out float tHit )
+bool SunBlockedT( float3 pos, float3 axis, int skipProp, out float tHit )
 {
 	tHit = MaxTrace;
 	float tmin = OccludeBias;
@@ -888,7 +931,7 @@ bool SunBlockedT( float3 pos, float3 axis, out float tHit )
 	[loop] for ( int pass = 0; pass < MAX_FILTER_HITS + 1; ++pass )
 	{
 		float t; uint flags, prim; float3 nHit;
-		if ( !TraceClosest( pos, axis, tmin, MaxTrace, t, flags, prim, nHit ) )
+		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, t, flags, prim, nHit ) )
 			return false;
 		if ( flags & TRACE_ID_SKY )
 			return false;
@@ -913,7 +956,7 @@ bool SunBlockedT( float3 pos, float3 axis, out float tHit )
 	return false;
 }
 
-float3 EvalLight( uint i, float3 pos, float3 normal, uint seed, int faceNum, bool allowSoft, inout float sunAmt )
+float3 EvalLight( uint i, float3 pos, float3 normal, uint seed, int faceNum, int skipProp, bool allowSoft, inout float sunAmt, float lambda )
 {
 	float4 a0 = LA0( i );
 	float4 a1 = LA1( i );
@@ -936,7 +979,7 @@ R"HLSL(
 		if ( allowSoft && radius > 0.0f && SoftSamplesMax > 1 && distC > OccludeBias + 1.0f )
 		{
 			float tHit = distC;
-			bool blocked = OccludedT( pos, origin, tHit );
+			bool blocked = OccludedT( pos, origin, skipProp, tHit );
 			ns = EstimatePenumbraSamples( radius, distC, tHit, blocked );
 		}
 
@@ -966,10 +1009,10 @@ R"HLSL(
 			float falloff = PointFalloff( i, dist );
 			if ( falloff <= 0 )
 				continue;
-			float3 vis = VisRGB( pos, lightPos );
+			float3 vis = VisRGB( pos, lightPos, skipProp );
 			if ( max( vis.x, max( vis.y, vis.z ) ) < 1e-5f )
 				continue;
-			accum += intensity * ( ndl * falloff ) * vis;
+			accum += LightContrib( intensity, ndl * falloff, vis, lambda );
 		}
 		sum = accum * ( 1.0f / (float)ns );
 	}
@@ -993,7 +1036,7 @@ R"HLSL(
 		if ( allowSoft && sinExt > 0.0f && SoftSamplesMax > 1 )
 		{
 			float tHit = MaxTrace;
-			bool blocked = SunBlockedT( pos, axis, tHit );
+			bool blocked = SunBlockedT( pos, axis, skipProp, tHit );
 			float refDist = max( tHit, 64.0f );
 			float lightSize = sinExt * refDist;
 			nSoft = EstimatePenumbraSamples( lightSize, refDist, tHit, blocked );
@@ -1021,7 +1064,7 @@ R"HLSL(
 			float ndlS = dot( normal, dir );
 			if ( ndlS <= 0 )
 				continue;
-			float3 visS = SunVisRGB( pos, dir );
+			float3 visS = SunVisRGB( pos, dir, skipProp );
 			if ( max( visS.x, max( visS.y, visS.z ) ) < 1e-5f )
 				continue;
 			float pdfBsdf = ndlS * INV_PI;
@@ -1036,7 +1079,7 @@ R"HLSL(
 			float3 vis = visAccum / (float)nSoft;
 			float ndlSoft = ndlAccum / nVis;
 			float mis = misAccum / nVis;
-			sum = intensity * ( ndlSoft * vis * mis * wEnv );
+			sum = LightContrib( intensity, ndlSoft * mis * wEnv, vis, lambda );
 			sunAmt += ( ( vis.x + vis.y + vis.z ) * ( 1.0f / 3.0f ) ) * wEnv;
 		}
 	}
@@ -1064,7 +1107,7 @@ R"HLSL(		// emit_surface / $vrad_emit*: hard center NEE + area falloff.
 				{
 					toL /= distL;
 					float tHit = distL;
-					bool blocked = OccludedT( pos, origin, tHit );
+					bool blocked = OccludedT( pos, origin, skipProp, tHit );
 					ns = EstimatePenumbraSamples( softRadius, distL, tHit, blocked );
 				}
 			}
@@ -1094,10 +1137,10 @@ R"HLSL(		// emit_surface / $vrad_emit*: hard center NEE + area falloff.
 			float falloff = ApplyFade( emitterCos / denom, dist, c0.y, c0.z );
 			if ( falloff <= 0 )
 				continue;
-			float3 vis = VisRGB( pos, lightPos );
+			float3 vis = VisRGB( pos, lightPos, skipProp );
 			if ( max( vis.x, max( vis.y, vis.z ) ) < 1e-5f )
 				continue;
-			accum += intensity * ( ndl * falloff ) * vis;
+			accum += LightContrib( intensity, ndl * falloff, vis, lambda );
 		}
 		sum = accum * ( 1.0f / (float)ns );
 	}
@@ -1141,10 +1184,13 @@ uint SampleLocalCdf( float u )
 	return lo;
 }
 
-float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, bool allowSoft, inout float sunAmt )
+float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, int skipProp, bool allowSoft,
+					 bool fullLocals, inout float sunAmt, float lambda )
 {
 	float3 sum = 0;
-	const bool powerSample = ( LightSamples > 0 ) && ( LocalCount > LightSamples );
+	// First bounce (fullLocals): evaluate every local — critical for indoor props.
+	// Later bounces: optional power-sample subset when LightSamples > 0.
+	const bool powerSample = !fullLocals && ( LightSamples > 0 ) && ( LocalCount > LightSamples );
 
 	for ( uint i = 0; i < LightCount; ++i )
 	{
@@ -1153,7 +1199,7 @@ float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, bool all
 			continue;
 		if ( powerSample && LightsD[i].z != 0 )
 			continue;
-		sum += EvalLight( i, pos, normal, seed + i * 17u, faceNum, allowSoft, sunAmt );
+		sum += EvalLight( i, pos, normal, seed + i * 17u, faceNum, skipProp, allowSoft, sunAmt, lambda );
 	}
 
 	if ( powerSample )
@@ -1166,7 +1212,7 @@ float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, bool all
 			uint idx = LocalIdx[li];
 			float cdf0 = ( li == 0 ) ? 0.0f : LocalCdf[li - 1];
 			float pdf = max( LocalCdf[li] - cdf0, 1e-8f );
-			float3 col = EvalLight( idx, pos, normal, seed + ( s + 1 ) * 131u, faceNum, allowSoft, sunAmt );
+			float3 col = EvalLight( idx, pos, normal, seed + ( s + 1 ) * 131u, faceNum, skipProp, allowSoft, sunAmt, lambda );
 			sum += col * ( 1.0f / ( pdf * (float)LightSamples ) );
 		}
 	}
@@ -1230,9 +1276,9 @@ float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, bool all
 			float pdfA = 1.0f / area;
 			float pdf = sampleAll ? pdfA : ( pPick * pdfA );
 			if ( pdf <= 1e-20f ) continue;
-			float3 vis = VisRGB( pos, lp );
+			float3 vis = VisRGB( pos, lp, skipProp );
 			if ( max( vis.x, max( vis.y, vis.z ) ) < 1e-5f ) continue;
-			areaSum += Le * ( ndl * eCos / ( dist * dist * pdf ) ) * vis;
+			areaSum += LightContrib( Le, ndl * eCos / ( dist * dist * pdf ), vis, lambda );
 		}
 		if ( !sampleAll )
 			areaSum *= ( 1.0f / (float)k );
@@ -1241,24 +1287,49 @@ float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, bool all
 	return sum;
 }
 
-float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int faceNum, out float sunAmt )
+float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int faceNum, int skipProp, out float sunAmt )
 {
+	sunAmt = 0;
+	uint pathDepth = Bounces + 1;
+	if ( pathDepth < 1 ) pathDepth = 1;
+
+	const bool spectral = ( SpectralMode != 0 );
+	const float dLam = ( SPEC_LMAX - SPEC_LMIN ) / (float)SPEC_WAVES;
+	const float pdfLam = 1.0f / dLam;
+
+	float lam0 = 550.0f, lam1 = 550.0f, lam2 = 550.0f, lam3 = 550.0f;
+	float4 beta = 1.0f;
+	float4 Ls = 0.0f;
+	if ( spectral )
+	{
+		lam0 = SPEC_LMIN + ( 0.0f + Hash01( seed + sppIndex * 19u + 7u ) ) * dLam;
+		lam1 = SPEC_LMIN + ( 1.0f + Hash01( seed + sppIndex * 19u + 20u ) ) * dLam;
+		lam2 = SPEC_LMIN + ( 2.0f + Hash01( seed + sppIndex * 19u + 33u ) ) * dLam;
+		lam3 = SPEC_LMIN + ( 3.0f + Hash01( seed + sppIndex * 19u + 46u ) ) * dLam;
+	}
+
 	float3 radiance = 0;
 	float3 throughput = 1;
 	float3 pos = posIn;
 	float3 normal = normalIn;
 	int skipFace = faceNum;
-	sunAmt = 0;
-	uint pathDepth = Bounces + 1;
-	if ( pathDepth < 1 ) pathDepth = 1;
 
 	for ( uint bounce = 0; bounce < pathDepth; ++bounce )
 	{
 		bool allowSoft = ( bounce == 0 ) || ( SoftMode != 0 );
 		float sunB = 0;
-		float3 nee = SampleDirect( pos, normal, seed + bounce * 31u + sppIndex * 17u, skipFace, allowSoft, sunB );
-		nee = ClampFirefly( nee, bounce == 0 ? FireflyCap : FireflyCap * 0.16f );
-		radiance += throughput * nee;
+		float3 nee = SampleDirect( pos, normal, seed + bounce * 31u + sppIndex * 17u, skipFace, skipProp, allowSoft,
+								   bounce == 0, sunB, lam0 );
+		nee = ClampFirefly( nee, FireflyCap );
+		if ( spectral )
+		{
+			Ls.x += beta.x * SpecIllum( nee, lam0 );
+			Ls.y += beta.y * SpecIllum( nee, lam1 );
+			Ls.z += beta.z * SpecIllum( nee, lam2 );
+			Ls.w += beta.w * SpecIllum( nee, lam3 );
+		}
+		else
+			radiance += throughput * nee;
 		if ( bounce == 0 )
 			sunAmt = sunB;
 
@@ -1276,7 +1347,7 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 		[loop] for ( int fpass = 0; fpass < MAX_FILTER_HITS + 1; ++fpass )
 		{
 			float t0; uint f0, p0; float3 n0;
-			bool h0 = TraceClosest( pos, dir, tmin, MaxTrace, t0, f0, p0, n0 );
+			bool h0 = TraceClosest( pos, dir, tmin, MaxTrace, skipProp, t0, f0, p0, n0 );
 			if ( !h0 || ( f0 & TRACE_ID_SKY ) )
 			{
 				hit = false;
@@ -1299,7 +1370,16 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 					float3 F = SampleFilterT( p0, pos + dir * t0 );
 					if ( max( F.x, max( F.y, F.z ) ) < 1e-5f && ( f0 & TRACE_ID_FILTER ) != 0 )
 						F = float3( 1, 1, 1 );
-					throughput = OklabStackFilter( throughput, max( F, float3( 1e-4f, 1e-4f, 1e-4f ) ) );
+					F = max( F, 1e-4f );
+					if ( spectral )
+					{
+						beta.x *= SpecRefl( F, lam0 );
+						beta.y *= SpecRefl( F, lam1 );
+						beta.z *= SpecRefl( F, lam2 );
+						beta.w *= SpecRefl( F, lam3 );
+					}
+					else
+						throughput = OklabStackFilter( throughput, F );
 					lastFilterT = t0;
 					lastFilterN = faceN;
 				}
@@ -1313,7 +1393,15 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 		if ( !hit )
 		{
 			float3 amb = SampleSkyAmb( pos );
-			radiance += ClampFirefly( throughput * amb, FireflyCap * 0.16f );
+			if ( spectral )
+			{
+				Ls.x += beta.x * SpecIllum( amb, lam0 );
+				Ls.y += beta.y * SpecIllum( amb, lam1 );
+				Ls.z += beta.z * SpecIllum( amb, lam2 );
+				Ls.w += beta.w * SpecIllum( amb, lam3 );
+			}
+			else
+				radiance += ClampFirefly( throughput * amb, FireflyCap );
 			break;
 		}
 
@@ -1323,31 +1411,51 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 
 		float3 albedo = ( prim < TriCount ) ? TriAlbedo[prim] : float3( 0.45, 0.45, 0.45 );
 		albedo = ApplyBounceVolAlbedo( hitPos, albedo, bounce );
-		albedo = clamp( albedo, 0.0f, 0.92f );
-		throughput *= albedo;
-#if PT_ENABLE_VOLUMES
-		if ( EnvVolCount > 0 )
+		albedo = clamp( albedo, 0.0f, 1.0f );
+		if ( spectral )
 		{
-			int recvEnv = DominantEnvId( posIn );
-			int emitEnv = DominantEnvId( hitPos );
-			TintInboundBounce( recvEnv, emitEnv, throughput );
+			beta.x *= SpecRefl( albedo, lam0 );
+			beta.y *= SpecRefl( albedo, lam1 );
+			beta.z *= SpecRefl( albedo, lam2 );
+			beta.w *= SpecRefl( albedo, lam3 );
 		}
-#endif
+		else
+			throughput *= albedo;
 
 		if ( bounce >= 1 )
 		{
-			float q = min( 0.95f, max( throughput.x, max( throughput.y, throughput.z ) ) );
+			float q = spectral
+				? min( 0.95f, ( beta.x + beta.y + beta.z + beta.w ) * 0.25f )
+				: min( 0.95f, max( throughput.x, max( throughput.y, throughput.z ) ) );
 			float r = Hash01( seed + bounce * 41u + 99u + sppIndex );
 			if ( r > q )
 				break;
-			throughput *= ( 1.0f / max( q, 1e-3f ) );
+			float invQ = 1.0f / max( q, 1e-3f );
+			if ( spectral )
+				beta *= invQ;
+			else
+				throughput *= invQ;
 		}
 
 		pos = hitPos + hitN * 0.5f;
 		normal = hitN;
 		skipFace = -1;
-		if ( throughput.x + throughput.y + throughput.z < 1e-4f )
+		if ( spectral )
+		{
+			if ( ( beta.x + beta.y + beta.z + beta.w ) < 1e-4f )
+				break;
+		}
+		else if ( throughput.x + throughput.y + throughput.z < 1e-4f )
 			break;
+	}
+
+	if ( spectral )
+	{
+		float3 rgb = SpectralToRgb( Ls.x, lam0, pdfLam )
+			+ SpectralToRgb( Ls.y, lam1, pdfLam )
+			+ SpectralToRgb( Ls.z, lam2, pdfLam )
+			+ SpectralToRgb( Ls.w, lam3, pdfLam );
+		return ClampFirefly( rgb, FireflyCap );
 	}
 	return radiance;
 }
@@ -1369,6 +1477,7 @@ void CSMain( uint3 dtid : SV_DispatchThreadID )
 	float3 axisV = LuxelsB[i * 2 + 1].xyz;
 	int faceNum = LuxelsC[i].x;
 	int aaN = max( LuxelsC[i].y, 1 );
+	int skipProp = LuxelsC[i].z;
 
 	float3 sum = 0;
 	float sunSum = 0;
@@ -1388,7 +1497,7 @@ void CSMain( uint3 dtid : SV_DispatchThreadID )
 			samplePos += axisU * u + axisV * v;
 		}
 		float sunAmt = 0;
-		float3 li = PathLi( samplePos, normal, seed, sGlobal, faceNum, sunAmt );
+		float3 li = PathLi( samplePos, normal, seed, sGlobal, faceNum, skipProp, sunAmt );
 		li = ClampFirefly( li, FireflyCap );
 		sum += li;
 		sunSum += sunAmt;
@@ -1430,23 +1539,219 @@ struct PtBakeGpu
 	uint32						triCount = 0;
 	PtGpuBakeParams				params = {};
 	bool						active = false;
+	// Aggregated all-dark batch stats (reported once after bake / on CPU fallback).
+	uint32						darkBatchCount = 0;
+	uint32						darkLuxelCount = 0;
+	bool						hadLitBatch = false;
+	bool						firstBatchBlack = false;
 };
 static PtBakeGpu g_ptBake;
 
-static bool PtCompileCSNamed( const char *src, const char *entry, bool enableVolumes, ID3DBlob **ppBlob )
+// Luxel CS is large; DXC has intermittently AV'd (0xC0000005) on a *second* in-process
+// compile in the same VRAD run (world bake OK → prop bake recompile crashes). Cache the
+// DXIL so GpuBakeBegin after world→props does not re-enter dxcompiler.
+static ComPtr<ID3DBlob> g_ptLuxelCsCache[2]; // [0]=no volumes, [1]=volumes
+
+static bool PtEnsureDxcLoaded()
 {
-	// Reuse PtCompileCS pattern with custom source — local copy
+	if ( g_hDxc )
+		return true;
+
+	const wchar_t *paths[] = {
+		L"dxcompiler.dll",
+		L"C:\\Windows\\System32\\dxcompiler.dll",
+	};
+	for ( int i = 0; i < 2 && !g_hDxc; ++i )
+		g_hDxc = LoadLibraryW( paths[i] );
+
 	if ( !g_hDxc )
 	{
-		g_hDxil = LoadLibraryA( "dxil.dll" );
-		g_hDxc = LoadLibraryA( "dxcompiler.dll" );
-		if ( !g_hDxc )
-			return false;
+		wchar_t sdkRoot[MAX_PATH] = {};
+		DWORD n = GetEnvironmentVariableW( L"WindowsSdkDir", sdkRoot, MAX_PATH );
+		if ( n == 0 || n >= MAX_PATH )
+			wcscpy_s( sdkRoot, L"C:\\Program Files (x86)\\Windows Kits\\10\\" );
+		const wchar_t *vers[] = { L"10.0.26100.0", L"10.0.22621.0", L"10.0.22000.0", L"10.0.19041.0" };
+		for ( int v = 0; v < 4 && !g_hDxc; ++v )
+		{
+			wchar_t path[MAX_PATH];
+			_snwprintf_s( path, _TRUNCATE, L"%sbin\\%s\\x64\\dxcompiler.dll", sdkRoot, vers[v] );
+			g_hDxc = LoadLibraryW( path );
+		}
 	}
+	if ( !g_hDxc )
+	{
+		Warning( "[PathTrace-DXR] dxcompiler.dll not found; cannot compile luxel CS.\n" );
+		return false;
+	}
+
+	if ( !g_hDxil )
+	{
+		g_hDxil = LoadLibraryW( L"dxil.dll" );
+		if ( !g_hDxil )
+		{
+			wchar_t dxcPath[MAX_PATH] = {};
+			GetModuleFileNameW( g_hDxc, dxcPath, MAX_PATH );
+			wchar_t *slash = wcsrchr( dxcPath, L'\\' );
+			if ( slash )
+			{
+				wcscpy_s( slash + 1, MAX_PATH - (int)( slash + 1 - dxcPath ), L"dxil.dll" );
+				g_hDxil = LoadLibraryW( dxcPath );
+			}
+		}
+	}
+	return true;
+}
+
+static bool PtFindDxcExe( wchar_t outPath[MAX_PATH] )
+{
+	outPath[0] = 0;
+	if ( g_hDxc )
+	{
+		wchar_t dllPath[MAX_PATH] = {};
+		GetModuleFileNameW( g_hDxc, dllPath, MAX_PATH );
+		wchar_t *slash = wcsrchr( dllPath, L'\\' );
+		if ( slash )
+		{
+			wcscpy_s( slash + 1, MAX_PATH - (int)( slash + 1 - dllPath ), L"dxc.exe" );
+			if ( GetFileAttributesW( dllPath ) != INVALID_FILE_ATTRIBUTES )
+			{
+				wcscpy_s( outPath, MAX_PATH, dllPath );
+				return true;
+			}
+		}
+	}
+	wchar_t sdkRoot[MAX_PATH] = {};
+	DWORD n = GetEnvironmentVariableW( L"WindowsSdkDir", sdkRoot, MAX_PATH );
+	if ( n == 0 || n >= MAX_PATH )
+		wcscpy_s( sdkRoot, L"C:\\Program Files (x86)\\Windows Kits\\10\\" );
+	const wchar_t *vers[] = { L"10.0.26100.0", L"10.0.22621.0", L"10.0.22000.0", L"10.0.19041.0" };
+	for ( int v = 0; v < 4; ++v )
+	{
+		_snwprintf_s( outPath, MAX_PATH, _TRUNCATE, L"%sbin\\%s\\x64\\dxc.exe", sdkRoot, vers[v] );
+		if ( GetFileAttributesW( outPath ) != INVALID_FILE_ATTRIBUTES )
+			return true;
+	}
+	outPath[0] = 0;
+	return false;
+}
+
+static bool PtCompileLuxelCsExternal( const char *src, bool enableVolumes, ID3DBlob **ppBlob )
+{
+	*ppBlob = nullptr;
+	wchar_t dxcExe[MAX_PATH];
+	if ( !PtFindDxcExe( dxcExe ) )
+	{
+		Warning( "[PathTrace-DXR] dxc.exe not found for external luxel CS compile.\n" );
+		return false;
+	}
+
+	char tmpDir[MAX_PATH] = {};
+	GetTempPathA( MAX_PATH, tmpDir );
+	char hlslPath[MAX_PATH], dxilPath[MAX_PATH];
+	_snprintf_s( hlslPath, _TRUNCATE, "%spt_luxel_%u.hlsl", tmpDir, GetCurrentProcessId() );
+	_snprintf_s( dxilPath, _TRUNCATE, "%spt_luxel_%u.dxil", tmpDir, GetCurrentProcessId() );
+
+	{
+		HANDLE hw = CreateFileA( hlslPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr );
+		if ( hw == INVALID_HANDLE_VALUE )
+			return false;
+		DWORD written = 0;
+		const DWORD nSrc = (DWORD)strlen( src );
+		BOOL wr = WriteFile( hw, src, nSrc, &written, nullptr );
+		CloseHandle( hw );
+		if ( !wr || written != nSrc )
+		{
+			DeleteFileA( hlslPath );
+			return false;
+		}
+	}
+
+	wchar_t cmd[2048];
+	_snwprintf_s( cmd, _TRUNCATE,
+				  L"\"%s\" -E CSMain -T cs_6_5 -HV 2021 -DPT_ENABLE_VOLUMES=%d -Fo \"%S\" \"%S\"",
+				  dxcExe, enableVolumes ? 1 : 0, dxilPath, hlslPath );
+
+	STARTUPINFOW si = {};
+	si.cb = sizeof( si );
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION pi = {};
+	Msg( "[PathTrace-DXR] In-process DXC failed — compiling luxel CS via dxc.exe...\n" );
+	fflush( stdout );
+	BOOL ok = CreateProcessW( nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi );
+	if ( !ok )
+	{
+		DeleteFileA( hlslPath );
+		return false;
+	}
+	WaitForSingleObject( pi.hProcess, 120000 );
+	DWORD exitCode = 1;
+	GetExitCodeProcess( pi.hProcess, &exitCode );
+	CloseHandle( pi.hThread );
+	CloseHandle( pi.hProcess );
+	DeleteFileA( hlslPath );
+	if ( exitCode != 0 )
+	{
+		Warning( "[PathTrace-DXR] External dxc.exe failed (exit %u).\n", (unsigned)exitCode );
+		DeleteFileA( dxilPath );
+		return false;
+	}
+
+	HANDLE h = CreateFileA( dxilPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr );
+	if ( h == INVALID_HANDLE_VALUE )
+		return false;
+	DWORD sz = GetFileSize( h, nullptr );
+	if ( sz == 0 || sz == INVALID_FILE_SIZE )
+	{
+		CloseHandle( h );
+		DeleteFileA( dxilPath );
+		return false;
+	}
+	ID3DBlob *blob = nullptr;
+	if ( FAILED( D3DCreateBlob( sz, &blob ) ) || !blob )
+	{
+		CloseHandle( h );
+		DeleteFileA( dxilPath );
+		return false;
+	}
+	DWORD read = 0;
+	BOOL rdOk = ReadFile( h, blob->GetBufferPointer(), sz, &read, nullptr );
+	CloseHandle( h );
+	DeleteFileA( dxilPath );
+	if ( !rdOk || read != sz )
+	{
+		blob->Release();
+		return false;
+	}
+	*ppBlob = blob;
+	return true;
+}
+
+// SEH-safe wrapper — COM smart pointers cannot live in the same function as __try.
+static HRESULT PtDxcCompileRaw( IDxcCompiler3 *compiler, const DxcBuffer *buf,
+								LPCWSTR *args, UINT32 nArgs, IDxcResult **ppResult )
+{
+	__try
+	{
+		return compiler->Compile( buf, args, nArgs, nullptr, IID_PPV_ARGS( ppResult ) );
+	}
+	__except ( EXCEPTION_EXECUTE_HANDLER )
+	{
+		return E_FAIL;
+	}
+}
+
+static bool PtCompileCSNamedInProcess( const char *src, bool enableVolumes, ID3DBlob **ppBlob )
+{
+	*ppBlob = nullptr;
+	if ( !PtEnsureDxcLoaded() )
+		return false;
+
 	using DxcCreateInstanceFn = HRESULT( __stdcall * )( REFCLSID, REFIID, LPVOID * );
 	auto create = (DxcCreateInstanceFn)GetProcAddress( g_hDxc, "DxcCreateInstance" );
 	if ( !create )
 		return false;
+
 	ComPtr<IDxcUtils> utils;
 	ComPtr<IDxcCompiler3> compiler;
 	if ( FAILED( create( CLSID_DxcUtils, IID_PPV_ARGS( &utils ) ) ) )
@@ -1456,20 +1761,27 @@ static bool PtCompileCSNamed( const char *src, const char *entry, bool enableVol
 	ComPtr<IDxcBlobEncoding> source;
 	if ( FAILED( utils->CreateBlob( src, (UINT32)strlen( src ), CP_UTF8, &source ) ) )
 		return false;
-	// PT_ENABLE_VOLUMES=0 strips env/bounce vol helpers at DXC preprocess time so the
-	// no-volume case does not pay register pressure from dead volume code.
+
 	LPCWSTR args[] = {
 		L"-E", L"CSMain", L"-T", L"cs_6_5", L"-HV", L"2021",
 		enableVolumes ? L"-DPT_ENABLE_VOLUMES=1" : L"-DPT_ENABLE_VOLUMES=0"
 	};
-	(void)entry;
 	DxcBuffer buf = {};
 	buf.Ptr = source->GetBufferPointer();
 	buf.Size = source->GetBufferSize();
 	buf.Encoding = DXC_CP_UTF8;
-	ComPtr<IDxcResult> result;
-	if ( FAILED( compiler->Compile( &buf, args, _countof( args ), nullptr, IID_PPV_ARGS( &result ) ) ) )
+
+	IDxcResult *rawResult = nullptr;
+	HRESULT hrCompile = PtDxcCompileRaw( compiler.Get(), &buf, args, _countof( args ), &rawResult );
+	if ( FAILED( hrCompile ) || !rawResult )
+	{
+		Warning( "[PathTrace-DXR] In-process DXC luxel CS compile crashed or failed (0x%08X).\n",
+				 (unsigned)hrCompile );
 		return false;
+	}
+	ComPtr<IDxcResult> result;
+	result.Attach( rawResult );
+
 	HRESULT hrStatus = S_OK;
 	result->GetStatus( &hrStatus );
 	if ( FAILED( hrStatus ) )
@@ -1489,6 +1801,54 @@ static bool PtCompileCSNamed( const char *src, const char *entry, bool enableVol
 		return false;
 	memcpy( blob->GetBufferPointer(), dxil->GetBufferPointer(), dxil->GetBufferSize() );
 	*ppBlob = blob;
+	return true;
+}
+
+static bool PtCompileCSNamed( const char *src, const char * /*entry*/, bool enableVolumes, ID3DBlob **ppBlob )
+{
+	if ( PtCompileCSNamedInProcess( src, enableVolumes, ppBlob ) )
+		return true;
+	return PtCompileLuxelCsExternal( src, enableVolumes, ppBlob );
+}
+
+static bool PtGetOrCompileLuxelCS( bool enableVolumes, ID3DBlob **ppBlob )
+{
+	*ppBlob = nullptr;
+	const int slot = enableVolumes ? 1 : 0;
+	if ( g_ptLuxelCsCache[slot] )
+	{
+		*ppBlob = g_ptLuxelCsCache[slot].Get();
+		( *ppBlob )->AddRef();
+		Msg( "[PathTrace-DXR] Reusing cached GPU luxel CS (%s).\n",
+			 enableVolumes ? "volumes" : "lean" );
+		fflush( stdout );
+		return true;
+	}
+
+	std::string src( kPtLuxelBakeCS );
+	const char *marker = "// ---- SPECTRAL_INSERT ----";
+	size_t at = src.find( marker );
+	if ( at != std::string::npos )
+		src.replace( at, strlen( marker ), PtSpectralHLSL() );
+	else
+		Warning( "[PathTrace-DXR] SPECTRAL_INSERT marker missing — spectral HLSL not injected.\n" );
+
+	Msg( "[PathTrace-DXR] Compiling GPU luxel CS (%u KB source)...\n", (unsigned)( src.size() / 1024 ) );
+	fflush( stdout );
+
+	ID3DBlob *blob = nullptr;
+	if ( !PtCompileCSNamed( src.c_str(), "CSMain", enableVolumes, &blob ) || !blob )
+	{
+		Warning( "[PathTrace-DXR] GPU luxel CS compile failed.\n" );
+		return false;
+	}
+
+	g_ptLuxelCsCache[slot].Attach( blob ); // takes ownership of the one ref from compile
+	*ppBlob = g_ptLuxelCsCache[slot].Get();
+	( *ppBlob )->AddRef();
+	Msg( "[PathTrace-DXR] GPU luxel CS compiled OK (%u KB DXIL, cached).\n",
+		 (unsigned)( g_ptLuxelCsCache[slot]->GetBufferSize() / 1024 ) );
+	fflush( stdout );
 	return true;
 }
 
@@ -1527,9 +1887,30 @@ uint32_t PathTraceDXR_CapturedTriFlags( uint32_t triIndex )
 	return g_ptTris[triIndex].flags;
 }
 
+bool PathTraceDXR_GetCapturedTri( uint32_t triIndex, Vector &a, Vector &b, Vector &c, uint32_t *outFlags )
+{
+	if ( triIndex >= (uint32_t)g_ptTris.size() )
+		return false;
+	const PtHostTri &t = g_ptTris[triIndex];
+	a = t.a;
+	b = t.b;
+	c = t.c;
+	if ( outFlags )
+		*outFlags = t.flags;
+	return true;
+}
+
+bool PathTraceDXR_GpuBakeIsActive()
+{
+	return g_ptBake.active;
+}
+
 void PathTraceDXR_GpuBakeEnd()
 {
 	g_ptBake.active = false;
+	// GPU may still be using bake buffers from the last dispatch — wait before Release.
+	if ( g_ptDev.queue && g_ptDev.fence && g_ptDev.fenceEvent )
+		PtWaitGPU();
 	g_ptBake.rootSig.Reset();
 	g_ptBake.pso.Reset();
 	g_ptBake.heap.Reset();
@@ -1550,6 +1931,26 @@ void PathTraceDXR_GpuBakeEnd()
 	g_ptBake.luxelCap = 0;
 	g_ptBake.lightCount = 0;
 	g_ptBake.triCount = 0;
+	// Keep darkBatch* until PathTraceDXR_ReportGpuBakeDarkStats().
+}
+
+void PathTraceDXR_ReportGpuBakeDarkStats( const char *phase )
+{
+	const char *p = phase ? phase : "GPU bake";
+	if ( g_ptBake.firstBatchBlack )
+	{
+		Warning( "[PathTrace-DXR] %s: first GPU batch was all-black (%u luxels) — check DXR RayQuery / buffer uploads.\n",
+				 p, g_ptBake.darkLuxelCount );
+	}
+	else if ( g_ptBake.darkBatchCount > 0 )
+	{
+		Warning( "[PathTrace-DXR] %s: %u all-dark batch(es) (%u luxels) — likely fully shadowed (kept).\n",
+				 p, g_ptBake.darkBatchCount, g_ptBake.darkLuxelCount );
+	}
+	g_ptBake.darkBatchCount = 0;
+	g_ptBake.darkLuxelCount = 0;
+	g_ptBake.hadLitBatch = false;
+	g_ptBake.firstBatchBlack = false;
 }
 
 bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
@@ -1570,14 +1971,14 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 
 	const bool enableVolumes = ( LightEnv_VolumeCount() > 0 ) || ( BounceVol_VolumeCount() > 0 );
 	ID3DBlob *csBlob = nullptr;
-	if ( !PtCompileCSNamed( kPtLuxelBakeCS, "CSMain", enableVolumes, &csBlob ) )
+	if ( !PtGetOrCompileLuxelCS( enableVolumes, &csBlob ) )
 		return false;
 	Msg( "[PathTrace-DXR] GPU luxel CS: %s\n", enableVolumes ? "volumes" : "lean (no volumes)" );
 
 	// Root: table t0..t19 + u0, then 24 constants
 	D3D12_DESCRIPTOR_RANGE ranges[2] = {};
 	ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-	ranges[0].NumDescriptors = 20;
+	ranges[0].NumDescriptors = 21;
 	ranges[0].BaseShaderRegister = 0;
 	ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 	ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -1591,7 +1992,7 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	paramsRS[0].DescriptorTable.pDescriptorRanges = ranges;
 	paramsRS[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 	paramsRS[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-	paramsRS[1].Constants.Num32BitValues = 24;
+	paramsRS[1].Constants.Num32BitValues = 26;
 	paramsRS[1].Constants.ShaderRegister = 0;
 	paramsRS[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
@@ -1625,7 +2026,7 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
 	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	heapDesc.NumDescriptors = 24;
+	heapDesc.NumDescriptors = 26;
 	heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	if ( FAILED( g_ptDev.device->CreateDescriptorHeap( &heapDesc, IID_PPV_ARGS( &g_ptBake.heap ) ) ) )
 		return false;
@@ -1652,12 +2053,16 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 
 	{
 		float *pa = nullptr, *pb = nullptr, *pc = nullptr; int *pd = nullptr; float *pal = nullptr; float *pf = nullptr;
-		upA->Map( 0, nullptr, (void **)&pa );
-		upB->Map( 0, nullptr, (void **)&pb );
-		upC->Map( 0, nullptr, (void **)&pc );
-		upD->Map( 0, nullptr, (void **)&pd );
-		upAlb->Map( 0, nullptr, (void **)&pal );
-		upFilt->Map( 0, nullptr, (void **)&pf );
+		if ( FAILED( upA->Map( 0, nullptr, (void **)&pa ) ) || !pa ||
+			 FAILED( upB->Map( 0, nullptr, (void **)&pb ) ) || !pb ||
+			 FAILED( upC->Map( 0, nullptr, (void **)&pc ) ) || !pc ||
+			 FAILED( upD->Map( 0, nullptr, (void **)&pd ) ) || !pd ||
+			 FAILED( upAlb->Map( 0, nullptr, (void **)&pal ) ) || !pal ||
+			 FAILED( upFilt->Map( 0, nullptr, (void **)&pf ) ) || !pf )
+		{
+			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading lights/albedo (host OOM?).\n" );
+			return false;
+		}
 		for ( uint32_t i = 0; i < nLights; ++i )
 		{
 			const PtGpuBakeLight &L = lights[i];
@@ -1712,7 +2117,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 			return false;
 		{
 			unsigned char *p = nullptr;
-			upArray->Map( 0, nullptr, (void **)&p );
+			if ( FAILED( upArray->Map( 0, nullptr, (void **)&p ) ) || !p )
+			{
+				Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading filter atlas (host OOM?).\n" );
+				return false;
+			}
 			memset( p, 255, (size_t)arrayBytes );
 			if ( filterArrayRGBA && filterArrayW > 0 && filterArrayH > 0 && filterArrayLayers > 0 )
 			{
@@ -1766,10 +2175,19 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !PtCreateBuffer( cdfBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.localCdf, L"LocCdf" ) ) return false;
 	{
 		void *p = nullptr;
-		upLoc->Map( 0, nullptr, &p );
+		if ( FAILED( upLoc->Map( 0, nullptr, &p ) ) || !p )
+		{
+			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading local light CDF (host OOM?).\n" );
+			return false;
+		}
 		memcpy( p, localIdx.data(), (size_t)locBytes );
 		upLoc->Unmap( 0, nullptr );
-		upCdf->Map( 0, nullptr, &p );
+		p = nullptr;
+		if ( FAILED( upCdf->Map( 0, nullptr, &p ) ) || !p )
+		{
+			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading local light CDF (host OOM?).\n" );
+			return false;
+		}
 		memcpy( p, localCdf.data(), (size_t)cdfBytes );
 		upCdf->Unmap( 0, nullptr );
 	}
@@ -1790,9 +2208,13 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !PtCreateBuffer( emitCdfBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.emitCdf, L"EmitCdf" ) ) return false;
 	{
 		float *pa = nullptr, *pe = nullptr, *pc = nullptr;
-		upEmitA->Map( 0, nullptr, (void **)&pa );
-		upEmitE->Map( 0, nullptr, (void **)&pe );
-		upEmitCdf->Map( 0, nullptr, (void **)&pc );
+		if ( FAILED( upEmitA->Map( 0, nullptr, (void **)&pa ) ) || !pa ||
+			 FAILED( upEmitE->Map( 0, nullptr, (void **)&pe ) ) || !pe ||
+			 FAILED( upEmitCdf->Map( 0, nullptr, (void **)&pc ) ) || !pc )
+		{
+			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading emit tris (host OOM?).\n" );
+			return false;
+		}
 		memset( pa, 0, (size_t)emitABytes );
 		memset( pe, 0, (size_t)emitEBytes );
 		memset( pc, 0, (size_t)emitCdfBytes );
@@ -1830,7 +2252,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !PtCreateBuffer( envBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.envVols, L"EnvVols" ) ) return false;
 	{
 		float *pe = nullptr;
-		upEnv->Map( 0, nullptr, (void **)&pe );
+		if ( FAILED( upEnv->Map( 0, nullptr, (void **)&pe ) ) || !pe )
+		{
+			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading env volumes (host OOM?).\n" );
+			return false;
+		}
 		memset( pe, 0, (size_t)envBytes );
 		for ( uint32 i = 0; i < nVol; ++i )
 		{
@@ -1857,7 +2283,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !PtCreateBuffer( bvolBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.bounceVols, L"BounceVols" ) ) return false;
 	{
 		float *pb = nullptr;
-		upBVol->Map( 0, nullptr, (void **)&pb );
+		if ( FAILED( upBVol->Map( 0, nullptr, (void **)&pb ) ) || !pb )
+		{
+			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading bounce volumes (host OOM?).\n" );
+			return false;
+		}
 		memset( pb, 0, (size_t)bvolBytes );
 		for ( uint32 i = 0; i < nBVol; ++i )
 		{
@@ -1943,11 +2373,19 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	g_ptBake.params.defaultBounceIntensity = LightEnv_GetDefaultBounceIntensity();
 	g_ptBake.params.bounceVolCount = nBVol;
 	g_ptBake.params.cliBounceBoost = g_flBounceBoost;
-	g_ptBake.params.cliBounceChroma = g_flBounceChroma;
+	// Physical colored transport: linear RGB light × texbounce albedo. No Oklab sat.
+	g_ptBake.params.cliBounceChroma = 0.0f;
 	g_ptBake.sampleOffset = 0;
 	g_ptBake.active = true;
+	g_ptBake.darkBatchCount = 0;
+	g_ptBake.darkLuxelCount = 0;
+	g_ptBake.hadLitBatch = false;
+	g_ptBake.firstBatchBlack = false;
 	Msg( "[PathTrace-DXR] GPU luxel baker ready (%u lights, %u locals, %u emit-tris, %u env vols, %u bounce vols, %u scene tris, pt_lights=%u).\n",
 		 nLights, g_ptBake.localCount, nEmit, nVol, nBVol, nTris, params.lightSamples );
+	Msg( "[PathTrace-DXR] Physical colored transport: light RGB × -texbounce albedo (no -bounce_chroma).\n" );
+	if ( g_ptBake.params.spectralMode )
+		Msg( "[PathTrace-DXR] Spectral mode ON (4 λ stratified / path).\n" );
 	fflush( stdout );
 	return true;
 }
@@ -1972,9 +2410,13 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 
 	{
 		float *pa = nullptr, *pb = nullptr; int *pc = nullptr;
-		g_ptBake.luxelAUp->Map( 0, nullptr, (void **)&pa );
-		g_ptBake.luxelBUp->Map( 0, nullptr, (void **)&pb );
-		g_ptBake.luxelCUp->Map( 0, nullptr, (void **)&pc );
+		if ( FAILED( g_ptBake.luxelAUp->Map( 0, nullptr, (void **)&pa ) ) || !pa ||
+			 FAILED( g_ptBake.luxelBUp->Map( 0, nullptr, (void **)&pb ) ) || !pb ||
+			 FAILED( g_ptBake.luxelCUp->Map( 0, nullptr, (void **)&pc ) ) || !pc )
+		{
+			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading luxels (host OOM?).\n" );
+			return false;
+		}
 		for ( uint32_t i = 0; i < nLuxels; ++i )
 		{
 			const PtGpuBakeLuxel &L = luxels[i];
@@ -1983,7 +2425,7 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 			*(uint32 *)&pa[i * 8 + 7] = L.seed;
 			pb[i * 8 + 0] = L.axisU[0]; pb[i * 8 + 1] = L.axisU[1]; pb[i * 8 + 2] = L.axisU[2]; pb[i * 8 + 3] = 0;
 			pb[i * 8 + 4] = L.axisV[0]; pb[i * 8 + 5] = L.axisV[1]; pb[i * 8 + 6] = L.axisV[2]; pb[i * 8 + 7] = 0;
-			pc[i * 4 + 0] = L.faceNum; pc[i * 4 + 1] = L.aaN; pc[i * 4 + 2] = 0; pc[i * 4 + 3] = 0;
+			pc[i * 4 + 0] = L.faceNum; pc[i * 4 + 1] = L.aaN; pc[i * 4 + 2] = L.skipPropIndex; pc[i * 4 + 3] = 0;
 		}
 		g_ptBake.luxelAUp->Unmap( 0, nullptr );
 		g_ptBake.luxelBUp->Unmap( 0, nullptr );
@@ -2118,13 +2560,27 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 		srv.Texture2DArray.ArraySize = g_ptBake.filterAtlasLayers;
 		g_ptDev.device->CreateShaderResourceView( g_ptBake.filterAtlas.Get(), &srv, at( 19 ) );
 	}
+	// t20 PrimBase (Phase-2 instancing; 1 entry {0} when flat)
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+		srv.Format = DXGI_FORMAT_UNKNOWN;
+		srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+		srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srv.Buffer.NumElements = max( g_ptDev.primBaseCount, 1u );
+		srv.Buffer.StructureByteStride = sizeof( uint32 );
+		ID3D12Resource *pb = g_ptDev.primBaseBuffer.Get();
+		if ( !pb )
+			pb = g_ptDev.flagBuffer.Get(); // should not happen
+		g_ptDev.device->CreateShaderResourceView( pb, &srv, at( 20 ) );
+	}
 	{
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
 		uav.Format = DXGI_FORMAT_UNKNOWN;
 		uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
 		uav.Buffer.NumElements = g_ptBake.luxelCap;
 		uav.Buffer.StructureByteStride = sizeof( float ) * 4;
-		g_ptDev.device->CreateUnorderedAccessView( g_ptBake.outBuf.Get(), nullptr, &uav, at( 20 ) );
+		// Heap: SRV t0..t20 (21), then UAV u0 at index 21
+		g_ptDev.device->CreateUnorderedAccessView( g_ptBake.outBuf.Get(), nullptr, &uav, at( 21 ) );
 	}
 
 	ID3D12DescriptorHeap *heaps[] = { g_ptBake.heap.Get() };
@@ -2133,7 +2589,7 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 	g_ptDev.list->SetPipelineState( g_ptBake.pso.Get() );
 	g_ptDev.list->SetComputeRootDescriptorTable( 0, g_ptBake.heap->GetGPUDescriptorHandleForHeapStart() );
 
-	UINT cb[24] = {};
+	UINT cb[26] = {};
 	cb[0] = nLuxels;
 	cb[1] = g_ptBake.params.spp;
 	cb[2] = g_ptBake.params.bounces;
@@ -2158,7 +2614,9 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 	cb[21] = g_ptBake.bounceVolCount;
 	*(float *)&cb[22] = g_ptBake.params.cliBounceBoost;
 	*(float *)&cb[23] = g_ptBake.params.cliBounceChroma;
-	g_ptDev.list->SetComputeRoot32BitConstants( 1, 24, cb, 0 );
+	cb[24] = g_ptDev.useInstancedAS ? 1u : 0u;
+	cb[25] = g_ptBake.params.spectralMode;
+	g_ptDev.list->SetComputeRoot32BitConstants( 1, 26, cb, 0 );
 	g_ptDev.list->Dispatch( ( nLuxels + 63 ) / 64, 1, 1 );
 
 	D3D12_RESOURCE_BARRIER uavB = {};
@@ -2217,13 +2675,6 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 		}
 		D3D12_RANGE empty = {};
 		g_ptBake.outRead->Unmap( 0, &empty );
-		static bool s_logged = false;
-		static bool s_hadGoodBatch = false;
-		if ( !s_logged )
-		{
-			Msg( "[PathTrace-DXR] GPU bake batch: %u/%u luxels lit, maxRGB sum=%.4f\n", nLit, nLuxels, maxL );
-			s_logged = true;
-		}
 		if ( nLit == 0 || maxL < 1e-6f )
 		{
 			HRESULT removed = S_OK;
@@ -2235,19 +2686,19 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 						 (unsigned)removed );
 				return false;
 			}
-			// Fully shaded / sealed faces can legitimately return all-black. Only treat
-			// as a hard failure if we have never seen a lit luxel (shader/upload broken).
-			if ( !s_hadGoodBatch )
+			g_ptBake.darkBatchCount++;
+			g_ptBake.darkLuxelCount += nLuxels;
+			// Fully shaded faces can be legitimately black. Fail only if nothing has ever lit
+			// (shader/upload broken) — warning is deferred to ReportGpuBakeDarkStats.
+			if ( !g_ptBake.hadLitBatch )
 			{
-				Warning( "[PathTrace-DXR] GPU bake produced black results on first batch — check DXR RayQuery / buffer uploads.\n" );
+				g_ptBake.firstBatchBlack = true;
 				return false;
 			}
-			Msg( "[PathTrace-DXR] GPU bake batch all-dark (%u luxels) — keeping (likely fully shadowed faces).\n",
-				 nLuxels );
 		}
 		else
 		{
-			s_hadGoodBatch = true;
+			g_ptBake.hadLitBatch = true;
 		}
 	}
 	return true;

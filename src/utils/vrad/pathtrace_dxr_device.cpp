@@ -21,6 +21,7 @@
 #include <vector>
 #include <mutex>
 #include <cstring>
+#include <string>
 
 #include "tier0/dbg.h"
 #include "mathlib/vector.h"
@@ -29,6 +30,7 @@
 #include "worldsize.h"
 #include "envvolume.h"
 #include "bounce_vol.h"
+#include "pt_spectral_hlsl.h"
 
 #pragma comment( lib, "d3d12.lib" )
 #pragma comment( lib, "dxgi.lib" )
@@ -49,11 +51,82 @@ struct PtHostTri
 static std::vector<PtHostTri>	g_ptTris;
 static bool						g_bPtCaptureDone = false;
 
+struct PtPropModelMesh
+{
+	int modelIdx = -1;
+	uint32 triBase = 0;
+	uint32 nTris = 0;
+	std::vector<Vector> verts; // nTris * 3, local space
+};
+struct PtPropInstanceRec
+{
+	int propIndex = 0;
+	int modelIdx = -1;
+	float xform[3][4];
+};
+static std::vector<PtPropModelMesh>		g_ptPropModels;
+static std::vector<PtPropInstanceRec>	g_ptPropInstances;
+static std::vector<ComPtr<ID3D12Resource>> g_ptPropBlas;
+
+void PathTraceDXR_ClearPropInstances()
+{
+	g_ptPropModels.clear();
+	g_ptPropInstances.clear();
+}
+
+void PathTraceDXR_RegisterPropModel( int modelIdx, const Vector *verts, int nTris )
+{
+	if ( !verts || nTris <= 0 )
+		return;
+	for ( size_t i = 0; i < g_ptPropModels.size(); ++i )
+	{
+		if ( g_ptPropModels[i].modelIdx == modelIdx )
+			return; // already registered
+	}
+	PtPropModelMesh m;
+	m.modelIdx = modelIdx;
+	m.nTris = (uint32)nTris;
+	m.verts.assign( verts, verts + nTris * 3 );
+	g_ptPropModels.push_back( std::move( m ) );
+}
+
+void PathTraceDXR_RegisterPropInstance( int propIndex, int modelIdx, const float xform[3][4] )
+{
+	PtPropInstanceRec r;
+	r.propIndex = propIndex;
+	r.modelIdx = modelIdx;
+	memcpy( r.xform, xform, sizeof( r.xform ) );
+	g_ptPropInstances.push_back( r );
+}
+
+static int PtFindPropModel( int modelIdx )
+{
+	for ( size_t i = 0; i < g_ptPropModels.size(); ++i )
+	{
+		if ( g_ptPropModels[i].modelIdx == modelIdx )
+			return (int)i;
+	}
+	return -1;
+}
+
+static bool PathTraceDXR_PropInstancingReady()
+{
+	if ( g_ptPropModels.empty() || g_ptPropInstances.empty() )
+		return false;
+	for ( size_t i = 0; i < g_ptPropInstances.size(); ++i )
+	{
+		if ( PtFindPropModel( g_ptPropInstances[i].modelIdx ) < 0 )
+			return false;
+	}
+	return true;
+}
+
 void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv )
 {
 	g_ptTris.clear();
 	g_bPtCaptureDone = false;
 	const int n = rtEnv.OptimizedTriangleList.Count();
+	const bool bInstanced = PathTraceDXR_PropInstancingReady();
 	g_ptTris.reserve( n );
 	for ( int i = 0; i < n; ++i )
 	{
@@ -63,10 +136,35 @@ void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv )
 		h.b = tri.Vertex( 1 );
 		h.c = tri.Vertex( 2 );
 		h.flags = (uint32)tri.m_Data.m_GeometryData.m_nTriangleID;
+		if ( bInstanced && ( h.flags & TRACE_ID_STATICPROP ) )
+			continue; // unique-model BLASes + TLAS instances
 		g_ptTris.push_back( h );
 	}
+	if ( bInstanced )
+	{
+		for ( size_t mi = 0; mi < g_ptPropModels.size(); ++mi )
+		{
+			PtPropModelMesh &m = g_ptPropModels[mi];
+			m.triBase = (uint32)g_ptTris.size();
+			for ( uint32 t = 0; t < m.nTris; ++t )
+			{
+				PtHostTri h;
+				h.a = m.verts[t * 3 + 0];
+				h.b = m.verts[t * 3 + 1];
+				h.c = m.verts[t * 3 + 2];
+				// Prop id comes from TLAS InstanceID at hit time.
+				h.flags = TRACE_ID_STATICPROP;
+				g_ptTris.push_back( h );
+			}
+		}
+		Msg( "[PathTrace-DXR] Captured %u world tris + %d unique prop models (%d instances) for instanced AS\n",
+			 g_ptPropModels[0].triBase, (int)g_ptPropModels.size(), (int)g_ptPropInstances.size() );
+	}
+	else
+	{
+		Msg( "[PathTrace-DXR] Captured %d triangles for DXR AS\n", (int)g_ptTris.size() );
+	}
 	g_bPtCaptureDone = true;
-	Msg( "[PathTrace-DXR] Captured %d triangles for DXR AS\n", n );
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +241,9 @@ struct PtDevice
 	ComPtr<ID3D12Resource>				tlas;
 	ComPtr<ID3D12Resource>				vertexBuffer;
 	ComPtr<ID3D12Resource>				flagBuffer;
+	ComPtr<ID3D12Resource>				primBaseBuffer;
+	uint32								primBaseCount = 0;
+	bool								useInstancedAS = false;
 	ComPtr<ID3D12DescriptorHeap>		srvUavHeap;
 	D3D12_GPU_DESCRIPTOR_HANDLE			tlasSrvGpu = {};
 	D3D12_GPU_VIRTUAL_ADDRESS			tlasVA = 0;
@@ -501,68 +602,175 @@ bool PathTraceDXR_DeviceInit( int adapterIndex )
 	barriers[1].Transition.pResource = g_ptDev.flagBuffer.Get();
 	g_ptDev.list->ResourceBarrier( 2, barriers );
 
-	// ---- BLAS ----
-	D3D12_RAYTRACING_GEOMETRY_DESC geo = {};
-	geo.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-	geo.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-	geo.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-	geo.Triangles.VertexCount = nTris * 3;
-	geo.Triangles.VertexBuffer.StartAddress = g_ptDev.vertexBuffer->GetGPUVirtualAddress();
-	geo.Triangles.VertexBuffer.StrideInBytes = sizeof( float ) * 3;
+	// ---- BLAS / TLAS (flat or Phase-2 instanced props) ----
+	g_ptDev.useInstancedAS = false;
+	g_ptDev.primBaseCount = 0;
+	g_ptDev.primBaseBuffer.Reset();
+	g_ptPropBlas.clear();
 
-	D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS blasIn = {};
-	blasIn.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-	blasIn.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-	blasIn.NumDescs = 1;
-	blasIn.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-	blasIn.pGeometryDescs = &geo;
+	const bool bInstanced = PathTraceDXR_PropInstancingReady();
+	uint32 nWorldTris = nTris;
+	if ( bInstanced && !g_ptPropModels.empty() )
+		nWorldTris = g_ptPropModels[0].triBase;
 
-	D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blasPre = {};
-	g_ptDev.device->GetRaytracingAccelerationStructurePrebuildInfo( &blasIn, &blasPre );
+	std::vector<ComPtr<ID3D12Resource>> blasScratches;
+	auto buildBlas = [&]( uint32 triStart, uint32 triCount, ComPtr<ID3D12Resource> *outBlas, const wchar_t *name ) -> bool
+	{
+		if ( triCount == 0 )
+			return false;
+		D3D12_RAYTRACING_GEOMETRY_DESC geo = {};
+		geo.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+		geo.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+		geo.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+		geo.Triangles.VertexCount = triCount * 3;
+		geo.Triangles.VertexBuffer.StartAddress =
+			g_ptDev.vertexBuffer->GetGPUVirtualAddress() + (UINT64)triStart * 9ull * sizeof( float );
+		geo.Triangles.VertexBuffer.StrideInBytes = sizeof( float ) * 3;
 
-	ComPtr<ID3D12Resource> blasScratch;
-	if ( !PtCreateBuffer( blasPre.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
-						  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
-						  &blasScratch, L"PT_BLASScratch" ) )
+		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS blasIn = {};
+		blasIn.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+		blasIn.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+		blasIn.NumDescs = 1;
+		blasIn.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+		blasIn.pGeometryDescs = &geo;
+
+		D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blasPre = {};
+		g_ptDev.device->GetRaytracingAccelerationStructurePrebuildInfo( &blasIn, &blasPre );
+
+		ComPtr<ID3D12Resource> blasScratch;
+		if ( !PtCreateBuffer( blasPre.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+							  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
+							  &blasScratch, L"PT_BLASScratch" ) )
+			return false;
+		if ( !PtCreateBuffer( blasPre.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+							  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+							  D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+							  outBlas->GetAddressOf(), name ) )
+			return false;
+
+		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC blasBuild = {};
+		blasBuild.Inputs = blasIn;
+		blasBuild.DestAccelerationStructureData = ( *outBlas )->GetGPUVirtualAddress();
+		blasBuild.ScratchAccelerationStructureData = blasScratch->GetGPUVirtualAddress();
+		g_ptDev.list->BuildRaytracingAccelerationStructure( &blasBuild, 0, nullptr );
+
+		D3D12_RESOURCE_BARRIER uavB = {};
+		uavB.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+		uavB.UAV.pResource = outBlas->Get();
+		g_ptDev.list->ResourceBarrier( 1, &uavB );
+		blasScratches.push_back( std::move( blasScratch ) );
+		return true;
+	};
+
+	if ( bInstanced ? ( nWorldTris > 0 ) : ( nTris > 0 ) )
+	{
+		if ( !buildBlas( 0, bInstanced ? nWorldTris : nTris, &g_ptDev.blas, L"PT_BLAS" ) )
+			return false;
+	}
+	else if ( !bInstanced )
+	{
+		Warning( "[PathTrace-DXR] No triangles for BLAS.\n" );
 		return false;
-	if ( !PtCreateBuffer( blasPre.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
-						  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-						  D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-						  &g_ptDev.blas, L"PT_BLAS" ) )
-		return false;
+	}
 
-	D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC blasBuild = {};
-	blasBuild.Inputs = blasIn;
-	blasBuild.DestAccelerationStructureData = g_ptDev.blas->GetGPUVirtualAddress();
-	blasBuild.ScratchAccelerationStructureData = blasScratch->GetGPUVirtualAddress();
-	g_ptDev.list->BuildRaytracingAccelerationStructure( &blasBuild, 0, nullptr );
+	std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances;
+	std::vector<uint32> primBases;
 
-	D3D12_RESOURCE_BARRIER uavBarrier = {};
-	uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-	uavBarrier.UAV.pResource = g_ptDev.blas.Get();
-	g_ptDev.list->ResourceBarrier( 1, &uavBarrier );
+	if ( bInstanced )
+	{
+		g_ptPropBlas.resize( g_ptPropModels.size() );
+		for ( size_t mi = 0; mi < g_ptPropModels.size(); ++mi )
+		{
+			const PtPropModelMesh &m = g_ptPropModels[mi];
+			wchar_t name[64];
+			_snwprintf_s( name, _TRUNCATE, L"PT_PropBLAS_%u", (unsigned)mi );
+			if ( !buildBlas( m.triBase, m.nTris, &g_ptPropBlas[mi], name ) )
+				return false;
+		}
 
-	// ---- TLAS ----
-	D3D12_RAYTRACING_INSTANCE_DESC inst = {};
-	inst.Transform[0][0] = inst.Transform[1][1] = inst.Transform[2][2] = 1.0f;
-	inst.InstanceMask = 0xFF;
-	inst.AccelerationStructure = g_ptDev.blas->GetGPUVirtualAddress();
+		if ( g_ptDev.blas )
+		{
+			D3D12_RAYTRACING_INSTANCE_DESC worldInst = {};
+			worldInst.Transform[0][0] = worldInst.Transform[1][1] = worldInst.Transform[2][2] = 1.0f;
+			worldInst.InstanceMask = 0xFF;
+			worldInst.InstanceID = 0;
+			worldInst.AccelerationStructure = g_ptDev.blas->GetGPUVirtualAddress();
+			instances.push_back( worldInst );
+			primBases.push_back( 0 );
+		}
+
+		for ( size_t ii = 0; ii < g_ptPropInstances.size(); ++ii )
+		{
+			const PtPropInstanceRec &rec = g_ptPropInstances[ii];
+			const int mi = PtFindPropModel( rec.modelIdx );
+			if ( mi < 0 || !g_ptPropBlas[mi] )
+				continue;
+			D3D12_RAYTRACING_INSTANCE_DESC inst = {};
+			for ( int r = 0; r < 3; ++r )
+				for ( int c = 0; c < 4; ++c )
+					inst.Transform[r][c] = rec.xform[r][c];
+			inst.InstanceMask = 0xFF;
+			inst.InstanceID = (UINT)( rec.propIndex & 0x00FFFFFF );
+			inst.AccelerationStructure = g_ptPropBlas[mi]->GetGPUVirtualAddress();
+			instances.push_back( inst );
+			primBases.push_back( g_ptPropModels[mi].triBase );
+		}
+		if ( instances.empty() )
+			return false;
+		g_ptDev.useInstancedAS = true;
+		Msg( "[PathTrace-DXR] Instanced AS: %u world tris, %d model BLASes, %d TLAS instances\n",
+			 nWorldTris, (int)g_ptPropModels.size(), (int)instances.size() );
+	}
+	else
+	{
+		D3D12_RAYTRACING_INSTANCE_DESC inst = {};
+		inst.Transform[0][0] = inst.Transform[1][1] = inst.Transform[2][2] = 1.0f;
+		inst.InstanceMask = 0xFF;
+		inst.AccelerationStructure = g_ptDev.blas->GetGPUVirtualAddress();
+		instances.push_back( inst );
+		primBases.push_back( 0 );
+	}
+
+	ComPtr<ID3D12Resource> primBaseUpload;
+	{
+		const UINT64 pbBytes = sizeof( uint32 ) * (UINT64)max( (size_t)1, primBases.size() );
+		if ( !PtCreateBuffer( pbBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+							  D3D12_RESOURCE_STATE_GENERIC_READ, &primBaseUpload, L"PT_PrimBaseUp" ) )
+			return false;
+		if ( !PtCreateBuffer( pbBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+							  D3D12_RESOURCE_STATE_COMMON, &g_ptDev.primBaseBuffer, L"PT_PrimBase" ) )
+			return false;
+		uint32 *p = nullptr;
+		primBaseUpload->Map( 0, nullptr, (void **)&p );
+		memcpy( p, primBases.data(), sizeof( uint32 ) * primBases.size() );
+		primBaseUpload->Unmap( 0, nullptr );
+		g_ptDev.list->CopyResource( g_ptDev.primBaseBuffer.Get(), primBaseUpload.Get() );
+		D3D12_RESOURCE_BARRIER pbBar = {};
+		pbBar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		pbBar.Transition.pResource = g_ptDev.primBaseBuffer.Get();
+		pbBar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		pbBar.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		pbBar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		g_ptDev.list->ResourceBarrier( 1, &pbBar );
+		g_ptDev.primBaseCount = (uint32)primBases.size();
+	}
 
 	ComPtr<ID3D12Resource> instUpload;
-	if ( !PtCreateBuffer( sizeof( inst ), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+	const UINT64 instBytes = sizeof( D3D12_RAYTRACING_INSTANCE_DESC ) * (UINT64)instances.size();
+	if ( !PtCreateBuffer( instBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
 						  D3D12_RESOURCE_STATE_GENERIC_READ, &instUpload, L"PT_InstUpload" ) )
 		return false;
 	{
 		void *p = nullptr;
 		instUpload->Map( 0, nullptr, &p );
-		memcpy( p, &inst, sizeof( inst ) );
+		memcpy( p, instances.data(), (size_t)instBytes );
 		instUpload->Unmap( 0, nullptr );
 	}
 
 	D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasIn = {};
 	tlasIn.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
 	tlasIn.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-	tlasIn.NumDescs = 1;
+	tlasIn.NumDescs = (UINT)instances.size();
 	tlasIn.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
 	tlasIn.InstanceDescs = instUpload->GetGPUVirtualAddress();
 
@@ -586,6 +794,8 @@ bool PathTraceDXR_DeviceInit( int adapterIndex )
 	tlasBuild.ScratchAccelerationStructureData = tlasScratch->GetGPUVirtualAddress();
 	g_ptDev.list->BuildRaytracingAccelerationStructure( &tlasBuild, 0, nullptr );
 
+	D3D12_RESOURCE_BARRIER uavBarrier = {};
+	uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
 	uavBarrier.UAV.pResource = g_ptDev.tlas.Get();
 	g_ptDev.list->ResourceBarrier( 1, &uavBarrier );
 
@@ -700,6 +910,10 @@ void PathTraceDXR_DeviceShutdown()
 	g_ptDev.tlas.Reset();
 	g_ptDev.vertexBuffer.Reset();
 	g_ptDev.flagBuffer.Reset();
+	g_ptDev.primBaseBuffer.Reset();
+	g_ptDev.primBaseCount = 0;
+	g_ptDev.useInstancedAS = false;
+	g_ptPropBlas.clear();
 	g_ptDev.list.Reset();
 	g_ptDev.alloc.Reset();
 	g_ptDev.queue.Reset();
@@ -1001,7 +1215,8 @@ bool PathTraceDXR_TraceClosest( const Vector *origins, const Vector *dirs, const
 		return false;
 
 	// Large batches: DXR RayQuery (Frostbite/Bakery style). Tiny batches: SSE (avoids submit overhead).
-	if ( g_ptDev.ready && nRays >= (int)kPtGpuMinRays )
+	// Instanced prop TLAS needs PrimBase remap in the RayQuery CS — keep SSE for that path.
+	if ( g_ptDev.ready && nRays >= (int)kPtGpuMinRays && !g_ptDev.useInstancedAS )
 	{
 		if ( PathTraceDXR_TraceClosest_GPU( origins, dirs, tmins, tmaxs, outT, outFlags, outHit, outNormal, nRays ) )
 			return true;

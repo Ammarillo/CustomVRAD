@@ -71,7 +71,7 @@ struct PtGpuBakeLuxel
 	float		padV;
 	int			faceNum;
 	int			aaN;		// 1..5
-	int			pad0;
+	int			skipPropIndex;	// -1 = allow self-shadow; >=0 skip TRACE_ID_STATICPROP|id
 	int			pad1;
 };
 
@@ -101,6 +101,7 @@ struct PtGpuBakeParams
 	uint32_t	bounceVolCount;	// light_bounce_vol count
 	float		cliBounceBoost;
 	float		cliBounceChroma;
+	uint32_t	spectralMode;	// 1 = hero-wavelength Smits+CIE
 };
 
 // GPU copy of LightEnvVolumeInfo_t (AABB + blend + shadow + bounce tint).
@@ -151,10 +152,17 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 								 PtGpuBakeResult *outResults );
 
 void PathTraceDXR_GpuBakeEnd();
+bool PathTraceDXR_GpuBakeIsActive();
+
+// Emit one summary for all-dark GPU batches accumulated since last Begin (then clear).
+void PathTraceDXR_ReportGpuBakeDarkStats( const char *phase );
 
 uint32_t PathTraceDXR_CapturedTriCount();
 
 // Triangle TRACE_ID_* captured before KD convert (safe after SetupAccelerationStructure).
 uint32_t PathTraceDXR_CapturedTriFlags( uint32_t triIndex );
+
+// World-space (or local for prop-model) verts for albedo / debug.
+bool PathTraceDXR_GetCapturedTri( uint32_t triIndex, Vector &a, Vector &b, Vector &c, uint32_t *outFlags );
 
 #endif

@@ -22,12 +22,12 @@ Compatible lightmap / BSP lighting output for the engine. Experimental — valid
 | Cross-face bounce weld | bake | Opt-in (`-bounce_weld`): edge-weighted bounce across coplanar seams |
 | Lightmap seam stitching | bake | Blends luxels across coplanar VBSP face splits (`-nostitch` to disable) |
 | `-gpu` | CLI | OpenCL bounce gather; sky occlusion stays CPU with `-TextureShadows` |
-| `-pathtrace` / `-dxr` | CLI | D3D12 DXR path-traced world lightmaps (GPU baker + `$vrad_emit` area lights) |
+| `-pathtrace` / `-dxr` | CLI | D3D12 DXR path-traced world + static-prop lightmaps (GPU baker + `$vrad_emit` area lights) |
 | `-config` / `-cfg` | CLI | Load a text preset of VRAD flags (keeps Hammer compile strings short) |
 | `-coarse` / `-adaptivechop` / `-texbounce` / `-energy` / `-cavity` / `-maxtransfer` / `-bounce_soft` / `-bounce_boost` / `-bounce_chroma` | CLI | Faster / tunable radiosity (`-energy` cavity damp opt-in) |
 | VMT `$vrad_emit*` | material | Textured emission; pathtrace uses PBRT-style area mesh NEE |
 | VMT `$vrad_filter*` | material | Colored glass light transmission (pathtrace CPU + GPU) |
-| Prop lighting speedups | bake | 4-wide SSE direct + GPU-culled bounce for `-StaticPropLighting` |
+| Prop lighting speedups | bake | 4-wide SSE direct + GPU-culled bounce; `-pathtrace` GPU PathLi for props |
 | Threading | runtime | Auto core detect (incl. >64), up to **256** threads |
 
 Stock VRAD flags (`-hdr`, `-final`, `-StaticPropLighting`, `-textureshadows`, etc.) still work. Run `vrad.exe` with no args for the stock help text. Full CLI tables: [VRAD CLI reference](#vrad-cli-reference--all-parameters).
@@ -235,7 +235,7 @@ Without `-gpu`, everything falls back to CPU.
 | `-bounce_soft N` | Bounce luxel splat scale (default `1` = stock) |
 | `-bounce_weld` | Opt-in: cull distant coplanar neighbor bounce (can blotch ceilings; **off by default**) |
 | `-bounce_boost N` | **Artistic** scale of final bounced light after radiosity (`1` = stock; `0`–`16`). Direct lights unchanged. Does not compound across bounces. |
-| `-bounce_chroma N` | **Artistic** early-bounce saturation (`0` = off; `0`–`8`). Keeps luminance; strongest on bounce #1. Use with `-texbounce`. Overridable per-area via `light_bounce_vol`. |
+| `-bounce_chroma N` | **Artistic** early-bounce saturation (`0` = off; `0`–`8`). Keeps luminance; strongest on bounce #1. Use with `-texbounce`. Overridable per-area via `light_bounce_vol`. **Ignored by `-pathtrace`** (linear RGB × texbounce). |
 | `-nostitch` | Disable lightmap seam stitching across coplanar face splits |
 | `-edgepull [N]` | **On by default** — pull edge luxel samples inward (`N` luxels, default `0.5`). Reduces black strips on thin walls / door jambs |
 | `-noedgepull` | Stock Valve sample positions (no edge inset) |
@@ -338,6 +338,7 @@ CustomVRAD speedups on top of stock prop vertex lighting:
 - **4 vertices per SSE gather** for direct light (stock duplicated one vert across all lanes)
 - **GPU bounce-ray culling** with `-gpu` (sky / miss rays skip the BSP lightmap walk)
 - **Cleaner bounce on props** — bilinear luxel reads + cheap vertex soften (keeps stock-fast sample counts)
+- **`-pathtrace` + `-StaticPropLighting`** — GPU pathtraces props: **lightmap texels** match world spp/bounces/NEE; **vertex** lighting samples a virtual per-triangle lightmap (`-pt_prop_vertgrid`, default **4**) and barycentric-weights those samples onto verts (denoiser-friendly spatial filter; `0` = old noisy per-vert). Multi-LOD models inherit the same vertex/texel colors on every LOD (shared studio verts + nearest-lit fill). Override spp/bounces with `-pt_prop_samples` / `-pt_prop_bounces`. CPU gather fallback if DXR bake fails.
 
 Quality flags like `-StaticPropPolys` / `-TextureShadows` still apply and are expensive — drop them for preview compiles.
 
@@ -345,7 +346,9 @@ Quality flags like `-StaticPropPolys` / `-TextureShadows` still apply and are ex
 
 ## Path tracing (`-pathtrace` / `-dxr`)
 
-Optional **D3D12 DXR** baker that replaces stock `BuildFacelights` + radiosity bounce for **world faces** (direct + multi-bounce GI + sky, soft lights, textured `$vrad_emit*` area lights). Props / leaf ambient stay on the stock path. Falls back to radiosity if DXR init fails.
+Optional **D3D12 DXR** baker that replaces stock `BuildFacelights` + radiosity bounce for **world faces** (direct + multi-bounce GI + sky, soft lights, textured `$vrad_emit*` area lights). With **`-StaticPropLighting`**, the same GPU PathLi pass also bakes static prop vertex/lightmap samples. Leaf ambient / detail props stay on the stock path. Falls back to radiosity (world) or CPU prop gather if DXR init/bake fails.
+
+**Colored light (physical):** default **`-pt_spectral`** — hero-wavelength path transport (Smits 1999 RGB→spectrum via PBRT tables, CIE 1931 XYZ → linear sRGB). Lights and albedo multiply in λ-space so colored bounce mixes like a spectral renderer, then projects back for lightmaps. Use **`-pt_nospectral`** for linear RGB. Firefly clamp is luminance-preserving on all bounces; artistic chroma/env tint ignored.
 
 Default bake path is the **GPU RayQuery luxel baker** (`-pt_gpu`). Use `-pt_cpu` for the SSE CPU integrator.
 
@@ -429,11 +432,14 @@ Also see [`configs/full.cfg`](configs/full.cfg) (same flags, commented for toggl
 
 | Parameter | Description |
 |-----------|-------------|
-| `-pathtrace` / `-dxr` | Path-traced world lightmaps (replaces BuildFacelights + world radiosity) |
+| `-pathtrace` / `-dxr` | Path-traced world (+ prop) lightmaps (replaces BuildFacelights + world radiosity) |
 | `-pt_gpu` | GPU RayQuery luxel baker (default when DXR ready) |
 | `-pt_cpu` | Force CPU SSE path tracer (full soft-shadow path) |
 | `-pt_samples N` | Samples per luxel (CLI default **4** / **2** `-fast` / **8** `-final`; max **4096**; configs often **256**–**1024**) |
-| `-pt_bounces N` | Indirect hops after the luxel (default **2**; **1** `-fast`; max **16**) |
+| `-pt_bounces N` | Indirect hops after the luxel (**0** = direct+sky only; default **3**; **1** `-fast`; max **16**) |
+| `-pt_prop_samples N` | Prop spp (default **max(8, pt_samples/4)**) |
+| `-pt_prop_bounces N` | Prop indirect hops (**0** = direct+sky; default **same as `-pt_bounces`**) |
+| `-pt_prop_vertgrid N` | Virtual triangle lightmap edge subdiv for vertex lighting (default **4**; **0** = one sample/vert) |
 | `-pt_aa N` | Luxel footprint AA grid **1**–**5** (`1` = off; default **3**) |
 | `-pt_lights N` | Local point/spot NEE samples (`0` = all; sky always all) |
 | `-pt_emit_samples N` | `$vrad_emit` **area** NEE samples (`0` = all tris; default **64**; higher = less noise) |
@@ -587,6 +593,10 @@ vrad.exe -ao -ao_samples 32 -ao_distance 64 -ao_strength 0.85 -ao_denoise -gpu -
 ## Build (Windows)
 
 **Needs:** Visual Studio 2022 (Desktop C++, MSVC v143, Windows 10/11 SDK). OpenCL SDK/ICD only if you use `-gpu`.
+
+**Recommended:** run `build.ps1` at the repo root. It always does a full rebuild of `vrad_dll` (no stale object files — a mixed incremental build once produced a DLL that crashed mid-bake), auto-picks an MSBuild with the v143 toolset, and verifies `bin\vrad_dll.dll` was actually written. `.\build.ps1 -Incremental` for fast iteration only.
+
+Manual alternative:
 
 1. Open `src/Source GPU compiles tool (L-I).sln`
 2. Build **Release | x64**

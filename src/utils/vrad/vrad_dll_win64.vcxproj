@@ -389,6 +389,7 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClCompile Include="vrad_emit_area.cpp" />
     <ClCompile Include="vrad_filter.cpp" />
     <ClCompile Include="absorb.cpp" />
+    <ClCompile Include="pt_spectral_hlsl.cpp" />
     <ClCompile Include="pathtrace_dxr.cpp" />
     <ClCompile Include="pathtrace_dxr_device.cpp" />
     <ClCompile Include="pathtrace_oidn.cpp" />

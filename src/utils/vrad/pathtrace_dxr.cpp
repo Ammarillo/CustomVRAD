@@ -1,4 +1,4 @@
-﻿//========= Copyright CustomVRAD contributors. ============//
+//========= Copyright CustomVRAD contributors. ============//
 //
 // DXR path-traced world-face lightmap baker (-pathtrace / -dxr).
 // Hardware closest-hit via DXR RayQuery; path integration on CPU with
@@ -22,6 +22,7 @@
 #include "vrad_filter.h"
 #include "oklab.h"
 #include "bsplib.h"
+#include "pt_spectral.h"
 #include "worldsize.h"
 #include "coordsize.h"
 #include "tier0/dbg.h"
@@ -43,7 +44,7 @@
 bool	g_bPathTraceRequested = false;
 bool	g_bPathTraceActive = false;
 int		g_nPathTraceSamples = 0;	// 0 = auto
-int		g_nPathTraceBounces = 0;	// 0 = auto
+int		g_nPathTraceBounces = -1;	// -1 = auto; 0 = direct+sky only
 int		g_nPathTraceDevice = -1;
 bool	g_bPathTraceDenoise = false;	// opt-in (-pt_denoise)
 int		g_nPathTraceDenoiseRadius = 3;	// Sakai spatial radius (OIDN/OptiX ignore)
@@ -51,6 +52,10 @@ float	g_flPathTraceDenoiseStrength = 1.0f;	// blend noisy→denoised (1 = full)
 int		g_nPathTraceLuxelAA = 3;	// 1=off .. 5=5x5 free spatial AA
 int		g_nPathTraceLightSamples = 0;	// 0 = evaluate all local lights (legacy)
 int		g_nPathTraceEmitSamples = 64;	// $vrad_emit area NEE samples (0 = all tris)
+int		g_nPathTracePropSamples = 0;	// 0 = auto (max(8, world_spp/4))
+int		g_nPathTracePropBounces = -1;	// -1 = auto (match world); 0 = direct+sky
+int		g_nPathTracePropVertGrid = 4;	// barycentric edge subdiv; OIDN can't denoise sparse verts
+bool	g_bPathTraceSpectral = true;	// hero-wavelength Smits+CIE (default on)
 float	g_flPtLightRadius = 0.0f;	// soft disk for light/light_spot (0 = hard)
 float	g_flPtLightPenumbra = 1.0f;	// CHSS growth scale
 int		g_nPtSoftSamples = 16;		// max soft visibility rays per NEE
@@ -1156,7 +1161,7 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 		Vector nee = PtSampleDirect( pos, normal,
 									 seed + (unsigned)bounce * 31u + (unsigned)sppIndex * 17u,
 									 &sunB, skipFace, neeFlags );
-		nee = PtClampFirefly( nee, bounce == 0 ? 2500.0f : 400.0f );
+		nee = PtClampFirefly( nee, 2500.0f );
 		radiance += throughput * nee;
 		if ( bounce == 0 )
 			sunAmt = sunB;
@@ -1227,7 +1232,7 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 		if ( !bHit )
 		{
 			// Sky only via BSDF (no skyambient NEE) → weight 1.
-			radiance += PtClampFirefly( throughput * PtSampleSkyAmbient( pos, dir ), 400.0f );
+			radiance += PtClampFirefly( throughput * PtSampleSkyAmbient( pos, dir ), 2500.0f );
 			break;
 		}
 
@@ -1245,25 +1250,28 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 			 PtSurfaceEmissionContrib( pos, normal, hitPos, hitNormal, skipFace, emitContrib, pdfLight ) )
 		{
 			const float mis = PtMisWeight( pdfBsdf, pdfLight );
-			radiance += PtClampFirefly( throughput * emitContrib * mis, bounce == 0 ? 2500.0f : 400.0f );
+			radiance += PtClampFirefly( throughput * emitContrib * mis, 2500.0f );
 			break; // emitters terminate the path
 		}
 
-		Vector albedo = PtGetHitAlbedo( hitPos, hitNormal, true, true, (int)bounce );
+		Vector albedo = PtGetHitAlbedo( hitPos, hitNormal, true, false, (int)bounce );
 		albedo *= Absorb_BounceScale( hitPos, pos );
-		albedo.x = min( 0.92f, max( 0.0f, albedo.x ) );
-		albedo.y = min( 0.92f, max( 0.0f, albedo.y ) );
-		albedo.z = min( 0.92f, max( 0.0f, albedo.z ) );
+		// Energy scale only (light_bounce_vol / -bounce_boost). No -bounce_chroma —
+		// Oklab sat boost is artistic and breaks physical colored transport.
+		{
+			BounceVolSettings_t bv;
+			BounceVol_Resolve( hitPos, bv );
+			albedo *= bv.boost;
+		}
+		// PBRT: diffuse ρ ∈ [0,1] per channel (energy-conserving reflectance).
+		albedo.x = min( 1.0f, max( 0.0f, albedo.x ) );
+		albedo.y = min( 1.0f, max( 0.0f, albedo.y ) );
+		albedo.z = min( 1.0f, max( 0.0f, albedo.z ) );
 
-		// Lambert + cosine sampling ⇒ throughput *= albedo.
+		// Lambert + cosine sampling ⇒ throughput *= albedo (linear RGB × texbounce).
 		throughput *= albedo;
 
-		if ( LightEnv_HasInboundBounceTinting() )
-		{
-			int recvEnv = LightEnv_GetDominantEnvId( posIn );
-			int emitEnv = LightEnv_GetDominantEnvId( hitPos );
-			LightEnv_MaybeTintInboundBounce( recvEnv, emitEnv, throughput );
-		}
+		// light_env_vol inbound Oklab tint is artistic — skip for physical RGB transport.
 
 		// Russian roulette after first bounce (Veach efficiency-optimized style).
 		if ( bounce >= 1 )
@@ -1738,6 +1746,46 @@ static void PtFormatDuration( int totalSec, char *buf, int bufSize )
 		Q_snprintf( buf, bufSize, "%d:%02d", m, s );
 }
 
+// In-place progress line (\r overwrite). Finish with bFinish=true to emit newline.
+static int g_ptProgressLineLen = 0;
+
+static void PtEndProgressLine()
+{
+	if ( g_ptProgressLineLen <= 0 )
+		return;
+	Msg( "\n" );
+	fflush( stdout );
+	g_ptProgressLineLen = 0;
+}
+
+static void PtProgressLine( bool bFinish, const char *text )
+{
+	char line[700];
+	const int len = (int)V_strlen( text );
+	int padTo = ( g_ptProgressLineLen > len ) ? g_ptProgressLineLen : len;
+	if ( padTo > (int)sizeof( line ) - 8 )
+		padTo = (int)sizeof( line ) - 8;
+
+	int n = 0;
+	line[n++] = '\r';
+	for ( int i = 0; i < len && n < (int)sizeof( line ) - 2; ++i )
+		line[n++] = text[i];
+	while ( ( n - 1 ) < padTo && n < (int)sizeof( line ) - 2 )
+		line[n++] = ' ';
+	line[n] = '\0';
+	Msg( "%s", line );
+	if ( bFinish )
+	{
+		Msg( "\n" );
+		g_ptProgressLineLen = 0;
+	}
+	else
+	{
+		g_ptProgressLineLen = len;
+	}
+	fflush( stdout );
+}
+
 // Cheap pre-pass: luxels we expect to bake (lightmap grid; skips invisible / special / no-patch).
 static int PtEstimateFaceLuxels( int facenum )
 {
@@ -1788,7 +1836,7 @@ static int PtEstimateTotalLuxels()
 	return total;
 }
 
-// Rate-limited console progress (Hammer-friendly newlines, ~1 Hz).
+// Rate-limited in-place console progress (~1 Hz, \r overwrite).
 // ETA is luxel-work based with EMA rate + smoothed remaining time (faces vary wildly in cost).
 static void PtReportProgress( bool bForce )
 {
@@ -1823,7 +1871,7 @@ static void PtReportProgress( bool bForce )
 		luxelTotal = 1;
 
 	// Prefer luxel work for % (empty faces finish instantly and skew face %).
-	const float pct = ( luxelsDone > 0 || done >= g_ptFaceTotal )
+	float pct = ( luxelsDone > 0 || done >= g_ptFaceTotal )
 		? ( 100.0f * (float)luxelsDone / (float)luxelTotal )
 		: ( g_ptFaceTotal > 0 ? ( 100.0f * (float)done / (float)g_ptFaceTotal ) : 0.0f );
 
@@ -1908,19 +1956,28 @@ static void PtReportProgress( bool bForce )
 		}
 	}
 
-	if ( bShowEta )
+	const bool doneAll = ( done >= g_ptFaceTotal ) || ( luxelsDone >= luxelTotal && g_ptFaceTotal > 0 );
+	const bool finish = bForce || ( !bBaking && doneAll );
+	// Snap to 100% only when work is actually complete.
+	if ( finish && doneAll && pct < 100.0f )
+		pct = 100.0f;
+
+	char line[512];
+	if ( bShowEta && !finish )
 	{
 		char etaStr[32];
 		PtFormatDuration( etaSec, etaStr, sizeof( etaStr ) );
-		Msg( "[PathTrace-DXR] %5.1f%%  %d / %d faces  (%d lit, %d / %d luxels)  %s elapsed  ~%s left\n",
-			 pct, done, g_ptFaceTotal, baked, luxelsDone, luxelTotal, elapsedStr, etaStr );
+		Q_snprintf( line, sizeof( line ),
+					"[PathTrace-DXR] %5.1f%%  %d / %d faces  (%d lit, %d / %d luxels)  %s elapsed  ~%s left",
+					pct, done, g_ptFaceTotal, baked, luxelsDone, luxelTotal, elapsedStr, etaStr );
 	}
 	else
 	{
-		Msg( "[PathTrace-DXR] %5.1f%%  %d / %d faces  (%d lit, %d / %d luxels)  %s elapsed\n",
-			 pct, done, g_ptFaceTotal, baked, luxelsDone, luxelTotal, elapsedStr );
+		Q_snprintf( line, sizeof( line ),
+					"[PathTrace-DXR] %5.1f%%  %d / %d faces  (%d lit, %d / %d luxels)  %s elapsed",
+					pct, done, g_ptFaceTotal, baked, luxelsDone, luxelTotal, elapsedStr );
 	}
-	fflush( stdout );
+	PtProgressLine( finish, line );
 }
 static bool PtFaceIsBakeable( int facenum )
 {
@@ -2207,31 +2264,52 @@ static void PtBuildTriAlbedo( std::vector<float> &rgb )
 {
 	const uint32_t n = PathTraceDXR_CapturedTriCount();
 	rgb.assign( (size_t)n * 3u, 0.45f );
-	const int nEnv = g_RtEnv.OptimizedTriangleList.Count();
-	// Raw albedo only — GPU ApplyBounceVolAlbedo applies boost/chroma with falloff.
-	// Use -texbounce colors when enabled so -bounce_chroma has chroma to boost.
-	const bool bTex = g_bTexturedBounce;
-	if ( g_flBounceChroma > 0.0f && !bTex )
+
+	// Physical GI: per-triangle albedo from -texbounce ($basetexture). Must use captured
+	// g_ptTris positions (OptimizedTriangleList indices diverge when props are instanced).
+	if ( !g_bTexturedBounce )
 	{
-		Warning( "[PathTrace-DXR] -bounce_chroma %.2f with no -texbounce: flat reflectivity is often near-grey — "
-				 "chroma will be weak. Enable -texbounce.\n", g_flBounceChroma );
+		g_bTexturedBounce = true;
+		Msg( "[PathTrace-DXR] Enabling -texbounce for physical colored bounce.\n" );
 	}
-	if ( bTex )
-		BounceAlbedo_EnsureCache();
-	for ( uint32_t i = 0; i < n && (int)i < nEnv; ++i )
+	BounceAlbedo_EnsureCache();
+
+	int nTex = 0, nFlat = 0, nProp = 0;
+	for ( uint32_t i = 0; i < n; ++i )
 	{
-		const CacheOptimizedTriangle &tri = g_RtEnv.OptimizedTriangleList[i];
-		Vector centroid = ( tri.Vertex( 0 ) + tri.Vertex( 1 ) + tri.Vertex( 2 ) ) * ( 1.0f / 3.0f );
+		Vector a, b, c;
+		uint32_t flags = 0;
+		if ( !PathTraceDXR_GetCapturedTri( i, a, b, c, &flags ) )
+			continue;
+
+		// Unique-model prop meshes are local-space; keep neutral albedo (shadow casters).
+		if ( flags & TRACE_ID_STATICPROP )
+		{
+			rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 0.40f;
+			++nProp;
+			continue;
+		}
+
+		Vector centroid = ( a + b + c ) * ( 1.0f / 3.0f );
 		Vector nrm;
-		Vector e1 = tri.Vertex( 1 ) - tri.Vertex( 0 );
-		Vector e2 = tri.Vertex( 2 ) - tri.Vertex( 0 );
+		Vector e1 = b - a;
+		Vector e2 = c - a;
 		CrossProduct( e1, e2, nrm );
-		VectorNormalize( nrm );
-		Vector alb = PtGetHitAlbedo( centroid, nrm, bTex, false, 0 );
+		if ( VectorNormalize( nrm ) < 1e-6f )
+			nrm.Init( 0, 0, 1 );
+
+		// Raw texture/reflectivity only — no -bounce_chroma (that is artistic Oklab sat).
+		Vector alb = PtGetHitAlbedo( centroid, nrm, true, false, 0 );
 		rgb[i * 3 + 0] = alb.x;
 		rgb[i * 3 + 1] = alb.y;
 		rgb[i * 3 + 2] = alb.z;
+		if ( g_bTexturedBounce && ( alb.x != alb.y || alb.y != alb.z ) )
+			++nTex;
+		else
+			++nFlat;
 	}
+	Msg( "[PathTrace-DXR] Tri albedo: %d textured, %d flat/grey, %d prop-model (neutral).\n",
+		 nTex, nFlat, nProp );
 }
 
 // Per-triangle $vrad_filter GPU meta + Texture2DArray of unique filter images.
@@ -2296,7 +2374,7 @@ static bool PathTraceBakeWorldFacesGPU()
 
 	PtGpuBakeParams params = {};
 	params.spp = 1; // real spp set per pass via GpuBakeConfigurePass
-	params.bounces = (uint32_t)max( 1, g_ptBounces );
+	params.bounces = (uint32_t)max( 0, g_ptBounces );
 	params.lightSamples = (uint32_t)max( 0, g_nPathTraceLightSamples );
 	params.softSamplesMax = (uint32_t)max( 1, g_nPtSoftSamples );
 	params.occludeBias = g_flPtOccludeBias;
@@ -2337,7 +2415,16 @@ static bool PathTraceBakeWorldFacesGPU()
 	params.defaultBounceIntensity = LightEnv_GetDefaultBounceIntensity();
 	params.bounceVolCount = (uint32_t)max( 0, BounceVol_VolumeCount() );
 	params.cliBounceBoost = g_flBounceBoost;
-	params.cliBounceChroma = g_flBounceChroma;
+	// Pathtrace keeps linear RGB light×albedo. -bounce_chroma is artistic Oklab sat — ignore.
+	params.cliBounceChroma = 0.0f;
+	params.spectralMode = g_bPathTraceSpectral ? 1u : 0u;
+	if ( g_flBounceChroma > 0.0f )
+	{
+		Msg( "[PathTrace-DXR] Ignoring -bounce_chroma %.2f (artistic). Bounce uses -texbounce albedo in linear RGB.\n",
+			 g_flBounceChroma );
+	}
+	if ( params.spectralMode )
+		Msg( "[PathTrace-DXR] Spectral transport: 4 stratified wavelengths/path (compact RGB lobes + CIE).\n" );
 	if ( params.envVolCount > 0 )
 		Msg( "[PathTrace-DXR] GPU light_env_vol: %u volume(s) — weighted sky/ambient, shadow filters, BounceVol tint\n",
 			 params.envVolCount );
@@ -2577,6 +2664,7 @@ static bool PathTraceBakeWorldFacesGPU()
 				job.axisV[2] = l.luxelToWorldSpace[1].z;
 				job.faceNum = facenum;
 				job.aaN = aaN;
+				job.skipPropIndex = -1;
 				jobs.push_back( job );
 			}
 		}
@@ -2587,6 +2675,8 @@ static bool PathTraceBakeWorldFacesGPU()
 			if ( !flush() )
 			{
 				PathTraceDXR_GpuBakeEnd();
+				PtEndProgressLine();
+				PathTraceDXR_ReportGpuBakeDarkStats( "world lightmaps" );
 				return false;
 			}
 		}
@@ -2597,6 +2687,8 @@ static bool PathTraceBakeWorldFacesGPU()
 		if ( !flush() )
 		{
 			PathTraceDXR_GpuBakeEnd();
+			PtEndProgressLine();
+			PathTraceDXR_ReportGpuBakeDarkStats( "world lightmaps" );
 			return false;
 		}
 	}
@@ -2610,8 +2702,15 @@ static bool PathTraceBakeWorldFacesGPU()
 	}
 
 	PathTraceDXR_GpuBakeEnd();
+	if ( g_bInterrupt )
+	{
+		PtEndProgressLine();
+		PathTraceDXR_ReportGpuBakeDarkStats( "world lightmaps" );
+		return false;
+	}
 	PtReportProgress( true );
-	return !g_bInterrupt;
+	PathTraceDXR_ReportGpuBakeDarkStats( "world lightmaps" );
+	return true;
 }
 
 bool PathTraceDXR_BakeWorldFaces()
@@ -2655,7 +2754,7 @@ bool PathTraceDXR_BakeWorldFaces()
 			g_ptSpp = 12;
 	}
 	g_ptBounces = g_nPathTraceBounces;
-	if ( g_ptBounces <= 0 )
+	if ( g_ptBounces < 0 )
 		g_ptBounces = do_fast ? 1 : 3;
 	if ( g_ptBounces > 16 )
 		g_ptBounces = 16;
@@ -2701,8 +2800,8 @@ bool PathTraceDXR_BakeWorldFaces()
 		Msg( "[PathTrace-DXR] ~%.1f luxels/lit-face - Hammer scale 2 should be high; if low, re-run VBSP.\n",
 			 (double)g_ptLuxelTotalEst / (double)g_ptBakeableFacesEst );
 	}
-	Msg( "[PathTrace-DXR] Progress updates ~1/sec (%% by luxel work, faces, ETA)...\n" );
-	PtReportProgress( true );
+	Msg( "[PathTrace-DXR] Progress updates ~1/sec on one line (%% by luxel work, faces, ETA)...\n" );
+	PtReportProgress( false );
 
 	bool bGpuOk = false;
 	bool bGpuAttempted = false;
@@ -2713,6 +2812,7 @@ bool PathTraceDXR_BakeWorldFaces()
 		bGpuOk = PathTraceBakeWorldFacesGPU();
 		if ( !bGpuOk && !g_bInterrupt )
 		{
+			PtEndProgressLine();
 			Warning( "[PathTrace-DXR] GPU bake failed after %d lit faces / %d luxels.\n",
 					 g_ptFacesBaked.load(), g_ptLuxelsBaked.load() );
 			// CPU path is ~50–200× slower; mid-bake fallback turns a 2‑min GPU job
@@ -2746,6 +2846,7 @@ bool PathTraceDXR_BakeWorldFaces()
 
 	if ( g_bInterrupt )
 	{
+		PtEndProgressLine();
 		Warning( "[PathTrace-DXR] Interrupted after %s (%d / %d faces, %d lit).\n",
 				 elapsedStr,
 				 g_ptFaceProgress.load(), g_ptFaceTotal,
@@ -2755,10 +2856,326 @@ bool PathTraceDXR_BakeWorldFaces()
 		return false;
 	}
 
-	PtReportProgress( true );
+	// GPU path already finished progress + dark stats; CPU path needs a final 100% line.
+	if ( !bGpuOk )
+		PtReportProgress( true );
 	PathTraceDenoise_Shutdown();
 	g_bPathTraceActive = true;
 	Msg( "[PathTrace-DXR] World-face path trace complete in %s - %d lit faces, %d luxels.\n",
 		 elapsedStr, g_ptFacesBaked.load(), g_ptLuxelsBaked.load() );
 	return true;
+}
+
+bool PathTraceDXR_CanBakeProps()
+{
+	return g_bPathTraceActive && g_bPathTraceGpu && !g_bPathTraceCpuForced && PathTraceDXR_DeviceReady();
+}
+
+static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int softSamplesMax, int emitSamples )
+{
+	std::vector<PtGpuBakeLight> lights;
+	PtPackGpuLights( lights );
+	if ( lights.empty() )
+		return false;
+
+	std::vector<float> albedo;
+	PtBuildTriAlbedo( albedo );
+	std::vector<float> filterMeta;
+	VRadFilterGpuArray_t filterArray;
+	PtBuildTriFilterGpu( filterMeta, filterArray );
+
+	PtGpuBakeParams params = {};
+	params.spp = 1;
+	params.bounces = (uint32_t)max( 0, bounces );
+	params.lightSamples = (uint32_t)max( 0, lightSamples );
+	params.softSamplesMax = (uint32_t)max( 1, softSamplesMax );
+	params.occludeBias = g_flPtOccludeBias;
+	params.maxTraceLen = (float)MAX_TRACE_LENGTH;
+	params.fireflyCap = 2500.0f;
+	params.penumbraScale = g_flPtLightPenumbra;
+	params.softMode = (uint32_t)( ( g_nPtSoftMode != 0 ) ? 1 : 0 );
+	params.triCount = PathTraceDXR_CapturedTriCount();
+	{
+		Vector skyAmb( 0, 0, 0 );
+		for ( size_t i = 0; i < lights.size(); ++i )
+		{
+			if ( lights[i].type > 3.5f )
+			{
+				skyAmb.x += lights[i].intensity[0];
+				skyAmb.y += lights[i].intensity[1];
+				skyAmb.z += lights[i].intensity[2];
+			}
+		}
+		params.skyAmb[0] = skyAmb.x;
+		params.skyAmb[1] = skyAmb.y;
+		params.skyAmb[2] = skyAmb.z;
+	}
+
+	std::vector<PtGpuEmitTri> emitGpu;
+	std::vector<float> emitCdf;
+	const int nEmitTris = VRadEmitArea_TriCount();
+	params.emitTriCount = (uint32_t)max( 0, nEmitTris );
+	params.emitSamples = (uint32_t)max( 0, emitSamples );
+	params.envVolCount = (uint32_t)max( 0, LightEnv_VolumeCount() );
+	params.defaultBounceIntensity = LightEnv_GetDefaultBounceIntensity();
+	params.bounceVolCount = (uint32_t)max( 0, BounceVol_VolumeCount() );
+	params.cliBounceBoost = g_flBounceBoost;
+	// Pathtrace keeps linear RGB light×albedo. -bounce_chroma is artistic Oklab sat — ignore.
+	params.cliBounceChroma = 0.0f;
+	params.spectralMode = g_bPathTraceSpectral ? 1u : 0u;
+	if ( g_flBounceChroma > 0.0f )
+	{
+		Msg( "[PathTrace-DXR] Ignoring -bounce_chroma %.2f (artistic). Bounce uses -texbounce albedo in linear RGB.\n",
+			 g_flBounceChroma );
+	}
+	if ( params.spectralMode )
+		Msg( "[PathTrace-DXR] Spectral transport: 4 stratified wavelengths/path (compact RGB lobes + CIE).\n" );
+	if ( nEmitTris > 0 )
+	{
+		const VRadEmitTri_t *src = VRadEmitArea_Tris();
+		const float *cdf = VRadEmitArea_PowerCdf();
+		emitGpu.resize( (size_t)nEmitTris );
+		emitCdf.resize( (size_t)nEmitTris );
+		for ( int i = 0; i < nEmitTris; ++i )
+		{
+			PtGpuEmitTri &D = emitGpu[i];
+			const VRadEmitTri_t &S = src[i];
+			D.v0[0] = S.v0.x; D.v0[1] = S.v0.y; D.v0[2] = S.v0.z; D.area = S.area;
+			D.v1[0] = S.v1.x; D.v1[1] = S.v1.y; D.v1[2] = S.v1.z; D.power = S.power;
+			D.v2[0] = S.v2.x; D.v2[1] = S.v2.y; D.v2[2] = S.v2.z; D.facenum = (float)S.facenum;
+			D.n[0] = S.n.x; D.n[1] = S.n.y; D.n[2] = S.n.z; D.padN = 0;
+			D.e0[0] = S.e0.x; D.e0[1] = S.e0.y; D.e0[2] = S.e0.z; D.pad0 = 0;
+			D.e1[0] = S.e1.x; D.e1[1] = S.e1.y; D.e1[2] = S.e1.z; D.pad1 = 0;
+			D.e2[0] = S.e2.x; D.e2[1] = S.e2.y; D.e2[2] = S.e2.z; D.pad2 = 0;
+			emitCdf[i] = cdf[i];
+		}
+	}
+
+	return PathTraceDXR_GpuBakeBegin( lights.data(), (uint32_t)lights.size(),
+									  albedo.data(), (uint32_t)( albedo.size() / 3 ), params,
+									  nEmitTris > 0 ? emitGpu.data() : nullptr,
+									  (uint32_t)nEmitTris,
+									  nEmitTris > 0 ? emitCdf.data() : nullptr,
+									  filterMeta.data(),
+									  filterArray.rgba.data(),
+									  (uint32_t)filterArray.width,
+									  (uint32_t)filterArray.height,
+									  (uint32_t)filterArray.layers );
+}
+
+bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamples,
+								   PtGpuBakeResult *outResults, bool bLightmapQuality,
+								   bool bEndSession, unsigned progressBase, unsigned progressTotal )
+{
+	if ( !PathTraceDXR_CanBakeProps() || !samples || !outResults || nSamples == 0 )
+		return false;
+
+	int spp, bounces, lightSamples, emitSamples, softSamplesMax;
+	const char *tag;
+	if ( bLightmapQuality )
+	{
+		// Same integrator settings as world brush luxels.
+		spp = max( 1, g_ptSpp );
+		bounces = max( 0, g_ptBounces );
+		if ( bounces > 16 ) bounces = 16;
+		lightSamples = max( 0, g_nPathTraceLightSamples );
+		emitSamples = max( 0, g_nPathTraceEmitSamples );
+		softSamplesMax = max( 1, g_nPtSoftSamples );
+		tag = "prop lightmaps";
+	}
+	else
+	{
+		spp = g_nPathTracePropSamples;
+		if ( spp <= 0 )
+			spp = max( 8, g_ptSpp / 4 );
+		if ( spp < 1 ) spp = 1;
+		if ( spp > 4096 ) spp = 4096;
+
+		// Match world bounce depth — indoor props need multi-bounce GI.
+		bounces = g_nPathTracePropBounces;
+		if ( bounces < 0 )
+			bounces = max( 0, g_ptBounces );
+		if ( bounces > 16 ) bounces = 16;
+
+		// Locals: bounce 0 always evaluates all lights (shader). Later bounces power-sample
+		// when LightSamples > 0. Default 32 keeps indoor direct correct without all×spp×bounce cost.
+		lightSamples = g_nPathTraceLightSamples;
+		if ( lightSamples <= 0 )
+			lightSamples = 32;
+		emitSamples = g_nPathTraceEmitSamples;
+		if ( emitSamples <= 0 )
+			emitSamples = 32;
+		softSamplesMax = 1;
+		tag = "prop verts";
+	}
+
+	const bool bNewSession = !PathTraceDXR_GpuBakeIsActive();
+	if ( bNewSession )
+	{
+		if ( !PathTraceBeginGpuBakeSession( bounces, lightSamples, softSamplesMax, emitSamples ) )
+		{
+			Warning( "[PathTrace-DXR] Prop GPU bake session failed (%s).\n", tag );
+			return false;
+		}
+		const unsigned showTotal = progressTotal > 0 ? progressTotal : nSamples;
+		Msg( "[PathTrace-DXR] GPU baking %s: %u samples (%d spp, %d bounces, pt_lights=%d%s)...\n",
+			 tag, showTotal, spp, bounces, lightSamples,
+			 bLightmapQuality ? "" : ", hard NEE" );
+		fflush( stdout );
+	}
+
+	int kBatch = 65536;
+	int sppChunk = ( spp > 32 ) ? 16 : max( 1, spp );
+	if ( spp >= 512 ) { kBatch = 16384; sppChunk = 8; }
+	if ( spp >= 1024 ) { kBatch = 8192; sppChunk = 4; }
+
+	std::vector<PtGpuBakeResult> temp( (size_t)kBatch );
+	std::vector<PtGpuBakeResult> pass( (size_t)kBatch );
+	// Accumulate directly into caller's outResults (avoid a second full-size buffer).
+	memset( outResults, 0, (size_t)nSamples * sizeof( PtGpuBakeResult ) );
+
+	const unsigned progTotal = progressTotal > 0 ? progressTotal : nSamples;
+	// Wall-clock for the whole stream (not each chunk).
+	static double s_propStreamStart = 0.0;
+	static long long s_propLastReportMs = 0;
+	if ( bNewSession || progressBase == 0 )
+	{
+		s_propStreamStart = Plat_FloatTime();
+		s_propLastReportMs = (long long)( s_propStreamStart * 1000.0 );
+	}
+
+	auto reportProp = [&]( unsigned localDone, bool bForce )
+	{
+		const double now = Plat_FloatTime();
+		const long long nowMs = (long long)( now * 1000.0 );
+		if ( !bForce && nowMs - s_propLastReportMs < 1000 )
+			return;
+		s_propLastReportMs = nowMs;
+
+		const unsigned overallDone = progressBase + localDone;
+		const unsigned showDone = ( overallDone > progTotal ) ? progTotal : overallDone;
+		const double elapsed = now - s_propStreamStart;
+		float pct = progTotal > 0 ? ( 100.0f * (float)showDone / (float)progTotal ) : 100.0f;
+		const bool streamDone = ( progressTotal > 0 )
+			? ( progressBase + nSamples >= progressTotal && localDone >= nSamples )
+			: ( localDone >= nSamples );
+		const bool finish = bForce && ( bEndSession || streamDone );
+		if ( finish )
+			pct = 100.0f;
+		char elapsedStr[32], etaStr[32];
+		PtFormatDuration( (int)elapsed, elapsedStr, sizeof( elapsedStr ) );
+		etaStr[0] = '\0';
+		if ( !finish && showDone > 0 && showDone < progTotal && elapsed > 1.0 )
+		{
+			const double rate = (double)showDone / elapsed;
+			const int etaSec = (int)( ( (double)( progTotal - showDone ) / max( rate, 1e-6 ) ) + 0.5 );
+			char tmp[32];
+			PtFormatDuration( etaSec, tmp, sizeof( tmp ) );
+			Q_snprintf( etaStr, sizeof( etaStr ), "  ~%s left", tmp );
+		}
+		char line[512];
+		Q_snprintf( line, sizeof( line ),
+					"[PathTrace-DXR] %s  %5.1f%%  %u / %u  %s elapsed%s",
+					tag, pct, finish ? progTotal : showDone, progTotal, elapsedStr, etaStr );
+		PtProgressLine( finish, line );
+	};
+
+	bool ok = true;
+	for ( unsigned base = 0; base < nSamples && ok && !g_bInterrupt; base += (unsigned)kBatch )
+	{
+		const unsigned n = min( (unsigned)kBatch, nSamples - base );
+		for ( unsigned i = 0; i < n; ++i )
+		{
+			temp[i].radiance[0] = temp[i].radiance[1] = temp[i].radiance[2] = 0.0f;
+			temp[i].sunAmt = 0.0f;
+		}
+		for ( int so = 0; so < spp && ok; so += sppChunk )
+		{
+			const int nPass = min( sppChunk, spp - so );
+			PathTraceDXR_GpuBakeConfigurePass( (uint32_t)nPass, (uint32_t)so );
+			if ( !PathTraceDXR_GpuBakeLuxels( samples + base, n, pass.data() ) )
+			{
+				ok = false;
+				break;
+			}
+			const float w = (float)nPass;
+			for ( unsigned i = 0; i < n; ++i )
+			{
+				temp[i].radiance[0] += pass[i].radiance[0] * w;
+				temp[i].radiance[1] += pass[i].radiance[1] * w;
+				temp[i].radiance[2] += pass[i].radiance[2] * w;
+				temp[i].sunAmt += pass[i].sunAmt * w;
+			}
+			{
+				const double sppFrac = (double)( so + nPass ) / (double)spp;
+				const unsigned approxDone = base + (unsigned)( (double)n * sppFrac );
+				reportProp( min( approxDone, nSamples ), false );
+			}
+		}
+		const float inv = 1.0f / (float)spp;
+		for ( unsigned i = 0; i < n; ++i )
+		{
+			outResults[base + i].radiance[0] = temp[i].radiance[0] * inv;
+			outResults[base + i].radiance[1] = temp[i].radiance[1] * inv;
+			outResults[base + i].radiance[2] = temp[i].radiance[2] * inv;
+			outResults[base + i].sunAmt = temp[i].sunAmt * inv;
+		}
+		reportProp( min( base + n, nSamples ), false );
+	}
+
+	if ( !ok || g_bInterrupt )
+	{
+		PtEndProgressLine();
+		if ( bEndSession || !ok || g_bInterrupt )
+		{
+			PathTraceDXR_GpuBakeEnd();
+			PathTraceDXR_ReportGpuBakeDarkStats( tag );
+		}
+		return false;
+	}
+
+	reportProp( nSamples, true );
+	if ( bEndSession )
+	{
+		PathTraceDXR_GpuBakeEnd();
+		PathTraceDXR_ReportGpuBakeDarkStats( tag );
+		Msg( "[PathTrace-DXR] %s complete (%u samples).\n", tag, progTotal > 0 ? progTotal : nSamples );
+		fflush( stdout );
+	}
+	return true;
+}
+
+void PathTraceDXR_PropBakeClose( const char *tag, unsigned totalSamples )
+{
+	const char *t = tag ? tag : "prop bake";
+	if ( g_ptProgressLineLen > 0 )
+	{
+		char line[512];
+		Q_snprintf( line, sizeof( line ),
+					"[PathTrace-DXR] %s  100.0%%  %u / %u",
+					t, totalSamples, totalSamples );
+		PtProgressLine( true, line );
+	}
+	else
+	{
+		PtEndProgressLine();
+	}
+	if ( PathTraceDXR_GpuBakeIsActive() )
+	{
+		PathTraceDXR_GpuBakeEnd();
+		PathTraceDXR_ReportGpuBakeDarkStats( t );
+	}
+	Msg( "[PathTrace-DXR] %s complete (%u samples).\n", t, totalSamples );
+	fflush( stdout );
+}
+
+void PathTraceDXR_PropBakeSuspend( const char *tag )
+{
+	const char *t = tag ? tag : "prop bake";
+	PtEndProgressLine();
+	if ( PathTraceDXR_GpuBakeIsActive() )
+	{
+		PathTraceDXR_GpuBakeEnd();
+		PathTraceDXR_ReportGpuBakeDarkStats( t );
+	}
 }

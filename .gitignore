@@ -57,3 +57,79 @@ bin/
 
 # Local map test assets (not for distribution)
 map_test/
+
+# ---------------------------------------------------------------------------
+# Local / generated — keep out of GitHub
+# ---------------------------------------------------------------------------
+
+# Visual Studio / MSVC extras
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+ipch/
+*.aps
+*.ncb
+*.opensdf
+*.sdf
+*.ilk
+*.iobj
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.temp
+*_i.c
+*_p.c
+*.idb
+
+# Editor / OS junk
+*~
+*.bak
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Patch / merge / backup leftovers from local experiments
+*.orig
+*.rej
+*.patch
+*.head
+*.inl.head
+
+# Local benchmarks / scratch notes
+_bench_*.txt
+*.bench.txt
+
+# LaTeX build products (keep *.tex sources)
+*.aux
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.synctex(busy)
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
+*.bcf
+*.run.xml
+docs/*.pdf
+/algorithms.pdf
+
+# Downloaded third-party SDKs (fetch locally; see thirdparty READMEs)
+# OIDN binaries are also covered by *.dll / *.lib above; ignore the whole tree.
+thirdparty/oidn/
+thirdparty/oidn-*/
