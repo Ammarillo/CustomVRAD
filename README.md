@@ -20,7 +20,7 @@ Compatible lightmap / BSP lighting output for the engine. Experimental — valid
 | `light_absorb` | brush entity | Volumes that damp bounce (and optional direct) light |
 | `light_volume` | point entity | Soft sphere point light (scattered origins, like soft sun) |
 | `light_spot` `IES` / `IESScale` / `IESBrightness` / `IESMaxIntensity` | entity keys | IESNA LM-63 photometric intensity for spots (bake-only; replaces cone angles) |
-| `light_spot` `ProjectedTexture` | entity key | Planar, cubemap, or spherical projected VTF modulation (auto-detect; bake-only) |
+| `light_spot` `ProjectedTexture` | entity key | Planar or envmap/cubemap VTF projection (auto-detect; bake-only) |
 | Soft sun | bake | Faster, smoother `SunSpreadAngle` / `-softsun` cone sampling |
 | Cross-face bounce weld | bake | Opt-in (`-bounce_weld`): edge-weighted bounce across coplanar seams |
 | Lightmap seam stitching | bake | Blends luxels across coplanar VBSP face splits (`-nostitch` to disable) |
@@ -192,14 +192,13 @@ Place e.g. `garrysmod/IES/light01.ies`, set `IES` to `light01`, and optionally
 
 ### `ProjectedTexture`
 
-Material path under `materials/` (e.g. `lights/gobos/logo`). Classification is
-automatic from the VTF:
+Material path under `materials/` (e.g. `lights/gobos/logo`). The VTF is classified
+automatically into one of two modes:
 
-| VTF | Behaviour |
-|-----|-----------|
-| Planar 2D | Image framed to the outer cone (`_cone`); see `ProjectedTextureMode` |
-| Cubemap (6 faces) | Omnidirectional cube sample; entity angles rotate the frame |
-| 2D + ENVMAP (matcap / spheremap / equirect) | Omnidirectional 2D map — square → spheremap, wide → equirect |
+| Mode | Detection | Behaviour |
+|------|-----------|-----------|
+| **Planar 2D** | Ordinary 2D VTF | Image framed to the outer cone (`_cone`); see `ProjectedTextureMode` |
+| **Envmap / cubemap** | Cubemap VTF (`TEXTUREFLAGS_ENVMAP`, 6 faces) | Omnidirectional sample; entity angles rotate the projection |
 
 **`ProjectedTextureMode`** (planar only; default `fill`):
 
@@ -209,9 +208,8 @@ automatic from the VTF:
 | `fit` | Square inscribed in the cone (`×√2`); full image visible |
 
 Projected RGB multiplies light intensity. With `IES` also set, the IES table is
-an angular mask on the projection. Cubemap / spherical modes are
-omnidirectional (no cone cull). Face UVs follow Direct3D / Source
-`CUBEMAP_FACE_*` conventions (Z-up axes). See
+an angular mask on the projection. Envmap / cubemap is omnidirectional (no cone
+cull). Cubemap face UVs follow Direct3D / Source `CUBEMAP_FACE_*` (Z-up). See
 [`docs/algorithms.tex`](docs/algorithms.tex) § Photometric spots and projected textures.
 
 ---
