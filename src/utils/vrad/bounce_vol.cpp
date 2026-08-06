@@ -1,5 +1,5 @@
 //========= Copyright CustomVRAD contributors. ============//
-// light_bounce_vol — soft AABB blend of local bounce_boost / bounce_chroma.
+// light_bounce_vol - soft AABB blend of local bounce_boost / bounce_chroma.
 //=============================================================================//
 
 #include "vrad.h"

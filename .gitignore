@@ -109,6 +109,7 @@ Desktop.ini
 # Local benchmarks / scratch notes
 _bench_*.txt
 *.bench.txt
+_crash_*.txt
 
 # LaTeX build products (keep *.tex sources)
 *.aux

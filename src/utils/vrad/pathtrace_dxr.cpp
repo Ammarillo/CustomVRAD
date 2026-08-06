@@ -11,6 +11,8 @@
 #include "lightmap.h"
 #include "pathtrace_dxr.h"
 #include "pathtrace_dxr_device.h"
+#include "ies_profile.h"
+#include "light_projection.h"
 #include "pathtrace_denoise.h"
 #include "envvolume.h"
 #include "skyambient.h"
@@ -48,7 +50,7 @@ int		g_nPathTraceBounces = -1;	// -1 = auto; 0 = direct+sky only
 int		g_nPathTraceDevice = -1;
 bool	g_bPathTraceDenoise = false;	// opt-in (-pt_denoise)
 int		g_nPathTraceDenoiseRadius = 3;	// Sakai spatial radius (OIDN/OptiX ignore)
-float	g_flPathTraceDenoiseStrength = 1.0f;	// blend noisy→denoised (1 = full)
+float	g_flPathTraceDenoiseStrength = 1.0f;	// blend noisy->denoised (1 = full)
 int		g_nPathTraceLuxelAA = 3;	// 1=off .. 5=5x5 free spatial AA
 int		g_nPathTraceLightSamples = 0;	// 0 = evaluate all local lights (legacy)
 int		g_nPathTraceEmitSamples = 64;	// $vrad_emit area NEE samples (0 = all tris)
@@ -223,8 +225,8 @@ static int PtSoftSampleCap()
 	return cap;
 }
 
-// PCSS-style penumbra → sample count. Contact (small tHit) → few rays; wide gap → up to cap.
-// distLight: receiver→light distance (use large value for sun). tHit: occluder distance along probe.
+// PCSS-style penumbra -> sample count. Contact (small tHit) -> few rays; wide gap -> up to cap.
+// distLight: receiver->light distance (use large value for sun). tHit: occluder distance along probe.
 // blocked: true if probe hit an occluder before the light.
 static int PtEstimatePenumbraSamples( float lightSize, float distLight, float tHit, bool blocked,
 									  float penumbraScale )
@@ -392,7 +394,7 @@ static float PtApplyFade( const directlight_t *dl, float dist, float falloff )
 	return falloff * mult;
 }
 
-// Point / spot attenuation: 1 / (c + lÂ·d + qÂ·dÂ²). CapDist<=0 (calloc) â‡’ uncapped.
+// Point / spot attenuation: 1 / (c + l*d + q*d^2). CapDist<=0 (calloc) => uncapped.
 static float PtPointFalloff( const directlight_t *dl, float dist )
 {
 	dist = max( dist, 1.0f );
@@ -404,8 +406,8 @@ static float PtPointFalloff( const directlight_t *dl, float dist )
 	return PtApplyFade( dl, dist, 1.0f / falloff );
 }
 
-// emit_surface: stock GatherSampleLight â€” emitter_cos / (rÂ² + RÂ²).
-// RÂ² = m_flAreaRadius2 (equiv. disk radiusÂ² from patch area); 0 â‡’ classic 1/rÂ².
+// emit_surface: stock GatherSampleLight - emitter_cos / (r^2 + R^2).
+// R^2 = m_flAreaRadius2 (equiv. disk radius^2 from patch area); 0 => classic 1/r^2.
 static float PtSurfaceFalloff( const directlight_t *dl, float dist, float emitterCos )
 {
 	if ( emitterCos <= 0.0f )
@@ -422,16 +424,38 @@ static float PtSurfaceFalloff( const directlight_t *dl, float dist, float emitte
 
 static float PtSpotCone( const directlight_t *dl, const Vector &lightToSample )
 {
-	// light.normal points along emission; sample sees -normal
+	// lightToSample = direction from light toward the receiving sample.
+
+	// Cubemap ProjectedTexture: omnidirectional - no stock cone.
+	if ( Proj_IsOmniEnvmap( dl ) )
+	{
+		if ( dl->m_pIes )
+		{
+			float w = IES_Eval( dl->m_pIes, dl->light.normal, dl->m_vecIesRight, lightToSample );
+			return w * dl->m_flIesScale;
+		}
+		return 1.0f;
+	}
+
+	// IES photometric profile replaces _inner_cone / _cone / _exponent entirely.
+	if ( dl->m_pIes )
+	{
+		float w = IES_Eval( dl->m_pIes, dl->light.normal, dl->m_vecIesRight, lightToSample );
+		return w * dl->m_flIesScale;
+	}
+
 	Vector dir = lightToSample;
 	VectorNormalize( dir );
-	float dot2 = -DotProduct( dir, dl->light.normal );
+	float dot2 = DotProduct( dir, dl->light.normal );
 	if ( dot2 <= dl->light.stopdot2 )
 		return 0.0f;
 	if ( dot2 >= dl->light.stopdot )
 		return 1.0f;
 	float mult = ( dot2 - dl->light.stopdot2 ) / ( dl->light.stopdot - dl->light.stopdot2 );
-	return max( 0.0f, min( 1.0f, mult ) );
+	mult = max( 0.0f, min( 1.0f, mult ) );
+	if ( dl->light.exponent != 0.0f && dl->light.exponent != 1.0f )
+		mult = powf( mult, dl->light.exponent );
+	return mult;
 }
 
 // Disk soft sample in the emitter plane (area / texlight penumbra).
@@ -466,7 +490,7 @@ static float PtLuma( const Vector &v )
 
 // Fast albedo: bound cluster walk (adaptivechop maps can have huge patch lists).
 // bApplyArt: apply -bounce_boost / -bounce_chroma / light_bounce_vol (false when
-// uploading raw TriAlbedo to the GPU — shader applies art with bounce falloff).
+// uploading raw TriAlbedo to the GPU - shader applies art with bounce falloff).
 static Vector PtGetHitAlbedo( const Vector &hitPos, const Vector &hitNormal, bool bAllowTexSample,
 							  bool bApplyArt = true, int bounceIndex = 0 )
 {
@@ -529,7 +553,7 @@ static Vector PtGetHitAlbedo( const Vector &hitPos, const Vector &hitNormal, boo
 // corner/edge samples act as if they sit in front of the adjacent occluder.
 static float g_flPtOccludeBias = 2.5f;
 
-// RGB transmittance from→to (1 = clear, 0 = blocked). Multiplies through $vrad_filter panes.
+// RGB transmittance from->to (1 = clear, 0 = blocked). Multiplies through $vrad_filter panes.
 static Vector PtVisibilityRGB( const Vector &from, const Vector &to )
 {
 	Vector delta = to - from;
@@ -577,7 +601,7 @@ static Vector PtLuxelOriginInFront( const Vector &samplePos, const Vector &faceN
 			continue;
 		if ( !hit[0] || ( flags[0] & TRACE_ID_SKY ) )
 			continue;
-		// Side occluder ≈ wall meeting this face (hit normal ⟂ face normal).
+		// Side occluder ~= wall meeting this face (hit normal perp face normal).
 		if ( fabsf( DotProduct( hitN[0], faceNormal ) ) > 0.55f )
 			continue;
 		extra = max( extra, ( probe - t[0] ) * 0.5f + 0.5f );
@@ -598,7 +622,7 @@ enum
 static int g_ptSpp = 16;
 static int g_ptBounces = 3;
 
-// Veach power heuristic (β = 2).
+// Veach power heuristic (beta = 2).
 static inline float PtMisWeight( float pdfA, float pdfB )
 {
 	if ( pdfA <= 0.0f )
@@ -617,7 +641,7 @@ static inline float PtMisWeight( float pdfA, float pdfB )
 // ---------------------------------------------------------------------------
 static std::vector<directlight_t *> g_ptSkyLights;
 static std::vector<directlight_t *> g_ptLocalLights;	// point/spot only (power-sampled)
-static std::vector<directlight_t *> g_ptEmitLights;		// emit_surface — always all NEE (stock-style)
+static std::vector<directlight_t *> g_ptEmitLights;		// emit_surface - always all NEE (stock-style)
 static std::vector<float> g_ptLocalCdf;	// inclusive prefix of power weights
 static float g_ptLocalWeightSum = 0.0f;
 
@@ -796,10 +820,10 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 		if ( facenum >= 0 && dl->facenum == facenum )
 			break;
 
-		// Hard NEE to face center. Soft-disk sampling used sqrt(area/π) as radius —
+		// Hard NEE to face center. Soft-disk sampling used sqrt(area/pi) as radius -
 		// on medium/large $vrad_emit faces that disk extends into solids and every
-		// soft sample fails occlusion → zero light. Softness comes from area falloff
-		// (cos/(r²+R²)) instead; optional small CHSS disk only when soft is on.
+		// soft sample fails occlusion -> zero light. Softness comes from area falloff
+		// (cos/(r^2+R^2)) instead; optional small CHSS disk only when soft is on.
 		const float areaR2 = max( dl->m_flAreaRadius2, 1.0f );
 		float softRadius = 0.0f;
 		int ns = 1;
@@ -908,7 +932,9 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 
 			if ( dl->light.type == emit_spotlight )
 			{
-				float cone = PtSpotCone( dl, delta );
+				// lightToSample = sample - light = -delta (delta is light - sample)
+				Vector lightToSample = -delta;
+				float cone = PtSpotCone( dl, lightToSample );
 				if ( cone <= 0.0f )
 					continue;
 				ndl *= cone;
@@ -918,7 +944,16 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 			if ( falloff <= 0.0f )
 				continue;
 
-			Vector est = dl->light.intensity * ( ndl * falloff * absScale );
+			Vector intensity = dl->light.intensity;
+			if ( dl->light.type == emit_spotlight && dl->m_pProj )
+			{
+				Vector rgb = Proj_EvalLightRGB( dl, -delta );
+				intensity.x *= rgb.x;
+				intensity.y *= rgb.y;
+				intensity.z *= rgb.z;
+			}
+
+			Vector est = intensity * ( ndl * falloff * absScale );
 			if ( est.x + est.y + est.z < 0.02f )
 				continue;
 
@@ -926,12 +961,12 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 			if ( vis.x + vis.y + vis.z < 1e-6f )
 				continue;
 
-			accum.x += dl->light.intensity.x * ( ndl * falloff * vis.x * absScale );
-			accum.y += dl->light.intensity.y * ( ndl * falloff * vis.y * absScale );
-			accum.z += dl->light.intensity.z * ( ndl * falloff * vis.z * absScale );
+			accum.x += intensity.x * ( ndl * falloff * vis.x * absScale );
+			accum.y += intensity.y * ( ndl * falloff * vis.y * absScale );
+			accum.z += intensity.z * ( ndl * falloff * vis.z * absScale );
 		}
 		accum *= ( 1.0f / (float)ns );
-		sum += accum;
+		sum += IES_ClampDirectSample( dl, accum );
 		break;
 	}
 	default:
@@ -988,7 +1023,7 @@ static Vector PtSampleEmitArea( const Vector &pos, const Vector &normal, unsigne
 	const VRadEmitTri_t *tris = VRadEmitArea_Tris();
 	const float absScale = Absorb_DirectScale( pos );
 
-	// 0 or K>=nTris → evaluate every triangle once (lowest variance).
+	// 0 or K>=nTris -> evaluate every triangle once (lowest variance).
 	const bool sampleAll = ( nSamples <= 0 || nSamples >= nTris );
 	const int k = sampleAll ? nTris : nSamples;
 
@@ -1231,7 +1266,7 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 
 		if ( !bHit )
 		{
-			// Sky only via BSDF (no skyambient NEE) → weight 1.
+			// Sky only via BSDF (no skyambient NEE) -> weight 1.
 			radiance += PtClampFirefly( throughput * PtSampleSkyAmbient( pos, dir ), 2500.0f );
 			break;
 		}
@@ -1256,22 +1291,22 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 
 		Vector albedo = PtGetHitAlbedo( hitPos, hitNormal, true, false, (int)bounce );
 		albedo *= Absorb_BounceScale( hitPos, pos );
-		// Energy scale only (light_bounce_vol / -bounce_boost). No -bounce_chroma —
+		// Energy scale only (light_bounce_vol / -bounce_boost). No -bounce_chroma -
 		// Oklab sat boost is artistic and breaks physical colored transport.
 		{
 			BounceVolSettings_t bv;
 			BounceVol_Resolve( hitPos, bv );
 			albedo *= bv.boost;
 		}
-		// PBRT: diffuse ρ ∈ [0,1] per channel (energy-conserving reflectance).
+		// PBRT: diffuse rho in [0,1] per channel (energy-conserving reflectance).
 		albedo.x = min( 1.0f, max( 0.0f, albedo.x ) );
 		albedo.y = min( 1.0f, max( 0.0f, albedo.y ) );
 		albedo.z = min( 1.0f, max( 0.0f, albedo.z ) );
 
-		// Lambert + cosine sampling ⇒ throughput *= albedo (linear RGB × texbounce).
+		// Lambert + cosine sampling => throughput *= albedo (linear RGB x texbounce).
 		throughput *= albedo;
 
-		// light_env_vol inbound Oklab tint is artistic — skip for physical RGB transport.
+		// light_env_vol inbound Oklab tint is artistic - skip for physical RGB transport.
 
 		// Russian roulette after first bounce (Veach efficiency-optimized style).
 		if ( bounce >= 1 )
@@ -1393,7 +1428,7 @@ static double g_ptEtaLastTime = 0.0;
 static double g_ptEtaLastDecayTime = 0.0;
 
 // Soften luxel stair-steps where neighbor brightness jumps hard (shadow edges).
-// Relative contrast drives blend — soft gradients stay put, binary jags AA.
+// Relative contrast drives blend - soft gradients stay put, binary jags AA.
 static void PtAntialiasHighContrast( Vector *grid, const float *wgt, int width, int height )
 {
 	if ( !grid || !wgt || width < 2 || height < 2 )
@@ -1631,7 +1666,7 @@ static void PtDenoiseFaceSamples( facelight_t *fl, dface_t *f, int normalCount, 
 					std::sort( neighL.begin(), neighL.end() );
 					float med = neighL[neighL.size() / 2];
 					float L = PtLuma( grid[idx] );
-					// Dark spike in a brighter neighborhood → likely sample-in-solid / backface.
+					// Dark spike in a brighter neighborhood -> likely sample-in-solid / backface.
 					if ( maxN > 1e-3f && L < maxN * 0.28f && L < med * 0.55f )
 						bad[idx] = 1;
 				}
@@ -1830,7 +1865,7 @@ static int PtEstimateTotalLuxels()
 	}
 	if ( g_ptBakeableFacesEst > 0 )
 	{
-		Msg( "[PathTrace-DXR] Lightmap dims on lit faces: avg max-side %.1f, largest %d luxels (Hammer scale 2 â‰ˆ many faces near 16â€“35).\n",
+		Msg( "[PathTrace-DXR] Lightmap dims on lit faces: avg max-side %.1f, largest %d luxels (Hammer scale 2 ~= many faces near 16-35).\n",
 			 (double)sumMaxDim / (double)g_ptBakeableFacesEst, maxDim );
 	}
 	return total;
@@ -1988,7 +2023,7 @@ static bool PtFaceIsBakeable( int facenum )
 	dface_t *f = &g_pFaces[facenum];
 	if ( texinfo[f->texinfo].flags & TEX_SPECIAL )
 		return false;
-	// Displacements are included — BuildSamplesAndLuxels_DoFast routes to Disp samples.
+	// Displacements are included - BuildSamplesAndLuxels_DoFast routes to Disp samples.
 	if ( g_FacePatches.Element( facenum ) == g_FacePatches.InvalidIndex() )
 		return false;
 	return true;
@@ -2076,7 +2111,7 @@ static void PathTraceBakeOneFace( int facenum )
 	int nAaUse = 0;
 	if ( aaN > 1 )
 	{
-		const float span = 0.66f; // corners at ±0.33 luxels
+		const float span = 0.66f; // corners at +/-0.33 luxels
 		int tap = 0;
 		for ( int ty = 0; ty < aaN; ++ty )
 		{
@@ -2181,13 +2216,20 @@ static void PathTraceClearAllFaces()
 
 
 // ---------------------------------------------------------------------------
-// GPU luxel baker (DXR RayQuery) — Frostbite-style: all work on GPU, luxels batched.
+// GPU luxel baker (DXR RayQuery) - Frostbite-style: all work on GPU, luxels batched.
 // Hard NEE (no CHSS soft); use -pt_cpu for full CPU soft-shadow path.
 // ---------------------------------------------------------------------------
-static void PtPackGpuLights( std::vector<PtGpuBakeLight> &out )
+static void PtPackGpuLights( std::vector<PtGpuBakeLight> &out, std::vector<float> &iesAtlasOut,
+							 ProjGpuArray_t &cookieArr, ProjGpuArray_t &cubeArr )
 {
+	iesAtlasOut.clear();
+	const int nIesLayers = IES_BuildGpuAtlas( iesAtlasOut );
+	Proj_AssignGpuLayers();
+	Proj_BuildGpuCookieArray( cookieArr );
+	Proj_BuildGpuCubeArray( cubeArr );
+
 	out.clear();
-	int nEmit = 0, nLocal = 0, nSky = 0;
+	int nEmit = 0, nLocal = 0, nSky = 0, nIes = 0, nProj = 0;
 	for ( directlight_t *dl = activelights; dl != NULL; dl = dl->next )
 	{
 		if ( dl->light.style != 0 )
@@ -2219,6 +2261,61 @@ static void PtPackGpuLights( std::vector<PtGpuBakeLight> &out )
 		L.envId = dl->m_nEnvId;
 		L.isLocal = 0;
 		L.power = 0.0f;
+		L.iesScale = 0.0f;
+		L.iesMaxIntensity = 0.0f;
+		L.iesLayer = -1;
+		L.projRight[0] = dl->m_vecProjRight.x;
+		L.projRight[1] = dl->m_vecProjRight.y;
+		L.projRight[2] = dl->m_vecProjRight.z;
+		L.projOuterCos = dl->light.stopdot2;
+		L.projUp[0] = dl->m_vecProjUp.x;
+		L.projUp[1] = dl->m_vecProjUp.y;
+		L.projUp[2] = dl->m_vecProjUp.z;
+		L.projMode = 0.0f;
+		L.projLayer = -1;
+		L.projFrameMode = 0;
+		if ( dl->m_pProj )
+		{
+			const ProjKind_t kind = Proj_Kind( dl->m_pProj );
+			const int layer = Proj_GpuLayer( dl->m_pProj );
+			if ( layer >= 0 && kind == PROJ_2D )
+			{
+				L.projMode = 1.0f;
+				L.projLayer = layer;
+				L.projFrameMode = ( dl->m_nProjFrameMode == (int)PROJ_FRAME_FIT ) ? 1 : 0;
+				++nProj;
+			}
+			else if ( layer >= 0 && kind == PROJ_CUBE )
+			{
+				L.projMode = 2.0f;
+				L.projLayer = layer;
+				L.projFrameMode = 0;
+				++nProj;
+			}
+			else if ( layer >= 0 && kind == PROJ_SPHERE )
+			{
+				L.projMode = 3.0f;
+				L.projLayer = layer;
+				L.projFrameMode = Proj_IsEquirect( dl->m_pProj ) ? 1 : 0; // 1=equirect, 0=matcap
+				++nProj;
+			}
+		}
+		if ( dl->light.type == emit_spotlight && dl->m_pIes )
+		{
+			L.iesScale = dl->m_flIesScale;
+			L.iesMaxIntensity = dl->m_flIesMaxIntensity;
+			L.iesLayer = IES_GpuLayer( dl->m_pIes );
+			if ( L.iesLayer >= 0 )
+			{
+				// Cone fields unused when IES is set - store IES right basis here.
+				L.stopdot = dl->m_vecIesRight.x;
+				L.stopdot2 = dl->m_vecIesRight.y;
+				L.exponent = dl->m_vecIesRight.z;
+				// Spots don't use areaR2 - pack IES max clamp into that GPU slot.
+				L.areaR2 = L.iesMaxIntensity;
+				++nIes;
+			}
+		}
 
 		switch ( dl->light.type )
 		{
@@ -2242,7 +2339,7 @@ static void PtPackGpuLights( std::vector<PtGpuBakeLight> &out )
 			++nSky;
 			break;
 		case emit_surface:
-			// Textured $vrad_emit faces → GPU area mesh, not point proxies.
+			// Textured $vrad_emit faces -> GPU area mesh, not point proxies.
 			if ( VRadEmitArea_FaceHasMesh( dl->facenum ) )
 				continue;
 			L.type = (float)PT_GPU_LIGHT_SURFACE;
@@ -2256,8 +2353,8 @@ static void PtPackGpuLights( std::vector<PtGpuBakeLight> &out )
 		}
 		out.push_back( L );
 	}
-	Msg( "[PathTrace-DXR] GPU lights packed: %d emit_surface, %d sky, %d local (of %d total)\n",
-		 nEmit, nSky, nLocal, (int)out.size() );
+	Msg( "[PathTrace-DXR] GPU lights packed: %d emit_surface, %d sky, %d local (%d IES, %d proj), %d IES atlas layer(s)\n",
+		 nEmit, nSky, nLocal, nIes, nProj, nIesLayers );
 }
 
 static void PtBuildTriAlbedo( std::vector<float> &rgb )
@@ -2298,7 +2395,7 @@ static void PtBuildTriAlbedo( std::vector<float> &rgb )
 		if ( VectorNormalize( nrm ) < 1e-6f )
 			nrm.Init( 0, 0, 1 );
 
-		// Raw texture/reflectivity only — no -bounce_chroma (that is artistic Oklab sat).
+		// Raw texture/reflectivity only - no -bounce_chroma (that is artistic Oklab sat).
 		Vector alb = PtGetHitAlbedo( centroid, nrm, true, false, 0 );
 		rgb[i * 3 + 0] = alb.x;
 		rgb[i * 3 + 1] = alb.y;
@@ -2324,7 +2421,7 @@ static void PtBuildTriFilterGpu( std::vector<float> &metaFloat4s, VRadFilterGpuA
 	if ( n == 0 )
 		return;
 
-	// Must use captured flags — after SetupAccelerationStructure, GeometryData.m_nTriangleID
+	// Must use captured flags - after SetupAccelerationStructure, GeometryData.m_nTriangleID
 	// is no longer valid (union overwritten; IntersectData keeps ID at a different offset).
 	std::vector<uint32_t> ids( n, 0 );
 	int nFilterIds = 0;
@@ -2358,10 +2455,12 @@ static bool PathTraceBakeWorldFacesGPU()
 		return false;
 
 	std::vector<PtGpuBakeLight> lights;
-	PtPackGpuLights( lights );
+	std::vector<float> iesAtlas;
+	ProjGpuArray_t projCookies, projCubes;
+	PtPackGpuLights( lights, iesAtlas, projCookies, projCubes );
 	if ( lights.empty() )
 	{
-		Warning( "[PathTrace-DXR] GPU bake: no lights — falling back to CPU.\n" );
+		Warning( "[PathTrace-DXR] GPU bake: no lights - falling back to CPU.\n" );
 		return false;
 	}
 
@@ -2415,7 +2514,7 @@ static bool PathTraceBakeWorldFacesGPU()
 	params.defaultBounceIntensity = LightEnv_GetDefaultBounceIntensity();
 	params.bounceVolCount = (uint32_t)max( 0, BounceVol_VolumeCount() );
 	params.cliBounceBoost = g_flBounceBoost;
-	// Pathtrace keeps linear RGB light×albedo. -bounce_chroma is artistic Oklab sat — ignore.
+	// Pathtrace keeps linear RGB lightxalbedo. -bounce_chroma is artistic Oklab sat - ignore.
 	params.cliBounceChroma = 0.0f;
 	params.spectralMode = g_bPathTraceSpectral ? 1u : 0u;
 	if ( g_flBounceChroma > 0.0f )
@@ -2426,10 +2525,10 @@ static bool PathTraceBakeWorldFacesGPU()
 	if ( params.spectralMode )
 		Msg( "[PathTrace-DXR] Spectral transport: 4 stratified wavelengths/path (compact RGB lobes + CIE).\n" );
 	if ( params.envVolCount > 0 )
-		Msg( "[PathTrace-DXR] GPU light_env_vol: %u volume(s) — weighted sky/ambient, shadow filters, BounceVol tint\n",
+		Msg( "[PathTrace-DXR] GPU light_env_vol: %u volume(s) - weighted sky/ambient, shadow filters, BounceVol tint\n",
 			 params.envVolCount );
 	if ( params.bounceVolCount > 0 )
-		Msg( "[PathTrace-DXR] GPU light_bounce_vol: %u volume(s) — boost/chroma at hit (CLI boost=%.2f chroma=%.2f)\n",
+		Msg( "[PathTrace-DXR] GPU light_bounce_vol: %u volume(s) - boost/chroma at hit (CLI boost=%.2f chroma=%.2f)\n",
 			 params.bounceVolCount, g_flBounceBoost, g_flBounceChroma );
 	if ( nEmitTris > 0 )
 	{
@@ -2464,9 +2563,19 @@ static bool PathTraceBakeWorldFacesGPU()
 									 filterArray.rgba.data(),
 									 (uint32_t)filterArray.width,
 									 (uint32_t)filterArray.height,
-									 (uint32_t)filterArray.layers ) )
+									 (uint32_t)filterArray.layers,
+									 iesAtlas.data(),
+									 (uint32_t)max( 1, (int)( iesAtlas.size() / max( 1, IES_GpuResV() * IES_GpuResH() ) ) ),
+									 projCookies.rgba.data(),
+									 (uint32_t)projCookies.width,
+									 (uint32_t)projCookies.height,
+									 (uint32_t)projCookies.layers,
+									 projCubes.rgba.data(),
+									 (uint32_t)projCubes.width,
+									 (uint32_t)projCubes.height,
+									 (uint32_t)projCubes.layers ) )
 	{
-		Warning( "[PathTrace-DXR] GPU baker init failed — falling back to CPU.\n" );
+		Warning( "[PathTrace-DXR] GPU baker init failed - falling back to CPU.\n" );
 		return false;
 	}
 	fflush( stdout );
@@ -2474,7 +2583,7 @@ static bool PathTraceBakeWorldFacesGPU()
 	// Prefer large luxel batches + thicker spp chunks (fewer upload/readback syncs).
 	// Only throttle under settings that previously TDR'd the driver (very high spp,
 	// and all-emit tris combined with high spp). A mid-bake all-black batch is often
-	// just fully-shadowed faces — not a reason to shrink the schedule.
+	// just fully-shadowed faces - not a reason to shrink the schedule.
 	int kBatch = 65536;
 	int sppChunk = ( g_ptSpp > 32 ) ? 16 : max( 1, g_ptSpp );
 	if ( g_ptSpp >= 512 )
@@ -2523,7 +2632,7 @@ static bool PathTraceBakeWorldFacesGPU()
 			PathTraceDXR_GpuBakeConfigurePass( (uint32_t)n, (uint32_t)off );
 			if ( !PathTraceDXR_GpuBakeLuxels( jobs.data(), (uint32_t)jobs.size(), temp.data() ) )
 				return false;
-			// GPU returns mean over n samples — weight by n for the overall mean.
+			// GPU returns mean over n samples - weight by n for the overall mean.
 			const float w = (float)n;
 			for ( size_t i = 0; i < acc.size(); ++i )
 			{
@@ -2555,7 +2664,7 @@ static bool PathTraceBakeWorldFacesGPU()
 					const int idx = fj.sampleBase + s * nc + ni;
 					if ( idx < 0 || idx >= (int)acc.size() )
 					{
-						Warning( "[PathTrace-DXR] GPU bake index OOB (idx=%d acc=%d) — aborting batch.\n",
+						Warning( "[PathTrace-DXR] GPU bake index OOB (idx=%d acc=%d) - aborting batch.\n",
 								 idx, (int)acc.size() );
 						return false;
 					}
@@ -2629,7 +2738,7 @@ static bool PathTraceBakeWorldFacesGPU()
 		int aaN = g_nPathTraceLuxelAA;
 		if ( aaN < 1 ) aaN = 1;
 		if ( aaN > 5 ) aaN = 5;
-		// Base-face luxel axes dig into displaced height — skip planar AA on disps.
+		// Base-face luxel axes dig into displaced height - skip planar AA on disps.
 		if ( f->dispinfo != -1 )
 			aaN = 1;
 
@@ -2815,7 +2924,7 @@ bool PathTraceDXR_BakeWorldFaces()
 			PtEndProgressLine();
 			Warning( "[PathTrace-DXR] GPU bake failed after %d lit faces / %d luxels.\n",
 					 g_ptFacesBaked.load(), g_ptLuxelsBaked.load() );
-			// CPU path is ~50–200× slower; mid-bake fallback turns a 2‑min GPU job
+			// CPU path is ~50-200x slower; mid-bake fallback turns a 2-min GPU job
 			// into hours. Only fall back if GPU never produced anything.
 			if ( g_ptFacesBaked.load() > 0 )
 			{
@@ -2825,7 +2934,7 @@ bool PathTraceDXR_BakeWorldFaces()
 				PathTraceDXR_DeviceShutdown();
 				return false;
 			}
-			Warning( "[PathTrace-DXR] GPU produced no faces — falling back to CPU path tracer.\n" );
+			Warning( "[PathTrace-DXR] GPU produced no faces - falling back to CPU path tracer.\n" );
 		}
 	}
 	else if ( g_bPathTraceCpuForced )
@@ -2834,7 +2943,7 @@ bool PathTraceDXR_BakeWorldFaces()
 	}
 	else if ( !bDxrOk )
 	{
-		Msg( "[PathTrace-DXR] DXR unavailable — CPU SSE path tracer.\n" );
+		Msg( "[PathTrace-DXR] DXR unavailable - CPU SSE path tracer.\n" );
 	}
 
 	if ( !bGpuOk && !g_bInterrupt && !( bGpuAttempted && g_ptFacesBaked.load() > 0 ) )
@@ -2874,7 +2983,9 @@ bool PathTraceDXR_CanBakeProps()
 static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int softSamplesMax, int emitSamples )
 {
 	std::vector<PtGpuBakeLight> lights;
-	PtPackGpuLights( lights );
+	std::vector<float> iesAtlas;
+	ProjGpuArray_t projCookies, projCubes;
+	PtPackGpuLights( lights, iesAtlas, projCookies, projCubes );
 	if ( lights.empty() )
 		return false;
 
@@ -2920,7 +3031,7 @@ static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int sof
 	params.defaultBounceIntensity = LightEnv_GetDefaultBounceIntensity();
 	params.bounceVolCount = (uint32_t)max( 0, BounceVol_VolumeCount() );
 	params.cliBounceBoost = g_flBounceBoost;
-	// Pathtrace keeps linear RGB light×albedo. -bounce_chroma is artistic Oklab sat — ignore.
+	// Pathtrace keeps linear RGB lightxalbedo. -bounce_chroma is artistic Oklab sat - ignore.
 	params.cliBounceChroma = 0.0f;
 	params.spectralMode = g_bPathTraceSpectral ? 1u : 0u;
 	if ( g_flBounceChroma > 0.0f )
@@ -2960,7 +3071,17 @@ static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int sof
 									  filterArray.rgba.data(),
 									  (uint32_t)filterArray.width,
 									  (uint32_t)filterArray.height,
-									  (uint32_t)filterArray.layers );
+									  (uint32_t)filterArray.layers,
+									  iesAtlas.data(),
+									  (uint32_t)max( 1, (int)( iesAtlas.size() / max( 1, IES_GpuResV() * IES_GpuResH() ) ) ),
+									  projCookies.rgba.data(),
+									  (uint32_t)projCookies.width,
+									  (uint32_t)projCookies.height,
+									  (uint32_t)projCookies.layers,
+									  projCubes.rgba.data(),
+									  (uint32_t)projCubes.width,
+									  (uint32_t)projCubes.height,
+									  (uint32_t)projCubes.layers );
 }
 
 bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamples,
@@ -2991,14 +3112,14 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 		if ( spp < 1 ) spp = 1;
 		if ( spp > 4096 ) spp = 4096;
 
-		// Match world bounce depth — indoor props need multi-bounce GI.
+		// Match world bounce depth - indoor props need multi-bounce GI.
 		bounces = g_nPathTracePropBounces;
 		if ( bounces < 0 )
 			bounces = max( 0, g_ptBounces );
 		if ( bounces > 16 ) bounces = 16;
 
 		// Locals: bounce 0 always evaluates all lights (shader). Later bounces power-sample
-		// when LightSamples > 0. Default 32 keeps indoor direct correct without all×spp×bounce cost.
+		// when LightSamples > 0. Default 32 keeps indoor direct correct without allxsppxbounce cost.
 		lightSamples = g_nPathTraceLightSamples;
 		if ( lightSamples <= 0 )
 			lightSamples = 32;

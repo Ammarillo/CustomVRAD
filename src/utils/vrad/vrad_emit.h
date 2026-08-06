@@ -8,12 +8,12 @@
 #include "mathlib/vector.h"
 
 // VMT keys (CustomVRAD):
-//   $vrad_emit            "1"              — enable emission (optional if strength > 0)
-//   $vrad_emitstrength    "200"            — intensity scaler (same idea as lights.rad 4th number)
-//   $vrad_emitdensity     "1"              — optional finer patch chop only (contact is area-softened; no light grid)
-//   $vrad_emitmask        "path/to/mask"   — optional greyscale mask (R/luma)
-//   $vrad_emitmap         "path/to/color"  — optional emissive color map
-//   $vrad_emissivemap     ...              — alias for $vrad_emitmap
+//   $vrad_emit            "1"              - enable emission (optional if strength > 0)
+//   $vrad_emitstrength    "200"            - intensity scaler (same idea as lights.rad 4th number)
+//   $vrad_emitdensity     "1"              - optional finer patch chop only (contact is area-softened; no light grid)
+//   $vrad_emitmask        "path/to/mask"   - optional greyscale mask (R/luma)
+//   $vrad_emitmap         "path/to/color"  - optional emissive color map
+//   $vrad_emissivemap     ...              - alias for $vrad_emitmap
 // If no emitmap: emission color comes from $basetexture (like -texbounce).
 
 bool VRadEmit_MaterialEmits( const char *pMaterialName );

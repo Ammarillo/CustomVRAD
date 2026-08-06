@@ -131,12 +131,13 @@ bool        g_bTextureShadows = false;
 bool        g_bDisablePropSelfShadowing = false;
 bool        g_bStitchSeams = true;		// blend lightmap luxels across coplanar VBSP face splits
 bool		g_bTexturedBounce = false;	// sample $basetexture albedo for bounce color bleed
+float		g_flTexbounceClean = 0.04f;	// kill DXT/JPEG chroma noise on near-greys (0=off)
 float		g_flBounceBoost = 1.0f;		// artistic scale of final bounced light (1 = stock)
 float		g_flBounceChroma = 0.0f;	// early-bounce saturation boost (0 = off)
 bool		g_bAdaptiveChop = false;	// refine chop near sun-visibility contrast
 bool		g_bEnergyConserve = false;	// enclosure-aware cavity damp (opt-in via -energy)
-float		g_flCavityScale = 0.70f;	// fully-enclosed gather weight vs stock (0.25–1)
-bool		g_bEdgePull = true;			// pull edge luxel samples inward (~½ luxel)
+float		g_flCavityScale = 0.70f;	// fully-enclosed gather weight vs stock (0.25-1)
+bool		g_bEdgePull = true;			// pull edge luxel samples inward (~0.5 luxel)
 float		g_flEdgePullInset = 0.5f;	// luxel-space inset from lightmap edges
 
 
@@ -1090,13 +1091,13 @@ void SubdividePatches (void)
 	qprintf ("%i patches after subdivision\n", uiPatchCount);
 	if ( uiPatchCount > MAX_PATCHES )
 	{
-		Warning( "WARNING: %u patches exceeds MAX_PATCHES (%d) — VisLeafs will flush mid-row; "
+		Warning( "WARNING: %u patches exceeds MAX_PATCHES (%d) - VisLeafs will flush mid-row; "
 				 "consider -coarse or higher lightmap scales.\n",
 				 uiPatchCount, MAX_PATCHES );
 	}
 	else if ( uiPatchCount > 250000 && !g_bVRadCoarsePatches )
 	{
-		Msg( "Note: %u patches — add -coarse (or -maxtransfer 4096) to speed VisLeafs/bounce.\n",
+		Msg( "Note: %u patches - add -coarse (or -maxtransfer 4096) to speed VisLeafs/bounce.\n",
 			 uiPatchCount );
 	}
 }
@@ -1289,10 +1290,10 @@ void MakeScales ( int ndxPatch, transfer_t *all_transfers )
 			total += t2->transfer;
 		}
 
-		// Stock: scale by 1/π (or 1/total if overcomplete) so a full hemisphere ≈ 1.
+		// Stock: scale by 1/pi (or 1/total if overcomplete) so a full hemisphere ~= 1.
 		// Enclosed rooms approach full hemisphere (sky never transfers) and recirculate
-		// for many bounces → unnaturally bright cavities.
-		// Energy mode: keep stock far-field, damp gathers by enclosure² so closed
+		// for many bounces -> unnaturally bright cavities.
+		// Energy mode: keep stock far-field, damp gathers by enclosure^2 so closed
 		// areas stay darker while open/outdoor bounce is nearly unchanged.
 		// light_bounce_vol EnergyMode soft-blends 0 (-noenergy) .. 1 (-energy).
 		{
@@ -1758,7 +1759,7 @@ RefineTexturedBounceReflectivity
 
 Sample $basetexture albedo at each leaf patch origin (plus macro tint) for radiosity.
 Falls back to flat dtexdata.reflectivity when no texture data.
-One sample per patch — full face-sample averaging was O(patches × samples) and slow.
+One sample per patch - full face-sample averaging was O(patches x samples) and slow.
 =============
 */
 static void RefineTexturedBounceReflectivity( void )
@@ -1938,7 +1939,7 @@ void BounceLight (void)
 		}
 		if ( bVol )
 		{
-			Msg( "light_bounce_vol: %d volume(s) — per-patch bounce boost/chroma overrides active.\n",
+			Msg( "light_bounce_vol: %d volume(s) - per-patch bounce boost/chroma overrides active.\n",
 				 BounceVol_VolumeCount() );
 		}
 	}
@@ -2025,7 +2026,7 @@ void BounceLight (void)
 			firstBounceEnergy = bounceEnergy;
 
 		// Absolute floor (stock) plus relative early-out: stop once a bounce adds
-		// less than 0.15% of bounce #1. Cuts long tails (30–40+ iters) that do not
+		// less than 0.15% of bounce #1. Cuts long tails (30-40+ iters) that do not
 		// change visible lighting on bright maps.
 		const float relativeEps = ( firstBounceEnergy > 0.0f ) ? ( firstBounceEnergy * 0.0015f ) : 0.0f;
 		const float bounceEps = max( 1.0f, relativeEps );
@@ -2448,7 +2449,7 @@ bool RadWorld_Go()
 			}
 			RunThreadsOnIndividual (numfaces, true, FinalLightFace);
 
-			// Seam stitch blurs pathtrace detail into blotches — skip when pathtraced.
+			// Seam stitch blurs pathtrace detail into blotches - skip when pathtraced.
 			if ( g_bStitchSeams && !bPathTraced )
 				StitchLightmapSeams();
 		}
@@ -2592,7 +2593,7 @@ void VRAD_LoadBSP( char const *pFilename )
 		g_pFaces = dfaces_hdr;
 		// Full rebake: always take lightmap layout from current VBSP faces.
 		// Stale LUMP_FACES_HDR extents (old scale / luxeldensity) cause blocky HDR bakes.
-		// Do NOT recompute extents from texinfo here — if texinfo was previously coarsened
+		// Do NOT recompute extents from texinfo here - if texinfo was previously coarsened
 		// in the BSP, CalcFaceExtents would shrink faces and make it worse; VBSP dfaces
 		// are the authority after a proper VBSP run.
 		if ( numfaces_hdr == 0 || numfaces_hdr != numfaces || !g_pIncremental )
@@ -2867,7 +2868,7 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 		else if ( !Q_stricmp( argv[i], "-pt_spectral" ) )
 		{
 			g_bPathTraceSpectral = true;
-			Msg( "PathTrace spectral (-pt_spectral): 4λ stratified RGB-lobe+CIE ON.\n" );
+			Msg( "PathTrace spectral (-pt_spectral): 4-lambda stratified RGB-lobe+CIE ON.\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-pt_nospectral" ) )
 		{
@@ -3033,6 +3034,32 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 		{
 			g_bTexturedBounce = true;
 			Msg( "Textured bounce (-texbounce): sample $basetexture albedo for color bleed.\n" );
+			if ( g_flTexbounceClean > 0.0f )
+				Msg( "  Albedo chroma clean (-texbounce_clean): %.3f (DXT/JPEG grey noise -> neutral).\n",
+					 g_flTexbounceClean );
+		}
+		else if ( !Q_stricmp( argv[i], "-texbounce_clean" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_flTexbounceClean = (float)atof( argv[i] );
+				if ( g_flTexbounceClean < 0.0f )
+					g_flTexbounceClean = 0.0f;
+				if ( g_flTexbounceClean > 0.5f )
+					g_flTexbounceClean = 0.5f;
+				Msg( "Texbounce chroma clean (-texbounce_clean): %.3f%s.\n",
+					 g_flTexbounceClean,
+					 g_flTexbounceClean <= 0.0f ? " (off)" : " (Oklab C soft threshold)" );
+			}
+			else
+			{
+				Warning( "Error: expected a value after '-texbounce_clean'\n" );
+			}
+		}
+		else if ( !Q_stricmp( argv[i], "-texbounce_noclean" ) )
+		{
+			g_flTexbounceClean = 0.0f;
+			Msg( "Texbounce chroma clean disabled (-texbounce_noclean).\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-nostitch" ) )
 		{
@@ -3418,7 +3445,7 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 				{
 					Warning( "WARNING: -luxeldensity makes lightmaps COARSER (blocky indoor GI). "
 							 "Do not use it to \"increase quality\". Prefer Hammer face lightmap scale. "
-							 "This also writes coarsened texinfo into the BSP — re-run VBSP to undo.\n" );
+							 "This also writes coarsened texinfo into the BSP - re-run VBSP to undo.\n" );
 				}
 			}
 			else
@@ -3762,7 +3789,7 @@ void PrintUsage( int argc, char **argv )
 		"  -pt_aa N        : Luxel footprint AA grid 1..5 (1=off, 2=2x2 .. 5=5x5; default 3).\n"
 		"  -pt_lights N    : Local NEE light samples (0=all; N=power-sample N locals/sky always all).\n"
 		"  -pt_emit_samples N : $vrad_emit area NEE samples (0=all tris; default 64; higher=less noise).\n"
-		"  -pt_spectral    : Hero-wavelength spectral transport (Smits RGB→SPD + CIE; default ON).\n"
+		"  -pt_spectral    : Hero-wavelength spectral transport (Smits RGB->SPD + CIE; default ON).\n"
 		"  -pt_nospectral  : Disable spectral; linear RGB path transport.\n"
 		"  -pt_lightradius N : Soft disk radius for light/light_spot (0=hard; world units; CHSS).\n"
 		"  -pt_lightpenumbra N : Softness growth vs distance for soft lights (default 1).\n"
@@ -3775,17 +3802,19 @@ void PrintUsage( int argc, char **argv )
 		"  -pt_denoiser X  : Denoiser oidn|optix|sakai (implies -pt_denoise; default oidn).\n"
 		"  -pt_nodennoise  : Disable PathTrace denoise.\n"
 		"  -pt_denoise_radius N : Sakai filter radius 1..8 (default 3; ignored by OIDN/OptiX).\n"
-		"  -pt_denoise_strength N : Blend 0..1 noisy→denoised (default 1; implies -pt_denoise).\n"
-		"  -coarse         : Larger lighting patches (chop 8) — faster VisLeafs/bounce.\n"
+		"  -pt_denoise_strength N : Blend 0..1 noisy->denoised (default 1; implies -pt_denoise).\n"
+		"  -coarse         : Larger lighting patches (chop 8) - faster VisLeafs/bounce.\n"
 		"  -adaptivechop   : Finer patch floor under -coarse (elongated patches).\n"
 		"  -texbounce      : Sample $basetexture albedo per patch for colored bounce.\n"
+		"  -texbounce_clean N : Kill DXT/JPEG chroma noise on near-greys (Oklab C; default 0.04; 0=off).\n"
+		"  -texbounce_noclean : Disable albedo chroma clean (keep raw texture tint).\n"
 		"  -bounce_soft N  : Bounce luxel splat scale (default 1=stock; <1 tighter; range 0.5..4).\n"
 		"  -bounce_boost N : Scale final bounced light (1=stock; 0..16). Direct lights unchanged.\n"
 		"  -bounce_chroma N: Early-bounce saturation boost (0=off; 0..8). Use with -texbounce.\n"
 		"  -bounce_weld    : Cull distant coplanar neighbor bounce (can blotch ceilings; off by default).\n"
-		"  -energy         : Cavity-damped radiosity — darkens enclosed bounce (off by default).\n"
+		"  -energy         : Cavity-damped radiosity - darkens enclosed bounce (off by default).\n"
 		"  -noenergy       : Stock Valve radiosity (no enclosure damp; default).\n"
-		"  -valve          : Same as -noenergy — stock Valve bounce look.\n"
+		"  -valve          : Same as -noenergy - stock Valve bounce look.\n"
 		"  -cavity N       : Fully-enclosed gather scale vs stock (default 0.70; range 0.25..1; implies -energy).\n"
 		"  -nostitch       : Disable lightmap seam stitching across coplanar face splits.\n"
 		"  -edgepull [N]   : Pull edge luxel samples inward (default ON, N=0.5 luxels). Helps thin walls.\n"
@@ -3853,7 +3882,7 @@ int RunVRAD( int argc, char **argv )
 
 	if ( g_bEnergyConserve )
 	{
-		Msg( "Cavity-damped radiosity: enclosed bounce gather ×%.2f (-noenergy for stock; -cavity N to tune).\n",
+		Msg( "Cavity-damped radiosity: enclosed bounce gather x%.2f (-noenergy for stock; -cavity N to tune).\n",
 			 g_flCavityScale );
 	}
 

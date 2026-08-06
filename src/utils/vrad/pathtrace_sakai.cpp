@@ -170,7 +170,7 @@ static void SakaiPass5( float *rgb, const float *luma, const float *varBuf, int 
 		rgb[i] = out[i];
 }
 
-// Mild 3x3 isotropic blend in low-gradient regions only — kills shadow mottling
+// Mild 3x3 isotropic blend in low-gradient regions only - kills shadow mottling
 // without soft-blurring hard shadow edges (stairs, wall contacts).
 static void SakaiEveningPass( float *rgb, const float *luma, int width, int height )
 {
@@ -222,7 +222,7 @@ static void SakaiEveningPass( float *rgb, const float *luma, int width, int heig
 
 			const float meanGrad = ( nNbr > 0 ) ? ( grad / (float)nNbr ) : 0.0f;
 			const float Lref = max( lc, 1e-4f );
-			// flatAmt → 1 in soft shadows / gradients, → 0 on hard edges.
+			// flatAmt -> 1 in soft shadows / gradients, -> 0 on hard edges.
 			const float flatAmt = 1.0f - min( 1.0f, meanGrad / ( 0.08f * Lref + 1e-4f ) );
 			const float a = flatAmt * flatAmt; // bias toward preserving edges
 
@@ -252,7 +252,7 @@ bool PathTraceSakai_DenoiseRGB( float *rgb, int width, int height, const float *
 	if ( radius > 4 )
 		radius = 4;
 
-	// More passes = cleaner; each pass stays 5x5 (no big windows → no block plateaus).
+	// More passes = cleaner; each pass stays 5x5 (no big windows -> no block plateaus).
 	const int nPasses = 1 + radius; // 2..5
 	// Slightly looser than 1.75: more neighbor share in noisy soft shadows.
 	const float tCrit = 1.35f;
@@ -264,7 +264,7 @@ bool PathTraceSakai_DenoiseRGB( float *rgb, int width, int height, const float *
 			luma[i] = SakaiLuma( rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2] );
 	}
 
-	// Two light evening passes — flattens mottled shadow interiors.
+	// Two light evening passes - flattens mottled shadow interiors.
 	SakaiEveningPass( rgb, luma.data(), width, height );
 	for ( int i = 0; i < n; ++i )
 		luma[i] = SakaiLuma( rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2] );

@@ -1,9 +1,9 @@
 //========= Copyright CustomVRAD contributors. ============//
-// Oklab — Björn Ottosson (2020), public domain / MIT.
+// Oklab - Bjoern Ottosson (2020), public domain / MIT.
 // https://bottosson.github.io/posts/oklab/
 //
 // Perceptual color ops for CustomVRAD (filters, bounce chroma, env tint).
-// Energy transport (albedo×light, NEE) stays linear RGB.
+// Energy transport (albedoxlight, NEE) stays linear RGB.
 //=============================================================================//
 #ifndef VRAD_OKLAB_H
 #define VRAD_OKLAB_H
@@ -14,9 +14,9 @@
 
 struct Oklab_t
 {
-	float L; // perceptual lightness (D65 white → 1; HDR lights may be >1)
-	float a; // green (−) … red (+)
-	float b; // blue (−) … yellow (+)
+	float L; // perceptual lightness (D65 white -> 1; HDR lights may be >1)
+	float a; // green (-) ... red (+)
+	float b; // blue (-) ... yellow (+)
 };
 
 inline Oklab_t Oklab_FromLinearSRGB( float r, float g, float b )
@@ -126,7 +126,7 @@ inline Vector Oklab_ScaleChroma( const Vector &c, float sat )
 	return Oklab_ClampNonNeg( Oklab_ToLinearSRGB( o ) );
 }
 
-// light_env_vol inbound tint: keep light's Oklab L (× lumScale), take a,b from tint.
+// light_env_vol inbound tint: keep light's Oklab L (x lumScale), take a,b from tint.
 inline Vector Oklab_ApplyTintPreserveL( const Vector &light, const Vector &tint, float lumScale )
 {
 	Oklab_t ol = Oklab_FromLinearSRGB( light );

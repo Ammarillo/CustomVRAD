@@ -30,6 +30,8 @@
 #include "bounce_vol.h"
 #include "map_shared.h"
 #include "vrad_emit.h"
+#include "ies_profile.h"
+#include "light_projection.h"
 
 extern char source[MAX_PATH];
 
@@ -1030,6 +1032,17 @@ directlight_t *AllocDLight( Vector& origin, bool bAddToList )
 	dl->index = numdlights++;
 	dl->m_nEnvId = LIGHTENV_ID_NONE;
 	dl->m_flSunAngularExtent = 0.0f;
+	dl->m_pIes = NULL;
+	dl->m_flIesScale = 1.0f;
+	dl->m_vecIesRight.Init( 1, 0, 0 );
+	dl->m_bIesBrightnessOverride = false;
+	dl->m_flIesBrightness = 0.0f;
+	dl->m_vecIesExportIntensity.Init();
+	dl->m_flIesMaxIntensity = 0.0f;
+	dl->m_pProj = NULL;
+	dl->m_vecProjRight.Init( 1, 0, 0 );
+	dl->m_vecProjUp.Init( 0, 0, 1 );
+	dl->m_nProjFrameMode = 0;
 
 	VectorCopy( origin, dl->light.origin );
 
@@ -1330,6 +1343,117 @@ static void ParseLightSpot( entity_t* e, directlight_t* dl )
 
 	dl->light.type = emit_spotlight;
 
+	// Optional IES photometric profile (bake-only). When set, inner/outer cone
+	// and _exponent are ignored for lighting - the IES table defines the beam.
+	const char *pIes = ValueForKey( e, "IES" );
+	if ( !pIes || !pIes[0] )
+		pIes = ValueForKey( e, "ies" );
+	if ( !pIes || !pIes[0] )
+		pIes = ValueForKey( e, "_ies" );
+	// Hammer / older FGD: scan epairs for any *ies* key (except ies_scale / brightness / max)
+	if ( !pIes || !pIes[0] )
+	{
+		for ( epair_t *ep = e->epairs; ep; ep = ep->next )
+		{
+			if ( !ep->key || !ep->value || !ep->value[0] )
+				continue;
+			if ( !Q_stristr( ep->key, "ies" ) )
+				continue;
+			if ( Q_stristr( ep->key, "scale" ) ||
+				 Q_stristr( ep->key, "bright" ) ||
+				 Q_stristr( ep->key, "max" ) )
+				continue;
+			pIes = ep->value;
+			Msg( "light_spot: using epair '%s' = '%s' as IES profile\n", ep->key, ep->value );
+			break;
+		}
+	}
+	if ( pIes && pIes[0] )
+	{
+		Msg( "light_spot at (%.0f %.0f %.0f): loading IES '%s'...\n",
+			 dest.x, dest.y, dest.z, pIes );
+		dl->m_pIes = IES_FindOrLoad( pIes );
+		dl->m_flIesScale = FloatForKeyWithDefault( e, "IESScale",
+			FloatForKeyWithDefault( e, "ies_scale",
+			FloatForKeyWithDefault( e, "_ies_scale", 1.0f ) ) );
+		if ( dl->m_flIesScale < 0.0f )
+			dl->m_flIesScale = 0.0f;
+		if ( dl->m_flIesScale > 64.0f )
+			dl->m_flIesScale = 64.0f;
+
+		dl->m_flIesMaxIntensity = FloatForKeyWithDefault( e, "IESMaxIntensity",
+			FloatForKeyWithDefault( e, "ies_max_intensity",
+			FloatForKeyWithDefault( e, "IESMaxLightmap", 0.0f ) ) );
+		if ( dl->m_flIesMaxIntensity < 0.0f )
+			dl->m_flIesMaxIntensity = 0.0f;
+
+		// IESBrightness: bake brightness separate from stock _light (engine export).
+		// < 0 (FGD default -1) = use stock _light brightness.
+		const float brightKey = FloatForKeyWithDefault( e, "IESBrightness",
+			FloatForKeyWithDefault( e, "ies_brightness",
+			FloatForKeyWithDefault( e, "_ies_brightness", -1.0f ) ) );
+		if ( brightKey >= 0.0f && dl->m_pIes )
+		{
+			dl->m_flIesBrightness = brightKey;
+			dl->m_vecIesExportIntensity = dl->light.intensity;
+			dl->m_bIesBrightnessOverride = true;
+
+			// Rebuild bake intensity from _light RGB + IESBrightness (ignore stock scaler).
+			double r = 255, g = 255, b = 255, scaler = 0;
+			const char *pLight = ValueForKey( e, "_light" );
+			if ( g_bHDR )
+			{
+				const char *pHdr = ValueForKey( e, "_lightHDR" );
+				double rH, gH, bH, sH;
+				if ( pHdr && pHdr[0] &&
+					 sscanf( pHdr, "%lf %lf %lf %lf", &rH, &gH, &bH, &sH ) >= 3 &&
+					 !( rH < 0 && gH < 0 && bH < 0 ) )
+				{
+					r = rH; g = gH; b = bH;
+				}
+				else if ( pLight && pLight[0] )
+					sscanf( pLight, "%lf %lf %lf %lf", &r, &g, &b, &scaler );
+			}
+			else if ( pLight && pLight[0] )
+			{
+				sscanf( pLight, "%lf %lf %lf %lf", &r, &g, &b, &scaler );
+			}
+
+			char rebuilt[128];
+			Q_snprintf( rebuilt, sizeof( rebuilt ), "%.6g %.6g %.6g %.6g", r, g, b, (double)dl->m_flIesBrightness );
+			LightForString( rebuilt, dl->light.intensity );
+			if ( g_bHDR )
+			{
+				VectorScale( dl->light.intensity,
+							 FloatForKeyWithDefault( e, "_lightscaleHDR", 1.0 ),
+							 dl->light.intensity );
+			}
+		}
+
+		if ( dl->m_pIes )
+		{
+			// Spin asymmetric IES with entity yaw/roll (SetupLightNormal drops
+			// yaw when pitch is +/-90 - basis must still use angles).
+			Vector angVec;
+			GetVectorForKey( e, "angles", angVec );
+			float pitch = FloatForKey( e, "pitch" );
+			float yaw = FloatForKey( e, "angle" );
+			if ( !pitch )
+				pitch = angVec.x;
+			if ( !yaw )
+				yaw = angVec.y;
+			const float roll = angVec.z;
+			Vector up;
+			IES_BuildBasis( dl->light.normal, QAngle( pitch, yaw, roll ),
+							dl->m_vecIesRight, up );
+		}
+		else
+		{
+			Warning( "light_spot at (%.0f %.0f %.0f): IES '%s' failed to load - using cone angles.\n",
+					 dest.x, dest.y, dest.z, pIes );
+		}
+	}
+
 	dl->light.stopdot = FloatForKey (e, "_inner_cone");
 	if (!dl->light.stopdot)
 		dl->light.stopdot = 10;
@@ -1341,7 +1465,7 @@ static void ParseLightSpot( entity_t* e, directlight_t* dl )
 		dl->light.stopdot2 = dl->light.stopdot;
 
 	// This is a point light if stop dots are 180...
-	if ((dl->light.stopdot == 180) && (dl->light.stopdot2 == 180))
+	if ((dl->light.stopdot == 180) && (dl->light.stopdot2 == 180) && !dl->m_pIes)
 	{
 		dl->light.stopdot = dl->light.stopdot2 = 0;
 		dl->light.type = emit_point;
@@ -1349,18 +1473,25 @@ static void ParseLightSpot( entity_t* e, directlight_t* dl )
 	}
 	else
 	{
-		// Clamp to 90, that's all DX8 can handle! 
+		// Clamp to 90 for engine worldlight export (DX8 cone limit).
+		// Bake with IES ignores these angles entirely.
 		if (dl->light.stopdot > 90)
 		{
-			Warning("WARNING: light_spot at (%i %i %i) has inner angle larger than 90 degrees! Clamping to 90...\n",
-					(int)dl->light.origin[0], (int)dl->light.origin[1], (int)dl->light.origin[2]);
+			if ( !dl->m_pIes )
+			{
+				Warning("WARNING: light_spot at (%i %i %i) has inner angle larger than 90 degrees! Clamping to 90...\n",
+						(int)dl->light.origin[0], (int)dl->light.origin[1], (int)dl->light.origin[2]);
+			}
 			dl->light.stopdot = 90;
 		}
 
 		if (dl->light.stopdot2 > 90)
 		{
-			Warning("WARNING: light_spot at (%i %i %i) has outer angle larger than 90 degrees! Clamping to 90...\n",
-					(int)dl->light.origin[0], (int)dl->light.origin[1], (int)dl->light.origin[2]);
+			if ( !dl->m_pIes )
+			{
+				Warning("WARNING: light_spot at (%i %i %i) has outer angle larger than 90 degrees! Clamping to 90...\n",
+						(int)dl->light.origin[0], (int)dl->light.origin[1], (int)dl->light.origin[2]);
+			}
 			dl->light.stopdot2 = 90;
 		}
 
@@ -1370,6 +1501,91 @@ static void ParseLightSpot( entity_t* e, directlight_t* dl )
 	}
 
 	SetLightFalloffParams(e,dl);
+
+	// ProjectedTexture: 2D planar (fit to outer cone) or cubemap - auto-detect from VTF.
+	const char *pProj = ValueForKey( e, "ProjectedTexture" );
+	if ( !pProj || !pProj[0] )
+		pProj = ValueForKey( e, "projectedtexture" );
+	if ( !pProj || !pProj[0] )
+		pProj = ValueForKey( e, "_projectedtexture" );
+	if ( pProj && pProj[0] )
+	{
+		dl->m_pProj = Proj_FindOrLoad( pProj );
+		if ( dl->m_pProj )
+		{
+			Vector angVec;
+			GetVectorForKey( e, "angles", angVec );
+			float pitch = FloatForKey( e, "pitch" );
+			float yaw = FloatForKey( e, "angle" );
+			if ( !pitch )
+				pitch = angVec.x;
+			if ( !yaw )
+				yaw = angVec.y;
+			const float roll = angVec.z;
+			IES_BuildBasis( dl->light.normal, QAngle( pitch, yaw, roll ),
+							dl->m_vecProjRight, dl->m_vecProjUp );
+			// Keep IES right aligned with projection when both are set.
+			if ( dl->m_pIes )
+				dl->m_vecIesRight = dl->m_vecProjRight;
+
+			dl->m_nProjFrameMode = (int)PROJ_FRAME_FILL;
+			const char *pMode = ValueForKey( e, "ProjectedTextureMode" );
+			if ( !pMode || !pMode[0] )
+				pMode = ValueForKey( e, "projectedtexturemode" );
+			if ( !pMode || !pMode[0] )
+				pMode = ValueForKey( e, "_projectedtexturemode" );
+			if ( pMode && pMode[0] )
+			{
+				if ( !Q_stricmp( pMode, "fit" ) || !Q_stricmp( pMode, "1" ) )
+					dl->m_nProjFrameMode = (int)PROJ_FRAME_FIT;
+				else if ( !Q_stricmp( pMode, "fill" ) || !Q_stricmp( pMode, "0" ) )
+					dl->m_nProjFrameMode = (int)PROJ_FRAME_FILL;
+			}
+
+			const ProjKind_t kind = Proj_Kind( dl->m_pProj );
+			if ( kind == PROJ_CUBE )
+			{
+				Msg( "light_spot at (%.0f %.0f %.0f): ProjectedTexture '%s' (cubemap, omnidirectional)%s\n",
+					 dest.x, dest.y, dest.z, pProj,
+					 dl->m_pIes ? " - IES used as angular mask" : "" );
+			}
+			else if ( kind == PROJ_SPHERE )
+			{
+				Msg( "light_spot at (%.0f %.0f %.0f): ProjectedTexture '%s' (2D envmap/matcap, omnidirectional)%s\n",
+					 dest.x, dest.y, dest.z, pProj,
+					 dl->m_pIes ? " - IES used as angular mask" : "" );
+			}
+			else
+			{
+				Msg( "light_spot at (%.0f %.0f %.0f): ProjectedTexture '%s' (2D planar, %s)%s\n",
+					 dest.x, dest.y, dest.z, pProj,
+					 ( dl->m_nProjFrameMode == (int)PROJ_FRAME_FIT ) ? "fit" : "fill",
+					 dl->m_pIes ? " - IES used as angular mask" : "" );
+			}
+		}
+		else
+		{
+			Warning( "light_spot at (%.0f %.0f %.0f): ProjectedTexture '%s' failed to load.\n",
+					 dest.x, dest.y, dest.z, pProj );
+		}
+	}
+
+	if ( dl->m_pIes )
+	{
+		if ( dl->m_bIesBrightnessOverride )
+		{
+			Msg( "light_spot at (%.0f %.0f %.0f): IES profile (scale %.2f, bake brightness %.0f, engine _light unchanged",
+				 dest.x, dest.y, dest.z, dl->m_flIesScale, dl->m_flIesBrightness );
+		}
+		else
+		{
+			Msg( "light_spot at (%.0f %.0f %.0f): IES profile (scale %.2f",
+				 dest.x, dest.y, dest.z, dl->m_flIesScale );
+		}
+		if ( dl->m_flIesMaxIntensity > 0.0f )
+			Msg( ", max lightmap %.1f", dl->m_flIesMaxIntensity );
+		Msg( ") - cone angles ignored for bake.\n" );
+	}
 }
 
 // NOTE: This is just a heuristic.  It traces a finite number of rays to find sky
@@ -1679,7 +1895,7 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 			bInheritedColor = true;
 		}
 
-		// SunSpreadAngle left at 0 → use default env's soft-sun extent
+		// SunSpreadAngle left at 0 -> use default env's soft-sun extent
 		if ( !ValueForKeyWithDefault( e, "SunSpreadAngle" ) ||
 			 fabsf( FloatForKeyWithDefault( e, "SunSpreadAngle", 0.0f ) ) < 1e-6f )
 		{
@@ -1694,7 +1910,7 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 	pAmbient->m_nEnvId = envId;
 	ParseSkyAmbientFromEntity( e, pSky, pAmbient );
 
-	// FGD default ambient "255 255 255 20" → inherit default env ambient
+	// FGD default ambient "255 255 255 20" -> inherit default env ambient
 	if ( gAmbient )
 	{
 		const char *pAmbKey = ValueForKey( e, "_ambient" );
@@ -1811,7 +2027,7 @@ void CreateDirectLights (void)
 			// scale to a range that results in actual light
 			VectorScale( dl->light.intensity, DIRECT_SCALE, dl->light.intensity );
 
-			// Soft area falloff for pathtrace / near-field contact (equiv. disk radius²).
+			// Soft area falloff for pathtrace / near-field contact (equiv. disk radius^2).
 			dl->m_flAreaRadius2 = max( 4.0f, p->area / (float)M_PI );
 			dl->m_flEndFadeDistance = -1.0f; // AllocDLight uses calloc (no ctor)
 			dl->m_flCapDist = 1.0e22f;
@@ -1824,7 +2040,7 @@ void CreateDirectLights (void)
 	VRadEmit_CreateDirectLights();
 	
 	//
-	// entities — default light_environment first so volumes can inherit sun extent
+	// entities - default light_environment first so volumes can inherit sun extent
 	//
 	for (i=0 ; i<(unsigned)num_entities ; i++)
 	{
@@ -1835,7 +2051,7 @@ void CreateDirectLights (void)
 	}
 
 	// Cordon / editor cull often strips light_environment from the BSP while
-	// the source .vmf still has it — outdoor sky goes black without this.
+	// the source .vmf still has it - outdoor sky goes black without this.
 	if ( !gSkyLight )
 	{
 		char vmfPath[MAX_PATH];
@@ -1846,12 +2062,12 @@ void CreateDirectLights (void)
 		memset( &vmfEnv, 0, sizeof( vmfEnv ) );
 		if ( LoadLightEnvironmentEntityFromVmf( vmfPath, &vmfEnv ) )
 		{
-			Msg( "light_environment missing from BSP (cordon/hidden?) — loaded from %s\n", vmfPath );
+			Msg( "light_environment missing from BSP (cordon/hidden?) - loaded from %s\n", vmfPath );
 			ParseLightEnvironment( &vmfEnv, dl );
 		}
 		else
 		{
-			Warning( "WARNING: no light_environment in BSP or '%s' — outdoor/sky lighting will be black.\n",
+			Warning( "WARNING: no light_environment in BSP or '%s' - outdoor/sky lighting will be black.\n",
 					 vmfPath );
 		}
 	}
@@ -1984,7 +2200,11 @@ void ExportDirectLightsToWorldLights()
 		wl->style	= dl->light.style;
 		VectorCopy( dl->light.origin, wl->origin );
 		// FIXME: why does vrad want 0 to 255 and not 0 to 1??
-		VectorScale( dl->light.intensity, (1.0 / 255.0), wl->intensity );
+		// IESBrightness overrides bake intensity only - export stock _light.
+		if ( dl->m_bIesBrightnessOverride )
+			VectorScale( dl->m_vecIesExportIntensity, (1.0 / 255.0), wl->intensity );
+		else
+			VectorScale( dl->light.intensity, (1.0 / 255.0), wl->intensity );
 		VectorCopy( dl->light.normal, wl->normal );
 		wl->stopdot	= dl->light.stopdot;
 		wl->stopdot2 = dl->light.stopdot2;
@@ -2010,7 +2230,7 @@ void ExportDirectLightsToWorldLights()
 // Soft sun (SunSpreadAngle) cone sampling.
 // Low-discrepancy directions (van der Corput radius + golden-angle spiral)
 // give smooth penumbras with no random speckle, and any prefix of the
-// sequence is evenly spread over the cone — so a short probe pass can
+// sequence is evenly spread over the cone - so a short probe pass can
 // early-out luxels that are fully lit or fully shadowed.
 // ---------------------------------------------------------------------------
 static inline float SoftSunRadicalInverse( unsigned int i )
@@ -2030,7 +2250,7 @@ static int SoftSunSampleCount( float flSinExtent, bool bFast )
 	if ( s < 0.0f ) s = 0.0f;
 	if ( s > 1.0f ) s = 1.0f;
 	const float angleDeg = (float)( asin( s ) * ( 180.0 / M_PI ) );
-	int n = 8 + (int)( angleDeg * 0.6f );		// 2° → 9, 20° → 20, 50° → 38
+	int n = 8 + (int)( angleDeg * 0.6f );		// 2 deg -> 9, 20 deg -> 20, 50 deg -> 38
 	if ( n > 40 )
 		n = 40;
 	if ( bFast )
@@ -2084,7 +2304,7 @@ static void SoftVolumeSampleOffset( float flRadius, int i, Vector &offsetOut )
 		offsetOut.Init();
 		return;
 	}
-	// Radius via cube-root of radical inverse → uniform volume density.
+	// Radius via cube-root of radical inverse -> uniform volume density.
 	const float u = SoftSunRadicalInverse( (unsigned int)i );
 	const float r = flRadius * cbrtf( u );
 	// Direction: golden-angle spiral on the unit sphere.
@@ -2180,7 +2400,7 @@ void GatherSampleSkyLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, i
 		}
 		else
 		{
-			// GPU failed — fall back to CPU tracing below.
+			// GPU failed - fall back to CPU tracing below.
 			totalFractionVisible = Four_Zeros;
 		}
 	}
@@ -2478,7 +2698,7 @@ static bool GatherSampleAmbientSkySSE_GPU( SSE_sampleLightOutput_t &out, directl
 	return true;
 }
 
-// Soft sphere point light: average falloff × N·L × visibility over sample
+// Soft sphere point light: average falloff x N*L x visibility over sample
 // origins scattered inside m_flVolumeRadius (same spirit as soft sun).
 void GatherSampleVolumeLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, int facenum,
 								 FourVectors const& pos, FourVectors *pNormals, int normalCount, int iThread,
@@ -2680,12 +2900,6 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 		dot2 = delta * dl->light.normal;
 		dot2 = NegSIMD( dot2 );
 
-		// Affix dot2 to zero if outside light cone
-		inCone = CmpGtSIMD( dot2, ReplicateX4( dl->light.stopdot2 ) );
-		if ( !TestSignSIMD ( inCone ) )
-			return;
-		dot = AndSIMD( inCone, dot );
-
 		constant  = ReplicateX4( dl->light.constant_attn );
 		linear    = ReplicateX4( dl->light.linear_attn );
 		quadratic = ReplicateX4( dl->light.quadratic_attn );
@@ -2695,24 +2909,80 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 		out.m_flFalloff = AddSIMD( out.m_flFalloff, MulSIMD( linear, falloffEvalDist ) );
 		out.m_flFalloff = AddSIMD( out.m_flFalloff, constant );
 		out.m_flFalloff = ReciprocalSIMD( out.m_flFalloff );
-		out.m_flFalloff = MulSIMD( out.m_flFalloff, dot2 );
 
-		// outside the inner cone
-		inFringe = CmpLeSIMD( dot2, ReplicateX4( dl->light.stopdot ) );
-		mult = ReplicateX4( dl->light.stopdot - dl->light.stopdot2 );
-		mult = ReciprocalSIMD( mult );
-		mult = MulSIMD( mult, SubSIMD( dot2, ReplicateX4( dl->light.stopdot2 ) ) );
-		mult = MinSIMD( mult, Four_Ones );
-		mult = MaxSIMD( mult, Four_Zeros );
+		// Cubemap ProjectedTexture: omnidirectional (like a point light) - no cone.
+		// IES (if set) still acts as an angular mask.
+		if ( Proj_IsOmniEnvmap( dl ) )
+		{
+			if ( dl->m_pIes )
+			{
+				float iesScale[4];
+				for ( int lane = 0; lane < 4; ++lane )
+				{
+					Vector lightToSample(
+						-SubFloat( delta.x, lane ),
+						-SubFloat( delta.y, lane ),
+						-SubFloat( delta.z, lane ) );
+					float w = IES_Eval( dl->m_pIes, dl->light.normal, dl->m_vecIesRight, lightToSample );
+					iesScale[lane] = w * dl->m_flIesScale;
+				}
+				fltx4 ies = LoadUnalignedSIMD( iesScale );
+				out.m_flFalloff = MulSIMD( out.m_flFalloff, ies );
+				fltx4 alive = CmpGtSIMD( ies, Four_Zeros );
+				dot = AndSIMD( dot, alive );
+				if ( !TestSignSIMD( alive ) )
+					return;
+			}
+		}
+		else if ( dl->m_pIes )
+		{
+			// IES replaces inner/outer cone and emitter-cos fringe entirely.
+			// Irradiance ~ IES(dir) / (c+ld+qd^2); surface cos is in `dot`.
+			float iesScale[4];
+			for ( int lane = 0; lane < 4; ++lane )
+			{
+				Vector lightToSample(
+					-SubFloat( delta.x, lane ),
+					-SubFloat( delta.y, lane ),
+					-SubFloat( delta.z, lane ) );
+				float w = IES_Eval( dl->m_pIes, dl->light.normal, dl->m_vecIesRight, lightToSample );
+				iesScale[lane] = w * dl->m_flIesScale;
+			}
+			fltx4 ies = LoadUnalignedSIMD( iesScale );
+			out.m_flFalloff = MulSIMD( out.m_flFalloff, ies );
+			// Zero contribution behind the emitter / zero IES
+			fltx4 alive = CmpGtSIMD( ies, Four_Zeros );
+			dot = AndSIMD( dot, alive );
+			if ( !TestSignSIMD( alive ) )
+				return;
+		}
+		else
+		{
+			// Affix dot2 to zero if outside light cone
+			inCone = CmpGtSIMD( dot2, ReplicateX4( dl->light.stopdot2 ) );
+			if ( !TestSignSIMD ( inCone ) )
+				return;
+			dot = AndSIMD( inCone, dot );
 
-		// pow is fixed point, so this isn't the most accurate, but it doesn't need to be
-		if ( (dl->light.exponent != 0.0f ) && ( dl->light.exponent != 1.0f ) )
-			mult = PowSIMD( mult, dl->light.exponent );
+			out.m_flFalloff = MulSIMD( out.m_flFalloff, dot2 );
 
-		// if not in between inner and outer cones, mult by 1
-		mult = AndSIMD( inFringe, mult );
-		mult = AddSIMD( mult, AndNotSIMD( inFringe, Four_Ones ) );
-		out.m_flFalloff = MulSIMD( mult, out.m_flFalloff );
+			// outside the inner cone
+			inFringe = CmpLeSIMD( dot2, ReplicateX4( dl->light.stopdot ) );
+			mult = ReplicateX4( dl->light.stopdot - dl->light.stopdot2 );
+			mult = ReciprocalSIMD( mult );
+			mult = MulSIMD( mult, SubSIMD( dot2, ReplicateX4( dl->light.stopdot2 ) ) );
+			mult = MinSIMD( mult, Four_Ones );
+			mult = MaxSIMD( mult, Four_Zeros );
+
+			// pow is fixed point, so this isn't the most accurate, but it doesn't need to be
+			if ( (dl->light.exponent != 0.0f ) && ( dl->light.exponent != 1.0f ) )
+				mult = PowSIMD( mult, dl->light.exponent );
+
+			// if not in between inner and outer cones, mult by 1
+			mult = AndSIMD( inFringe, mult );
+			mult = AddSIMD( mult, AndNotSIMD( inFringe, Four_Ones ) );
+			out.m_flFalloff = MulSIMD( mult, out.m_flFalloff );
+		}
 		break;
 
 	}
@@ -3421,7 +3691,27 @@ static void GatherSampleLightAt4Points( SSE_SampleInfo_t& info, int sampleIdx, i
 		{
 			for ( int i = 0; i < numSamples; i++ )
 			{
-				pLightmaps[n][sampleIdx + i].AddLight( SubFloat( fxdot[n], i ), dl->light.intensity, SubFloat( out.m_flSunAmount, i ) );
+				float amt = SubFloat( fxdot[n], i );
+				Vector intensity = dl->light.intensity;
+				if ( dl->m_pProj && amt > 0.0f )
+				{
+					Vector samplePos( SubFloat( info.m_Points.x, i ),
+									  SubFloat( info.m_Points.y, i ),
+									  SubFloat( info.m_Points.z, i ) );
+					Vector lightToSample = samplePos - dl->light.origin;
+					Vector rgb = Proj_EvalLightRGB( dl, lightToSample );
+					intensity.x *= rgb.x;
+					intensity.y *= rgb.y;
+					intensity.z *= rgb.z;
+				}
+				if ( dl->m_pIes && dl->m_flIesMaxIntensity > 0.0f && amt > 0.0f )
+				{
+					Vector c = intensity * amt;
+					const float m = max( c.x, max( c.y, c.z ) );
+					if ( m > dl->m_flIesMaxIntensity )
+						amt *= dl->m_flIesMaxIntensity / m;
+				}
+				pLightmaps[n][sampleIdx + i].AddLight( amt, intensity, SubFloat( out.m_flSunAmount, i ) );
 			}
 		}
 	}
@@ -3495,7 +3785,27 @@ static void ResampleLightAt4Points( SSE_SampleInfo_t& info, int lightStyleIndex,
 		{
 			for( int n = 0; n < info.m_NormalCount; ++n )
 			{
-				pLightmap[i][n].AddLight( SubFloat( fxdot[n], i ), dl->light.intensity, SubFloat( out.m_flSunAmount, i ) );
+				float amt = SubFloat( fxdot[n], i );
+				Vector intensity = dl->light.intensity;
+				if ( dl->m_pProj && amt > 0.0f )
+				{
+					Vector samplePos( SubFloat( info.m_Points.x, i ),
+									  SubFloat( info.m_Points.y, i ),
+									  SubFloat( info.m_Points.z, i ) );
+					Vector lightToSample = samplePos - dl->light.origin;
+					Vector rgb = Proj_EvalLightRGB( dl, lightToSample );
+					intensity.x *= rgb.x;
+					intensity.y *= rgb.y;
+					intensity.z *= rgb.z;
+				}
+				if ( dl->m_pIes && dl->m_flIesMaxIntensity > 0.0f && amt > 0.0f )
+				{
+					Vector c = intensity * amt;
+					const float m = max( c.x, max( c.y, c.z ) );
+					if ( m > dl->m_flIesMaxIntensity )
+						amt *= dl->m_flIesMaxIntensity / m;
+				}
+				pLightmap[i][n].AddLight( amt, intensity, SubFloat( out.m_flSunAmount, i ) );
 			}
 		}
 	}

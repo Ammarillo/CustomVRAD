@@ -7,15 +7,15 @@
 
 #include "mathlib/vector.h"
 
-// One emissive triangle with vertex emission (albedo×strength) for area NEE.
-// Refs: PBRT DiffuseAreaLight (area→solid-angle PDF), Veach MIS.
+// One emissive triangle with vertex emission (albedoxstrength) for area NEE.
+// Refs: PBRT DiffuseAreaLight (area->solid-angle PDF), Veach MIS.
 struct VRadEmitTri_t
 {
 	Vector	v0, v1, v2;
 	Vector	n;			// unit geometric normal (emission side)
 	Vector	e0, e1, e2;	// radiance at verts (VRAD direct units, includes DIRECT_SCALE)
 	float	area;
-	float	power;		// avg(|e|) * area — for power CDF
+	float	power;		// avg(|e|) * area - for power CDF
 	int		facenum;
 };
 

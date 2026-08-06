@@ -1,5 +1,5 @@
 //========= Copyright CustomVRAD contributors. ============//
-// light_bounce_vol — local artistic bounce overrides (boost / chroma).
+// light_bounce_vol - local artistic bounce overrides (boost / chroma).
 //=============================================================================//
 #ifndef VRAD_BOUNCE_VOL_H
 #define VRAD_BOUNCE_VOL_H

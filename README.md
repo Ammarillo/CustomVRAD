@@ -5,7 +5,8 @@ Custom **64-bit VRAD** for **Garry’s Mod** / Source SDK 2013. Drop-in lighting
 Compatible lightmap / BSP lighting output for the engine. Experimental — validate looks on your maps before shipping.
 
 **Repo:** https://github.com/Ammarillo/CustomVRAD  
-**FGD:** [`fgd/customvrad.fgd`](fgd/customvrad.fgd)
+**FGD:** [`fgd/customvrad.fgd`](fgd/customvrad.fgd)  
+**Algorithms:** [`docs/algorithms.tex`](docs/algorithms.tex) (technical report; compile with `pdflatex`)
 
 ---
 
@@ -18,6 +19,8 @@ Compatible lightmap / BSP lighting output for the engine. Experimental — valid
 | `light_ao` / `light_ao_vol` | point / brush | Baked AO with multi-scale, selective direct/bounce/sky factors, bent normals |
 | `light_absorb` | brush entity | Volumes that damp bounce (and optional direct) light |
 | `light_volume` | point entity | Soft sphere point light (scattered origins, like soft sun) |
+| `light_spot` `IES` / `IESScale` / `IESBrightness` / `IESMaxIntensity` | entity keys | IESNA LM-63 photometric intensity for spots (bake-only; replaces cone angles) |
+| `light_spot` `ProjectedTexture` | entity key | Planar, cubemap, or spherical projected VTF modulation (auto-detect; bake-only) |
 | Soft sun | bake | Faster, smoother `SunSpreadAngle` / `-softsun` cone sampling |
 | Cross-face bounce weld | bake | Opt-in (`-bounce_weld`): edge-weighted bounce across coplanar seams |
 | Lightmap seam stitching | bake | Blends luxels across coplanar VBSP face splits (`-nostitch` to disable) |
@@ -165,6 +168,54 @@ Sample count scales with radius (~16 at default 16, capped at 40; reduced with `
 
 ---
 
+## `light_spot` photometry and projected textures
+
+Bake-only extensions on stock `light_spot`. Engine worldlights continue to use
+cone keys for dynamic lighting; the lightmap bake may replace or modulate that
+response with an IESNA table and/or a projected VTF.
+
+### IESNA profiles (`IES`)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `IES` | (empty) | LM-63 `.ies` path under `garrysmod/IES/` (also `IES/maps/<map>/`) |
+| `IESScale` | `1` | Scales the peak-normalized angular table |
+| `IESBrightness` | `-1` | Bake brightness (same units as `_light`’s 4th component). `-1` uses stock `_light`. Values `≥ 0` override bake intensity only; set `_light` brightness to `0` to suppress engine dynamic light |
+| `IESMaxIntensity` | `0` | Per-luxel RGB cap on this light’s direct contribution (`0` = off) |
+
+When `IES` is set, the bake ignores `_inner_cone`, `_cone`, and `_exponent`; the
+candela table defines the beam. Distance attenuation is unchanged. Supported on
+classic radiosity and path tracing (CPU/GPU). Only `TILT=NONE` files are accepted.
+
+Place e.g. `garrysmod/IES/light01.ies`, set `IES` to `light01`, and optionally
+`IESBrightness` for bake intensity independent of `_light`.
+
+### `ProjectedTexture`
+
+Material path under `materials/` (e.g. `lights/gobos/logo`). Classification is
+automatic from the VTF:
+
+| VTF | Behaviour |
+|-----|-----------|
+| Planar 2D | Image framed to the outer cone (`_cone`); see `ProjectedTextureMode` |
+| Cubemap (6 faces) | Omnidirectional cube sample; entity angles rotate the frame |
+| 2D + ENVMAP (matcap / spheremap / equirect) | Omnidirectional 2D map — square → spheremap, wide → equirect |
+
+**`ProjectedTextureMode`** (planar only; default `fill`):
+
+| Mode | Geometry |
+|------|----------|
+| `fill` | Square sides lie on the cone; corners are clipped |
+| `fit` | Square inscribed in the cone (`×√2`); full image visible |
+
+Projected RGB multiplies light intensity. With `IES` also set, the IES table is
+an angular mask on the projection. Cubemap / spherical modes are
+omnidirectional (no cone cull). Face UVs follow Direct3D / Source
+`CUBEMAP_FACE_*` conventions (Z-up axes). See
+[`docs/algorithms.tex`](docs/algorithms.tex) § Photometric spots and projected textures.
+
+---
+
 ## Soft sun (`SunSpreadAngle` / `-softsun`)
 
 Replaces stock’s fixed 30 random rays:
@@ -228,6 +279,7 @@ Without `-gpu`, everything falls back to CPU.
 | `-coarse` | Patch chop `8` — fewer patches, faster VisLeafs / bounce |
 | `-adaptivechop` | Finer patches where sky visibility contrasts (floor `4` under `-coarse`) |
 | `-texbounce` | Sample `$basetexture` albedo per patch for color bleed (supports VTF 7.5; fallback: flat texdata average) |
+| `-texbounce_clean N` | Soft-kill DXT/JPEG chroma noise on near-greys (Oklab C; default **0.04**; **0**/`-texbounce_noclean` = off). Stops yellowish bounce from “white” walls |
 | `-energy` | Opt-in — cavity-damped radiosity (enclosed bounce darkened; outdoor nearly unchanged) |
 | `-noenergy` / `-valve` | Stock Valve radiosity (no enclosure damp; **default**) |
 | `-cavity N` | Fully-enclosed gather scale vs stock (default `0.70`; range `0.25`–`1`; implies `-energy`) |
@@ -472,6 +524,8 @@ Also see [`configs/full.cfg`](configs/full.cfg) (same flags, commented for toggl
 | Parameter | Description |
 |-----------|-------------|
 | `-texbounce` | Sample `$basetexture` albedo per patch for colored bounce |
+| `-texbounce_clean N` | Kill compression chroma on near-greys (default **0.04**; **0** = off) |
+| `-texbounce_noclean` | Keep raw texture tint (disable clean) |
 | `-coarse` | Larger lighting patches (chop **8**) — faster VisLeafs/bounce |
 | `-adaptivechop` | Finer patch floor under `-coarse` (elongated patches) |
 | `-chop N` | Smallest luxel widths for a bounce patch (edges) |

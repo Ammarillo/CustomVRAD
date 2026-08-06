@@ -833,7 +833,7 @@ void ComputeIndirectLightingAtPoint( Vector &position, Vector &normal, Vector &o
 				{
 					const bool bHit = hitT[j] < MAX_TRACE_LENGTH - 1.0f;
 					if ( !bHit || ( hitFlags[j] & TRACE_ID_SKY ) )
-						continue;	// escaped to void or sky — no bounce
+						continue;	// escaped to void or sky - no bounce
 
 					// Static props aren't part of the BSP walk; the first world
 					// surface may lie beyond the prop, so keep the full ray.
@@ -844,7 +844,7 @@ void ComputeIndirectLightingAtPoint( Vector &position, Vector &normal, Vector &o
 					if ( !SampleIndirectRay( iThread, position, dirs[j], rayLen, outColor ) &&
 						 rayLen < MAX_TRACE_LENGTH )
 					{
-						// Shortened walk found nothing (rare BVH/BSP mismatch) — retry full.
+						// Shortened walk found nothing (rare BVH/BSP mismatch) - retry full.
 						SampleIndirectRay( iThread, position, dirs[j], MAX_TRACE_LENGTH, outColor );
 					}
 				}

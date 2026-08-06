@@ -1,21 +1,21 @@
 //========= Copyright CustomVRAD contributors. ============//
 // Compact HLSL spectral helpers for the luxel baker.
 // Uses smooth RGB lobe upsampling (not full Smits tables) so DXC stays
-// stable — full Smits remains available on CPU in pt_spectral.h.
+// stable - full Smits remains available on CPU in pt_spectral.h.
 //=============================================================================//
 #include "pt_spectral_hlsl.h"
 #include <string>
 
 std::string PtSpectralHLSL()
 {
-	// Keep this small: Smits 14×32 tables + dual PathLi previously AV'd DXC (0xC0000005).
+	// Keep this small: Smits 14x32 tables + dual PathLi previously AV'd DXC (0xC0000005).
 	return R"HLSL(
 static const float SPEC_LMIN = 380.0f;
 static const float SPEC_LMAX = 780.0f;
 static const float SPEC_CIE_Y_INT = 106.856895f;
 static const uint SPEC_WAVES = 4;
 
-// Smooth RGB→SPD lobes (stable, low register pressure). Illuminant may be >1.
+// Smooth RGB->SPD lobes (stable, low register pressure). Illuminant may be >1.
 float SpecFromRgb( float3 rgb, float lambda, bool illuminant )
 {
 	float3 c = illuminant ? max( rgb, 0.0f ) : saturate( rgb );

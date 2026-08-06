@@ -107,10 +107,10 @@ bool LightEnv_ShouldIgnoreSkyOccluder( const Vector &samplePos, const Vector &hi
 		const bool sampleIn = PointInVolumeAABB( v, samplePos );
 		const bool hitIn = PointInVolumeAABB( v, hitPos );
 
-		// Outside geo → sample inside volume
+		// Outside geo -> sample inside volume
 		if ( sampleIn && !hitIn && !v.bOutsideCastShadow )
 			return true;
-		// Inside geo → sample outside volume
+		// Inside geo -> sample outside volume
 		if ( !sampleIn && hitIn && !v.bInsideCastShadow )
 			return true;
 	}
@@ -262,14 +262,14 @@ static float RawVolumeWeight( int idx, const Vector &pos )
 	switch ( v.blendMode )
 	{
 	case LIGHTENV_BLEND_INSIDE:
-		// 0 at face / outside → 1 at +BlendDistance inside.
+		// 0 at face / outside -> 1 at +BlendDistance inside.
 		if ( dist <= 0.0f )
 			return 0.0f;
 		t = dist / blend;
 		break;
 
 	case LIGHTENV_BLEND_OUTSIDE:
-		// 1 inside / at face → 0 at -BlendDistance outside.
+		// 1 inside / at face -> 0 at -BlendDistance outside.
 		if ( dist >= 0.0f )
 			return 1.0f;
 		t = 1.0f + dist / blend;
@@ -400,7 +400,7 @@ void LightEnv_MaybeTintInboundBounce( int receiverEnvId, int emitterEnvId, Vecto
 	if ( !vol.bInboundBounceUsesVolumeColor )
 		return;
 
-	// Emitter is inside the same volume — keep natural bounce color.
+	// Emitter is inside the same volume - keep natural bounce color.
 	if ( emitterEnvId == receiverEnvId )
 		return;
 

@@ -10,16 +10,16 @@
 #include <stdint.h>
 
 // VMT keys (CustomVRAD):
-//   $vrad_filter            "1"            — enable colored transmission
-//   $vrad_filtermap         "path/to/tex"  — optional RGB filter map (else $basetexture)
-//   $vrad_filterstrength    "1"            — 0 = no tint, 1 = full texture tint
-//   $vrad_filteropacity     "0.05"         — flat absorption (0..1); keep low for stacked panes
-//   $vrad_filterthickness   "1"            — pow(filterRGB, thickness) for denser stained glass
-//   $nocull                 "1"            — two-sided (default for filters). Explicit "0" ignored
+//   $vrad_filter            "1"            - enable colored transmission
+//   $vrad_filtermap         "path/to/tex"  - optional RGB filter map (else $basetexture)
+//   $vrad_filterstrength    "1"            - 0 = no tint, 1 = full texture tint
+//   $vrad_filteropacity     "0.05"         - flat absorption (0..1); keep low for stacked panes
+//   $vrad_filterthickness   "1"            - pow(filterRGB, thickness) for denser stained glass
+//   $nocull                 "1"            - two-sided (default for filters). Explicit "0" ignored
 //                                           unless $vrad_filter_onesided is set.
-//   $vrad_filter_onesided   "0"            — 1 = front-face tint only (no backface multiply)
+//   $vrad_filter_onesided   "0"            - 1 = front-face tint only (no backface multiply)
 //
-// Stacked panes: Oklab gel stack (L0*L1, a0+a1, b0+b1) — see oklab.h.
+// Stacked panes: Oklab gel stack (L0*L1, a0+a1, b0+b1) - see oklab.h.
 // Transmittance: Oklab lerp(white, pow(rgb, thickness), strength) * (1 - opacity)
 
 bool VRadFilter_FaceFilters( int facenum );
@@ -51,8 +51,8 @@ bool VRadFilter_HasAny( void );
 // GPU upload: Texture2DArray (one layer per unique filter VTF) + per-tri meta
 //   [0] avgT.xyz, mode (0=opaque, 1=avg-only, 2=textured)
 //   [1] strength, opacity, thickness, flags (1=clampU, 2=clampV, 4=$nocull)
-//   [2] texVecU (world → texel S)
-//   [3] texVecV (world → texel T)
+//   [2] texVecU (world -> texel S)
+//   [3] texVecV (world -> texel T)
 //   [4] layerIndex, uvScale (mipW/origW), mipW, mipH
 // ---------------------------------------------------------------------------
 static const int kVRadFilterMetaFloat4s = 5;

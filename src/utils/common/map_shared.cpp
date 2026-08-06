@@ -240,21 +240,15 @@ static ChunkFileResult_t LoadLightEnvEntityCallback( CChunkFile *pFile, LoadLigh
 	return ChunkFile_Ok;
 }
 
+// Nested Hammer "hidden { }" (visgroups / cordons). Do not PushHandlers per nest
+// (overflows MAX_INDENT_DEPTH) and do not loop ReadChunk — one ReadChunk consumes
+// this block; looping past EndOfChunk desyncs the parser and crashes on large .vmf.
 static ChunkFileResult_t LoadLightEnvHiddenCallbackDepth( CChunkFile *pFile, LoadLightEnv_t *pCtx )
 {
 	++g_nLightEnvHiddenDepth;
-	CChunkHandlerMap Handlers;
-	Handlers.AddHandler( "entity", (ChunkHandler_t)LoadLightEnvEntityCallback, pCtx );
-	Handlers.AddHandler( "hidden", (ChunkHandler_t)LoadLightEnvHiddenCallbackDepth, pCtx );
-	pFile->PushHandlers( &Handlers );
-
-	ChunkFileResult_t eResult = ChunkFile_Ok;
-	while ( eResult == ChunkFile_Ok )
-		eResult = pFile->ReadChunk();
-
-	pFile->PopHandlers();
+	const ChunkFileResult_t eResult = pFile->ReadChunk();
 	--g_nLightEnvHiddenDepth;
-	return ( eResult == ChunkFile_EOF ) ? ChunkFile_Ok : eResult;
+	return eResult;
 }
 
 bool LoadLightEnvironmentEntityFromVmf( const char *pFilename, entity_t *pOut )

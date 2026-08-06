@@ -220,6 +220,111 @@ CRITICAL_SECTION g_SpewCS;
 bool g_bSpewCSInitted = false;
 bool g_bSuppressPrintfOutput = false;
 
+// Console Color channels are boolean flags (see SetConsoleTextColor), not 0-255.
+// Pick a meaning-based palette so bake logs are scannable at a glance.
+enum SpewMeaningColor_t
+{
+	SPEWCOL_DEFAULT = 0,	// white
+	SPEWCOL_INFO,			// cyan - progress / status
+	SPEWCOL_OK,				// green - loaded / success / done
+	SPEWCOL_NOTE,			// magenta - fallback / degraded / FYI
+	SPEWCOL_WARN,			// yellow - warning / clamp / missing
+	SPEWCOL_FAIL,			// red - failed / error / abort
+};
+
+static SpewMeaningColor_t ClassifySpewMeaning( const char *pMsg )
+{
+	if ( !pMsg || !pMsg[0] )
+		return SPEWCOL_DEFAULT;
+
+	// Tiny pacifier fragments (".", "3", "\n") - leave alone.
+	int nAlpha = 0;
+	for ( const char *p = pMsg; *p; ++p )
+	{
+		if ( ( *p >= 'A' && *p <= 'Z' ) || ( *p >= 'a' && *p <= 'z' ) )
+			++nAlpha;
+	}
+	if ( nAlpha < 6 )
+		return SPEWCOL_DEFAULT;
+
+	// Failure first (overrides "warning: failed to...").
+	if ( V_stristr( pMsg, "failed" ) ||
+		 V_stristr( pMsg, "failure" ) ||
+		 V_stristr( pMsg, "could not" ) ||
+		 V_stristr( pMsg, "couldn't" ) ||
+		 V_stristr( pMsg, "cannot " ) ||
+		 V_stristr( pMsg, "can't " ) ||
+		 V_stristr( pMsg, "fatal" ) ||
+		 V_stristr( pMsg, "abort" ) ||
+		 V_stristr( pMsg, " crash" ) ||
+		 V_stristr( pMsg, "error" ) )
+		return SPEWCOL_FAIL;
+
+	if ( V_stristr( pMsg, "warning" ) ||
+		 V_stristr( pMsg, "clamp" ) ||
+		 V_stristr( pMsg, "degenerate" ) ||
+		 V_stristr( pMsg, "missing" ) ||
+		 V_stristr( pMsg, "ignored" ) ||
+		 V_stristr( pMsg, "skipping" ) ||
+		 V_stristr( pMsg, "skip " ) )
+		return SPEWCOL_WARN;
+
+	// Success before fallback notes so "loaded ... (raw decode)" stays green.
+	if ( V_stristr( pMsg, "loaded" ) ||
+		 V_stristr( pMsg, "success" ) ||
+		 V_stristr( pMsg, "complete" ) ||
+		 V_stristr( pMsg, "finished" ) ||
+		 V_stristr( pMsg, "enabled" ) ||
+		 V_stristr( pMsg, " active" ) ||
+		 V_stristr( pMsg, "done<" ) ||
+		 V_stristr( pMsg, "done\n" ) ||
+		 ( V_stristr( pMsg, "done" ) && V_stristr( pMsg, "sec" ) ) )
+		return SPEWCOL_OK;
+
+	// Degraded / alternate path (still usable).
+	if ( V_stristr( pMsg, "fallback" ) ||
+		 V_stristr( pMsg, "fall back" ) ||
+		 V_stristr( pMsg, "instead" ) ||
+		 V_stristr( pMsg, "not a 6-face" ) ||
+		 V_stristr( pMsg, "facecount" ) ||
+		 V_stristr( pMsg, "using 2d" ) ||
+		 V_stristr( pMsg, "degraded" ) )
+		return SPEWCOL_NOTE;
+
+	if ( V_stristr( pMsg, "loading" ) ||
+		 V_stristr( pMsg, "building" ) ||
+		 V_stristr( pMsg, "baking" ) ||
+		 V_stristr( pMsg, "tracing" ) ||
+		 V_stristr( pMsg, "processing" ) ||
+		 V_stristr( pMsg, "compiling" ) ||
+		 V_stristr( pMsg, "gathering" ) ||
+		 V_stristr( pMsg, "pathtrace" ) ||
+		 V_stristr( pMsg, "projectedtexture" ) ||
+		 V_stristr( pMsg, "ies " ) ||
+		 V_stristr( pMsg, "light_spot" ) ||
+		 V_stristr( pMsg, "light_env" ) ||
+		 V_stristr( pMsg, "light_volume" ) ||
+		 V_stristr( pMsg, "light_ao" ) ||
+		 V_stristr( pMsg, "light_absorb" ) ||
+		 V_stristr( pMsg, "light_bounce" ) )
+		return SPEWCOL_INFO;
+
+	return SPEWCOL_DEFAULT;
+}
+
+static WORD SetConsoleColorForMeaning( SpewMeaningColor_t meaning )
+{
+	switch ( meaning )
+	{
+	case SPEWCOL_FAIL:	return SetConsoleTextColor( 1, 0, 0, 1 ); // red
+	case SPEWCOL_WARN:	return SetConsoleTextColor( 1, 1, 0, 1 ); // yellow
+	case SPEWCOL_NOTE:	return SetConsoleTextColor( 1, 0, 1, 1 ); // magenta
+	case SPEWCOL_OK:	return SetConsoleTextColor( 0, 1, 0, 1 ); // green
+	case SPEWCOL_INFO:	return SetConsoleTextColor( 0, 1, 1, 1 ); // cyan
+	default:			return SetConsoleTextColor( 1, 1, 1, 0 ); // white
+	}
+}
+
 SpewRetval_t CmdLib_SpewOutputFunc( SpewType_t type, char const *pMsg )
 {
 	// Hopefully two threads won't call this simultaneously right at the start!
@@ -234,32 +339,34 @@ SpewRetval_t CmdLib_SpewOutputFunc( SpewType_t type, char const *pMsg )
 	
 	EnterCriticalSection( &g_SpewCS );
 	{
-		if (( type == SPEW_MESSAGE ) || (type == SPEW_LOG ))
+		if ( ( type == SPEW_MESSAGE ) || ( type == SPEW_LOG ) )
 		{
 			Color c = *GetSpewOutputColor();
 			if ( c.r() != 255 || c.g() != 255 || c.b() != 255 )
 			{
-				// custom color
+				// Explicit ColorSpewMessage - honor caller.
 				old = SetConsoleTextColor( c.r(), c.g(), c.b(), c.a() );
 			}
 			else
 			{
-				old = SetConsoleTextColor( 1, 1, 1, 0 );
+				old = SetConsoleColorForMeaning( ClassifySpewMeaning( pMsg ) );
 			}
 			retVal = SPEW_CONTINUE;
 		}
-		else if( type == SPEW_WARNING )
+		else if ( type == SPEW_WARNING )
 		{
-			old = SetConsoleTextColor( 1, 1, 0, 1 );
+			// Failures logged as Warning -> red; otherwise yellow.
+			const SpewMeaningColor_t m = ClassifySpewMeaning( pMsg );
+			old = SetConsoleColorForMeaning( ( m == SPEWCOL_FAIL ) ? SPEWCOL_FAIL : SPEWCOL_WARN );
 			retVal = SPEW_CONTINUE;
 		}
-		else if( type == SPEW_ASSERT )
+		else if ( type == SPEW_ASSERT )
 		{
 			old = SetConsoleTextColor( 1, 0, 0, 1 );
 			retVal = SPEW_DEBUGGER;
 
 		}
-		else if( type == SPEW_ERROR )
+		else if ( type == SPEW_ERROR )
 		{
 			old = SetConsoleTextColor( 1, 0, 0, 1 );
 			retVal = SPEW_ABORT; // doesn't matter.. we exit below so we can return an errorlevel (which dbg.dll doesn't do).

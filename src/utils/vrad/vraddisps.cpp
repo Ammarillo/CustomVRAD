@@ -1735,8 +1735,8 @@ bool CVRadDispMgr::BuildDispSamplesAndLuxels_DoFast( lightinfo_t *pLightInfo, fa
 	float stepV = 1.0f / ( float )( height - 1 );
 
 	// Match BuildDispLuxels: UV on [0,1] at luxel grid corners.
-	// Do NOT add halfStep — that pushes the last U/V row past 1.0, DispUVToSurfPoint
-	// early-outs without writing, and samples stay at (0,0,0) → black edges on 2 sides.
+	// Do NOT add halfStep - that pushes the last U/V row past 1.0, DispUVToSurfPoint
+	// early-outs without writing, and samples stay at (0,0,0) -> black edges on 2 sides.
 	texinfo_t *pTex = &texinfo[pLightInfo->face->texinfo];
 	pFaceLight->worldAreaPerLuxel = 1.0 / ( sqrt( DotProduct( pTex->lightmapVecsLuxelsPerWorldUnits[0],
 															  pTex->lightmapVecsLuxelsPerWorldUnits[0] ) ) *

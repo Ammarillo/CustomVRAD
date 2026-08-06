@@ -13,7 +13,7 @@
 class RayTracingEnvironment;
 
 extern bool g_bVRadGPURequested;
-extern bool g_bVRadCoarsePatches; // larger chop → fewer patches
+extern bool g_bVRadCoarsePatches; // larger chop -> fewer patches
 extern float g_flMaxTransferDist; // 0 = off; world units squared cull in VisLeafs
 
 bool VRadGPU_IsActive();

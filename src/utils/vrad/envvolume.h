@@ -19,8 +19,8 @@
 // Per-volume BlendDistance placement relative to the brush face.
 enum LightEnvBlendMode_t
 {
-	LIGHTENV_BLEND_INSIDE = 0,	// fade only inside (0 at face → 1 at +BlendDistance)
-	LIGHTENV_BLEND_OUTSIDE = 1,	// full inside; fade only outside (1 at face → 0 at -BlendDistance)
+	LIGHTENV_BLEND_INSIDE = 0,	// fade only inside (0 at face -> 1 at +BlendDistance)
+	LIGHTENV_BLEND_OUTSIDE = 1,	// full inside; fade only outside (1 at face -> 0 at -BlendDistance)
 	LIGHTENV_BLEND_CENTER = 2,	// fade straddles the face (center shell)
 };
 

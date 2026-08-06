@@ -152,7 +152,7 @@ void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vect
 		radcolor[i].Init();
 		sampled[i] = false;
 
-		// -fastambient: every other sphere direction (~2× faster leaf cubes).
+		// -fastambient: every other sphere direction (~2x faster leaf cubes).
 		if ( g_bFastAmbient && ( i & 1 ) )
 			continue;
 

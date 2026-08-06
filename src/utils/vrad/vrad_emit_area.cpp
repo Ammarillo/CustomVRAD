@@ -1,5 +1,5 @@
 //========= Copyright CustomVRAD contributors. ============//
-// Textured mesh area lights — PBRT DiffuseAreaLight-style sampling.
+// Textured mesh area lights - PBRT DiffuseAreaLight-style sampling.
 //=============================================================================//
 
 #include "vrad_emit_area.h"
@@ -19,7 +19,7 @@ static CUtlVector<float> g_EmitCdf;		// inclusive prefix, normalized to 1
 static CUtlVector<char> g_EmitFaceHasMesh;	// numfaces bytes
 static float g_EmitPowerSum = 0.0f;
 
-// Match prior $vrad_emit cast calibration (128² reference sheet).
+// Match prior $vrad_emit cast calibration (128^2 reference sheet).
 static const float kEmitRefArea = 128.0f * 128.0f;
 static const float kDirectScale = 100.0f * 100.0f;
 
@@ -104,7 +104,7 @@ int VRadEmitArea_Build( void )
 			VectorNormalize( t.n );
 			if ( DotProduct( n, t.n ) < 0.0f )
 			{
-				// Fan winding opposite plane — swap to match.
+				// Fan winding opposite plane - swap to match.
 				Vector tmp = t.v1; t.v1 = t.v2; t.v2 = tmp;
 			}
 

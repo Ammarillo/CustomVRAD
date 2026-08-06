@@ -4,6 +4,7 @@
 
 #include "bounce_albedo.h"
 #include "vrad.h"
+#include "oklab.h"
 #include "bsplib.h"
 #include "cmdlib.h"
 #include "vtf/vtf.h"
@@ -51,7 +52,7 @@ static bool LoadFileToBuffer( const char *pPath, CUtlBuffer &buf )
 	return true;
 }
 
-// maps/<level>/<mat>_<x>_<y>_<z>  →  <mat>  (same as LightForTexture)
+// maps/<level>/<mat>_<x>_<y>_<z>  ->  <mat>  (same as LightForTexture)
 static bool ResolveCubemapPatchMaterial( const char *pName, char *pOut, int nOut )
 {
 	if ( !pName || Q_strncmp( pName, "maps/", 5 ) != 0 )
@@ -153,7 +154,7 @@ static BounceAlbedoTexture_t *LoadAlbedoFromBaseTextureName( const char *pBaseTe
 		return NULL;
 	}
 
-	// Bounce only needs low-frequency albedo — pick the smallest mip whose
+	// Bounce only needs low-frequency albedo - pick the smallest mip whose
 	// max edge is still >= 256 (or the lowest mip). Cuts VRAM and sample cost.
 	const int kMaxBounceAlbedoEdge = 256;
 	int mip = 0;
@@ -188,7 +189,7 @@ static BounceAlbedoTexture_t *LoadAlbedoFromBaseTextureName( const char *pBaseTe
 	if ( !bConverted )
 	{
 		delete[] pDstImage;
-		// Fall back: convert full texture then (still use mip 0 after convert — rare path).
+		// Fall back: convert full texture then (still use mip 0 after convert - rare path).
 		pTex->ConvertImageFormat( IMAGE_FORMAT_RGBA8888, false );
 		pSrcImage = pTex->ImageData( 0, 0, mip );
 		if ( !pSrcImage || pTex->Format() != IMAGE_FORMAT_RGBA8888 )
@@ -335,7 +336,7 @@ static BounceAlbedoTexture_t *FindOrLoadAlbedoForMaterial( const char *pMaterial
 	char szBase[MAX_PATH];
 	const char *pBaseTextureName = ReadBaseTextureFromVmt( pLookupName, szBase, sizeof( szBase ) );
 
-	// Also try the unresolved maps/ VMT (pakfile patch) for include → $basetexture
+	// Also try the unresolved maps/ VMT (pakfile patch) for include -> $basetexture
 	if ( !pBaseTextureName && pLookupName != pMaterialName )
 		pBaseTextureName = ReadBaseTextureFromVmt( pMaterialName, szBase, sizeof( szBase ) );
 
@@ -432,6 +433,43 @@ static inline int WrapOrClamp( int v, int size, bool bClamp )
 	return v;
 }
 
+extern float g_flTexbounceClean;
+
+// DXT / JPEG / resize chroma noise on white/grey albedo shows up as yellowish
+// (or pink/green) bounce. Soft-kill low Oklab chroma; keep real painted colors.
+static inline void SanitizeCompressionChroma( Vector &lin )
+{
+	if ( g_flTexbounceClean <= 0.0f )
+		return;
+
+	Oklab_t o = Oklab_FromLinearSRGB( lin );
+	const float C = sqrtf( o.a * o.a + o.b * o.b );
+	const float soft = g_flTexbounceClean;
+	const float keep = soft * 2.5f;
+	if ( C <= soft )
+	{
+		o.a = 0.0f;
+		o.b = 0.0f;
+	}
+	else if ( C < keep )
+	{
+		const float t = ( C - soft ) / ( keep - soft );
+		o.a *= t;
+		o.b *= t;
+	}
+	else
+		return;
+
+	lin = Oklab_ToLinearSRGBClamped( o );
+}
+
+static inline float SrgbByteToLinear( unsigned char b )
+{
+	float u = b * ( 1.0f / 255.0f );
+	u = max( 0.0f, min( 1.0f, u ) );
+	return ( u <= 0.04045f ) ? ( u / 12.92f ) : powf( ( u + 0.055f ) / 1.055f, 2.4f );
+}
+
 bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLinearRGB )
 {
 	if ( facenum < 0 || facenum >= numfaces )
@@ -460,15 +498,11 @@ bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLi
 		return false;
 
 	const unsigned char *p = &pTex->rgba[nOff];
-	// IEC 61966-2-1 sRGB → linear (PBRT ColorEncoding::sRGB). Albedo must be linear
+	// IEC 61966-2-1 sRGB -> linear (PBRT ColorEncoding::sRGB). Albedo must be linear
 	// reflectance for physically based bounce; using encoded bytes as-is over-brightens GI.
-	auto srgbToLinear = []( float u ) -> float
-	{
-		u = max( 0.0f, min( 1.0f, u ) );
-		return ( u <= 0.04045f ) ? ( u / 12.92f ) : powf( ( u + 0.055f ) / 1.055f, 2.4f );
-	};
-	outLinearRGB.x = srgbToLinear( p[0] * ( 1.0f / 255.0f ) );
-	outLinearRGB.y = srgbToLinear( p[1] * ( 1.0f / 255.0f ) );
-	outLinearRGB.z = srgbToLinear( p[2] * ( 1.0f / 255.0f ) );
+	outLinearRGB.x = SrgbByteToLinear( p[0] );
+	outLinearRGB.y = SrgbByteToLinear( p[1] );
+	outLinearRGB.z = SrgbByteToLinear( p[2] );
+	SanitizeCompressionChroma( outLinearRGB );
 	return true;
 }

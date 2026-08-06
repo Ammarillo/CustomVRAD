@@ -371,7 +371,7 @@ static EmitMaterial_t *ParseEmitMaterial( const char *pMaterialName )
 	char szMap[MAX_PATH] = {};
 	char szBase[MAX_PATH] = {};
 
-	// KeyValues only — Do NOT use GetMaterialVar("$basetexture"): texture vars
+	// KeyValues only - Do NOT use GetMaterialVar("$basetexture"): texture vars
 	// crash on GetStringValue(). Custom $vrad_emit* are plain strings/floats in the VMT.
 	KeyValues *pVMT = LoadMergedVmtKeys( pLookup );
 	if ( !pVMT && pLookup != pMaterialName )
@@ -620,10 +620,10 @@ int VRadEmit_CreateDirectLights( void )
 		VectorMA( a.normal, patch->area, patch->normal, a.normal );
 
 		// Brightness scale for textured $vrad_emit*:
-		//   /basearea (stock lights.rad) → invisible under pathtrace area falloff
-		//   no divide → blown out
-		//   /sqrt(basearea) → still too hot
-		// Fixed ref sheet (128²) keeps $vrad_emitstrength in a usable range regardless
+		//   /basearea (stock lights.rad) -> invisible under pathtrace area falloff
+		//   no divide -> blown out
+		//   /sqrt(basearea) -> still too hot
+		// Fixed ref sheet (128^2) keeps $vrad_emitstrength in a usable range regardless
 		// of VTF resolution.
 		Vector patchI;
 		const float kRefArea = 128.0f * 128.0f;
@@ -656,7 +656,7 @@ int VRadEmit_CreateDirectLights( void )
 		dl->light.type = emit_surface;
 		dl->facenum = face;
 		VectorCopy( nrm, dl->light.normal );
-		// Cap R²: full face-area R made cos/(r²+R²) kill stock-scale lights on large faces.
+		// Cap R^2: full face-area R made cos/(r^2+R^2) kill stock-scale lights on large faces.
 		// Small R keeps near-contact soft without crushing room lighting.
 		dl->m_flAreaRadius2 = max( 4.0f, min( a.area / (float)M_PI, 48.0f ) );
 		dl->m_flEndFadeDistance = -1.0f; // calloc skips ctor; uncapped

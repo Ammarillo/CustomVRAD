@@ -85,7 +85,7 @@ enum { kMinGPURays = 32 };
 enum { kDefaultRayBatch = 32768 };
 enum { kUploadChunkBytes = 16 * 1024 * 1024 };
 // Soft cap for GPU BVH (0 = unlimited). Override with -gpu_maxtris.
-// Default unlimited — large scenes are handled via small ray batches instead.
+// Default unlimited - large scenes are handled via small ray batches instead.
 enum { kDefaultMaxTris = 0 };
 
 int g_nMaxRayBatch = kDefaultRayBatch;
@@ -170,7 +170,7 @@ static float intersectTri(Float3 o, Float3 d, TriGPU t)
   return tt;
 }
 
-// Oklab (Ottosson) — inbound bounce tint only in this kernel.
+// Oklab (Ottosson) - inbound bounce tint only in this kernel.
 static Float3 oklabFromLin(float r, float g, float b)
 {
   if (r < 0.0f) r = 0.0f;
@@ -378,7 +378,7 @@ static void ReleaseSceneBuffers();
 static void ReleaseGatherBuffers();
 static void ShutdownUnlocked();
 
-// Only flips the flag — resources are freed in VRadGPU_Shutdown so other
+// Only flips the flag - resources are freed in VRadGPU_Shutdown so other
 // threads still inside a trace call never touch released handles.
 static void MarkGPUFailed( const char *why )
 {
@@ -417,7 +417,7 @@ static int BuildBVHRecursive( std::vector<int> &indices, int begin, int end, int
 	const int nodeIndex = (int)g_hostBVH.size();
 	g_hostBVH.push_back( node );
 
-	// Slightly larger leaves → shallower tree, less stack pressure in kernels.
+	// Slightly larger leaves -> shallower tree, less stack pressure in kernels.
 	if ( count <= 8 || depth > 40 )
 	{
 		BVHNodeGPU leaf = g_hostBVH[nodeIndex];
@@ -561,7 +561,7 @@ static TraceCtx *AcquireTraceCtx()
 		return ctx;
 	}
 	if ( (int)g_ctxPool.size() >= kMaxTraceCtx )
-		return nullptr;	// all busy — caller falls back to CPU tracing
+		return nullptr;	// all busy - caller falls back to CPU tracing
 	TraceCtx *ctx = CreateTraceCtx();
 	if ( ctx )
 		g_ctxPool.push_back( ctx );
@@ -606,11 +606,11 @@ static bool FitsDeviceAlloc( size_t bytes, const char *label )
 {
 	if ( g_deviceMaxAlloc == 0 )
 		return true;
-	// Leave headroom — some ICDs reject near-limit COPY/WRITE sizes.
+	// Leave headroom - some ICDs reject near-limit COPY/WRITE sizes.
 	const cl_ulong limit = (cl_ulong)( g_deviceMaxAlloc * 0.85 );
 	if ( bytes > (size_t)limit )
 	{
-		Warning( "[VRAD-GPU] %s is %zu MB (device max alloc ~%llu MB) — skipping GPU scene.\n",
+		Warning( "[VRAD-GPU] %s is %zu MB (device max alloc ~%llu MB) - skipping GPU scene.\n",
 				 label, bytes / ( 1024 * 1024 ),
 				 (unsigned long long)( g_deviceMaxAlloc / ( 1024 * 1024 ) ) );
 		return false;
@@ -627,7 +627,7 @@ static bool UploadSceneToGPU()
 	const int nCaptured = (int)g_hostTris.size();
 	if ( g_nMaxTris > 0 && nCaptured > g_nMaxTris )
 	{
-		Warning( "[VRAD-GPU] Scene has %d tris (limit %d). GPU BVH skipped — bounce still on GPU; "
+		Warning( "[VRAD-GPU] Scene has %d tris (limit %d). GPU BVH skipped - bounce still on GPU; "
 				 "occlusion/closest use CPU. Raise with -gpu_maxtris N or drop -StaticPropPolys.\n",
 				 nCaptured, g_nMaxTris );
 		g_hostTris.clear();
@@ -924,12 +924,12 @@ bool VRadGPU_InitAfterScene()
 	g_bActive = true;
 	if ( bSceneOk )
 	{
-		Msg( "[VRAD-GPU] Ready — bounce gather + occlusion/closest (%d tris, %d BVH nodes).\n",
+		Msg( "[VRAD-GPU] Ready - bounce gather + occlusion/closest (%d tris, %d BVH nodes).\n",
 			 g_nTris, g_nBVH );
 	}
 	else
 	{
-		Msg( "[VRAD-GPU] Ready — bounce gather accelerated (CPU traces).\n" );
+		Msg( "[VRAD-GPU] Ready - bounce gather accelerated (CPU traces).\n" );
 	}
 	return true;
 }

@@ -53,10 +53,19 @@ struct PtGpuBakeLight
 	float	sunExtent;		// sin(angle)
 	float	volumeRadius;
 	float	power;			// for CDF / power sampling (locals)
+	float	iesScale;		// IES intensity scale (0 = no IES / use cone)
+	float	iesMaxIntensity;// per-sample direct clamp (0 = off); packed in areaR2 for IES spots
 	int		facenum;
 	int		envId;
 	int		isLocal;		// 1 = point/spot (power-sampled pool)
-	int		pad1;
+	int		iesLayer;		// GPU IES atlas layer (-1 = cone falloff)
+	// ProjectedTexture (bake-only)
+	float	projRight[3];
+	float	projOuterCos;	// light.stopdot2 (cos outer) for 2D planar fit
+	float	projUp[3];
+	float	projMode;		// 0=none, 1=2D planar, 2=cube, 3=spheremap/equirect
+	int		projLayer;		// planar layer or cube index
+	int		projFrameMode;	// 0=fill, 1=fit (2D only)
 };
 
 struct PtGpuBakeLuxel
@@ -134,6 +143,7 @@ struct PtGpuEmitTri
 // Upload lights + per-triangle albedo once per bake. albedoRGB = nTris*3 floats.
 // filterMeta = nTris*5 float4s; filterArrayRGBA = Texture2DArray layers (W*H*4*layers).
 // emitTris/cdf optional ($vrad_emit area mesh); pass nullptr/0 if unused.
+// projCookies / projCubes: ProjectedTexture Texture2DArrays (cubes store 6 faces per cube).
 bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 								const float *albedoRGB, uint32_t nTris,
 								const PtGpuBakeParams &params,
@@ -142,7 +152,15 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 								const float *filterMeta = nullptr,
 								const unsigned char *filterArrayRGBA = nullptr,
 								uint32_t filterArrayW = 0, uint32_t filterArrayH = 0,
-								uint32_t filterArrayLayers = 0 );
+								uint32_t filterArrayLayers = 0,
+								const float *iesAtlas = nullptr,
+								uint32_t iesLayers = 0,
+								const unsigned char *projCookieRGBA = nullptr,
+								uint32_t projCookieW = 0, uint32_t projCookieH = 0,
+								uint32_t projCookieLayers = 0,
+								const unsigned char *projCubeRGBA = nullptr,
+								uint32_t projCubeW = 0, uint32_t projCubeH = 0,
+								uint32_t projCubeLayers = 0 );
 
 // spp / sampleOffset for multi-pass high-spp bakes (chunked for GPU occupancy).
 void PathTraceDXR_GpuBakeConfigurePass( uint32_t spp, uint32_t sampleOffset );

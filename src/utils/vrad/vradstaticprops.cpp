@@ -10,6 +10,7 @@
 //=============================================================================//
 
 #include "vrad.h"
+#include "light_projection.h"
 #include "mathlib/vector.h"
 #include "UtlBuffer.h"
 #include "utlvector.h"
@@ -1206,13 +1207,27 @@ void ComputeDirectLightingAtPoint( Vector &position, Vector &normal, Vector &out
 		GatherSampleLightSSE( sampleOutput, dl, -1, adjusted_pos4, &normal4, 1, iThread, nLFlags | GATHERLFLAGS_FORCE_FAST,
 		                      static_prop_id_to_skip, flEpsilon );
 		
-		VectorMA( outColor, sampleOutput.m_flFalloff.m128_f32[0] * sampleOutput.m_flDot[0].m128_f32[0], dl->light.intensity, outColor );
+		{
+			const float amt = sampleOutput.m_flFalloff.m128_f32[0] * sampleOutput.m_flDot[0].m128_f32[0];
+			Vector intensity = dl->light.intensity;
+			if ( dl->m_pProj && amt > 0.0f )
+			{
+				Vector lightToSample = adjusted_pos - dl->light.origin;
+				Vector rgb = Proj_EvalLightRGB( dl, lightToSample );
+				intensity.x *= rgb.x;
+				intensity.y *= rgb.y;
+				intensity.z *= rgb.z;
+			}
+			Vector contrib = intensity * amt;
+			contrib = IES_ClampDirectSample( dl, contrib );
+			outColor += contrib;
+		}
 	}
 }
 
 //-----------------------------------------------------------------------------
 // Same as ComputeDirectLightingAtPoint, but lights up to 4 vertices per
-// gather call — one traced ray set serves 4 verts instead of duplicating
+// gather call - one traced ray set serves 4 verts instead of duplicating
 // one vertex across all SSE lanes (~4x fewer traces for prop vertices).
 //-----------------------------------------------------------------------------
 static void ComputeDirectLightingAtPoints4( const Vector *positions, const Vector *normals,
@@ -1285,7 +1300,20 @@ static void ComputeDirectLightingAtPoints4( const Vector *positions, const Vecto
 		{
 			float scale = pvsMask[i] * sampleOutput.m_flFalloff.m128_f32[i] * sampleOutput.m_flDot[0].m128_f32[i];
 			if ( scale > 0.0f )
-				VectorMA( outColors[i], scale, dl->light.intensity, outColors[i] );
+			{
+				Vector intensity = dl->light.intensity;
+				if ( dl->m_pProj )
+				{
+					Vector lightToSample = adjusted[i] - dl->light.origin;
+					Vector rgb = Proj_EvalLightRGB( dl, lightToSample );
+					intensity.x *= rgb.x;
+					intensity.y *= rgb.y;
+					intensity.z *= rgb.z;
+				}
+				Vector contrib = intensity * scale;
+				contrib = IES_ClampDirectSample( dl, contrib );
+				outColors[i] += contrib;
+			}
 		}
 	}
 }
@@ -1293,7 +1321,7 @@ static void ComputeDirectLightingAtPoints4( const Vector *positions, const Vecto
 //-----------------------------------------------------------------------------
 // Takes the results from a ComputeLighting call and applies it to the static prop in question.
 // Vertex colors are computed once against the shared studio vertex pool; every VTX LOD
-// inherits those colors via origMeshVertID (same light for LOD0 / LOD1 / …).
+// inherits those colors via origMeshVertID (same light for LOD0 / LOD1 / ...).
 //-----------------------------------------------------------------------------
 void CVradStaticPropMgr::ApplyLightingToStaticProp( int iStaticProp, CStaticProp &prop, const CComputeStaticPropLightingResults *pResults )
 {
@@ -1358,7 +1386,7 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp( int iStaticProp, CStaticProp
 
 						if (colorTexels)
 						{
-							// Same lightmap for every LOD — lower LODs inherit LOD0 texel lighting.
+							// Same lightmap for every LOD - lower LODs inherit LOD0 texel lighting.
 							ConvertTexelDataToTexture(prop.m_LightmapImageWidth, prop.m_LightmapImageHeight, prop.m_LightmapImageFormat, (*colorTexels), &prop.m_MeshData[nMeshIdx].m_TexelsEncoded);
 
 							if (g_bDumpPropLightmaps)
@@ -1900,8 +1928,8 @@ struct PtPropTexelTemplate
 
 struct PtPropModelTemplate
 {
-	CUtlVector<PtPropVertTemplate> vertSections; // one per body×model
-	CUtlVector<PtPropTexelTemplate> texelSections; // one per body×model (may be empty)
+	CUtlVector<PtPropVertTemplate> vertSections; // one per bodyxmodel
+	CUtlVector<PtPropTexelTemplate> texelSections; // one per bodyxmodel (may be empty)
 };
 
 static unsigned int PtPropSampleSeed( const Vector &pos, int propIndex )
@@ -2052,7 +2080,7 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 	struct VertScatter_t { int prop; int section; int v0, v1, v2; float b0, b1, b2; };
 	CUtlVector<SampleMap_t> texelMaps;
 	CUtlVector<VertScatter_t> vertScatters;
-	// Cap resident jobs — 17M verts * ~72B ≈ 1.2GB and was OOMing into Map() AVs.
+	// Cap resident jobs - 17M verts * ~72B ~= 1.2GB and was OOMing into Map() AVs.
 	const int kJobChunk = 262144;
 	texelJobs.EnsureCapacity( kJobChunk );
 	vertJobs.EnsureCapacity( kJobChunk );
@@ -2254,7 +2282,7 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 	}
 	if ( g_nPathTracePropVertGrid > 0 )
 	{
-		// Rough: ~2 tris/vert × lattice samples/tri.
+		// Rough: ~2 tris/vert x lattice samples/tri.
 		const unsigned spTri = (unsigned)( ( g_nPathTracePropVertGrid + 1 ) * ( g_nPathTracePropVertGrid + 2 ) / 2 );
 		estVerts = estVerts * 2u * spTri / 3u;
 	}
@@ -2398,7 +2426,7 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 						}
 					}
 				}
-				// Vert color arrays are allocated in phase 2 — keeps ~18M verts off the heap
+				// Vert color arrays are allocated in phase 2 - keeps ~18M verts off the heap
 				// during lightmap GpuBakeBegin (was causing intermittent Map/OOM AVs).
 			}
 		}
@@ -2412,7 +2440,7 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 	const int vertGrid = g_nPathTracePropVertGrid;
 	if ( vertGrid > 0 )
 	{
-		Msg( "[PathTrace-DXR] Prop vertex lighting: virtual tri lightmap edge subdiv=%d (~%d samples/tri, barycentric → verts).\n",
+		Msg( "[PathTrace-DXR] Prop vertex lighting: virtual tri lightmap edge subdiv=%d (~%d samples/tri, barycentric -> verts).\n",
 			 vertGrid, ( vertGrid + 1 ) * ( vertGrid + 2 ) / 2 );
 		fflush( stdout );
 	}
@@ -2694,7 +2722,7 @@ void CVradStaticPropMgr::ComputeLighting( int iThread )
 			bGpuProps = ComputeLightingPathTraceGPU();
 			SuppressPacifier( false );
 			if ( !bGpuProps )
-				Warning( "[PathTrace-DXR] Prop GPU bake failed — falling back to stock CPU prop lighting.\n" );
+				Warning( "[PathTrace-DXR] Prop GPU bake failed - falling back to stock CPU prop lighting.\n" );
 		}
 	}
 

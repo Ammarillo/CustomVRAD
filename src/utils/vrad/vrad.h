@@ -98,8 +98,27 @@ struct directlight_t
 	float	m_flSunAngularExtent;
 	// light_volume: soft-sample sphere radius in world units (0 = hard point).
 	float	m_flVolumeRadius;
-	// Soft area falloff for emit_surface / texlights: cos/(dist²+R²). 0 = classic 1/r².
+	// Soft area falloff for emit_surface / texlights: cos/(dist^2+R^2). 0 = classic 1/r^2.
 	float	m_flAreaRadius2;
+	// light_spot IES photometric profile (bake-only). When set, cone angles are ignored.
+	const struct IesProfile	*m_pIes;
+	float	m_flIesScale;
+	Vector	m_vecIesRight;		// orthonormal right for IES phi=0
+	// IESBrightness: when set, bake intensity uses this brightness (stock _light 4th)
+	// instead of _light's brightness. Engine worldlights keep m_vecIesExportIntensity.
+	bool	m_bIesBrightnessOverride;
+	float	m_flIesBrightness;			// Hammer brightness units (like _light 4th)
+	Vector	m_vecIesExportIntensity;	// original _light intensity for worldlight export
+	// Cap max RGB component of this light's direct contribution per sample (0 = off).
+	float	m_flIesMaxIntensity;
+
+	// light_spot ProjectedTexture (bake-only). Auto 2D cookie or cubemap.
+	// When set with IES, IES is an angular mask multiplied onto the projection RGB.
+	// Cubemap mode is omnidirectional (spot cone ignored).
+	const struct ProjTex *m_pProj;
+	Vector	m_vecProjRight;
+	Vector	m_vecProjUp;
+	int		m_nProjFrameMode;	// ProjFrameMode_t: FILL or FIT (2D)
 
 	directlight_t(void)
 	{
@@ -110,8 +129,30 @@ struct directlight_t
 		m_flSunAngularExtent = 0.0f;
 		m_flVolumeRadius = 0.0f;
 		m_flAreaRadius2 = 0.0f;
+		m_pIes = NULL;
+		m_flIesScale = 1.0f;
+		m_vecIesRight.Init( 1, 0, 0 );
+		m_bIesBrightnessOverride = false;
+		m_flIesBrightness = 0.0f;
+		m_vecIesExportIntensity.Init();
+		m_flIesMaxIntensity = 0.0f;
+		m_pProj = NULL;
+		m_vecProjRight.Init( 1, 0, 0 );
+		m_vecProjUp.Init( 0, 0, 1 );
+		m_nProjFrameMode = 0; // PROJ_FRAME_FILL
 	}
 };
+
+// Clamp one sample of IES direct lighting to m_flIesMaxIntensity (max RGB component).
+inline Vector IES_ClampDirectSample( const directlight_t *dl, const Vector &contrib )
+{
+	if ( !dl || !dl->m_pIes || dl->m_flIesMaxIntensity <= 0.0f )
+		return contrib;
+	const float m = max( contrib.x, max( contrib.y, contrib.z ) );
+	if ( m > dl->m_flIesMaxIntensity && m > 0.0f )
+		return contrib * ( dl->m_flIesMaxIntensity / m );
+	return contrib;
+}
 
 struct bumplights_t
 {
@@ -194,7 +235,7 @@ struct LightingValue_t
 };
 
 
-#define	MAX_PATCHES	(32*65536)	// 2097152 — dense luxels / large maps (was 8*65536)
+#define	MAX_PATCHES	(32*65536)	// 2097152 - dense luxels / large maps (was 8*65536)
 
 struct CPatch
 {
@@ -306,6 +347,7 @@ extern bool g_bShowStaticPropNormals;
 extern bool g_bDisablePropSelfShadowing;
 extern bool g_bStitchSeams;			// blend lightmap luxels across coplanar VBSP face splits
 extern bool g_bTexturedBounce;		// sample $basetexture albedo for colored bounce
+extern float g_flTexbounceClean;	// Oklab chroma soft-kill for DXT/compression noise (0=off)
 extern float g_flBounceBoost;		// scale final bounced light (1 = stock)
 extern float g_flBounceChroma;		// early-bounce saturation boost (0 = off)
 extern bool g_bAdaptiveChop;		// subdivide more near sky visibility contrast

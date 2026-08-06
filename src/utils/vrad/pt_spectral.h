@@ -1,13 +1,13 @@
 //========= Copyright CustomVRAD contributors. ============//
 // Hero-wavelength spectral transport helpers for pathtrace.
 //
-// RGB→spectrum: Smits 1999 via PBRT-v3 tabulated basis (BSD).
-//   Matt Pharr, Greg Humphreys, Wenzel Jakob — pbrt-v3 spectrum.cpp
-// CIE XYZ CMFs: Wyman et al. analytic fit to CIE 1931 2°.
-// XYZ→linear sRGB: IEC 61966-2-1 / Rec.709 matrix (PBRT).
+// RGB->spectrum: Smits 1999 via PBRT-v3 tabulated basis (BSD).
+//   Matt Pharr, Greg Humphreys, Wenzel Jakob - pbrt-v3 spectrum.cpp
+// CIE XYZ CMFs: Wyman et al. analytic fit to CIE 1931 2 deg.
+// XYZ->linear sRGB: IEC 61966-2-1 / Rec.709 matrix (PBRT).
 //
-// Light addition and albedo multiply happen in λ-space; result is
-// projected back through CIE XYZ → linear RGB for lightmap storage.
+// Light addition and albedo multiply happen in lambda-space; result is
+// projected back through CIE XYZ -> linear RGB for lightmap storage.
 //=============================================================================//
 #ifndef VRAD_PT_SPECTRAL_H
 #define VRAD_PT_SPECTRAL_H
@@ -132,7 +132,7 @@ inline float PtSpecLerpTab( const float *tab, float lambda )
 	return tab[i] * ( 1.0f - t ) + tab[i + 1] * t;
 }
 
-// Smits combination (PBRT SampledSpectrum::FromRGB). Returns SPD(λ).
+// Smits combination (PBRT SampledSpectrum::FromRGB). Returns SPD(lambda).
 inline float PtSpecFromRgb( float r, float g, float b, float lambda, bool illuminant )
 {
 	const float *W, *C, *M, *Y, *R, *G, *B;
@@ -150,7 +150,7 @@ inline float PtSpecFromRgb( float r, float g, float b, float lambda, bool illumi
 		R = kPtReflRed; G = kPtReflGreen; B = kPtReflBlue;
 	}
 
-	// Illuminants may exceed 1 — scale by max, upsample unit RGB, rescale.
+	// Illuminants may exceed 1 - scale by max, upsample unit RGB, rescale.
 	float scale = 1.0f;
 	if ( illuminant )
 	{
@@ -257,7 +257,7 @@ inline Vector PtXyzToLinearSrgb( float X, float Y, float Z )
 	return rgb;
 }
 
-// Monochromatic radiance L(λ) → linear RGB contribution.
+// Monochromatic radiance L(lambda) -> linear RGB contribution.
 inline Vector PtSpectralToRgb( float L, float lambda, float pdfLambda )
 {
 	float x, y, z;

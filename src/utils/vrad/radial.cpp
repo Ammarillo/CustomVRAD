@@ -20,7 +20,7 @@
 float g_flBounceRadialScale = 1.0f;
 
 // Cross-face bounce weld (opt-in via -bounce_weld): coplanar neighbor patches
-// near a shared edge contribute with edge falloff. Off by default — culling
+// near a shared edge contribute with edge falloff. Off by default - culling
 // distant coplanar neighbors removes stock GI bleed and blotches ceilings.
 bool g_bBounceWeld = false;
 static const float BOUNCE_WELD_COPLANAR_DOT = 0.985f;	// ~10 deg
@@ -93,7 +93,7 @@ static float BounceWeldWeight( int facenum, int neighborFace, const Vector &patc
 		}
 	}
 
-	// No exact shared edge (T-junction etc.) — keep stock neighbor splat.
+	// No exact shared edge (T-junction etc.) - keep stock neighbor splat.
 	if ( !bFoundShared )
 		return 1.0f;
 

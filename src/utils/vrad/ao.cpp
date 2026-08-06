@@ -86,7 +86,7 @@ static void ReadAOSettingsFromEntity( entity_t *e, AOSettings_t &s, bool bDefaul
 
 static void ReadAODenoiseFromEntity( entity_t *e )
 {
-	// Only light_ao (global) drives denoise — it's a face filter, not per-volume.
+	// Only light_ao (global) drives denoise - it's a face filter, not per-volume.
 	g_bAODenoise = IntForKeyWithDefault( e, "Denoise", g_bAODenoise ? 1 : 0 ) != 0;
 	g_nAODenoiseRadius = IntForKeyWithDefault( e, "DenoiseRadius", g_nAODenoiseRadius );
 	g_flAODenoiseStrength = FloatForKeyWithDefault( e, "DenoiseStrength", g_flAODenoiseStrength );

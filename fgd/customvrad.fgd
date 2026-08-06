@@ -1,13 +1,13 @@
 // =============================================================================
-// CustomVRAD — all compile-time entities in one FGD
+// CustomVRAD - all compile-time entities in one FGD
 // =============================================================================
-// Hammer: Tools → Options → Game Configurations → Game Data Files
+// Hammer: Tools -> Options -> Game Configurations -> Game Data Files
 // Add this file AFTER your main game FGD (e.g. garrysmod.fgd), then restart Hammer.
 // Path: G:\dev\RND\CustomVRAD\fgd\customvrad.fgd
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// light_env_vol — sky/sun override volume (brush)
+// light_env_vol - sky/sun override volume (brush)
 // Place like a trigger (tools/toolstrigger or nodraw).
 // Legacy classname "light_environment_volume" is still accepted by VRAD.
 // -----------------------------------------------------------------------------
@@ -55,7 +55,7 @@
 ]
 
 // -----------------------------------------------------------------------------
-// light_ao — global AO settings (POINT entity — Entity Tool, not Tie to Entity)
+// light_ao - global AO settings (POINT entity - Entity Tool, not Tie to Entity)
 // Optional. Without this, use CLI -ao / -ao_* or only light_ao_vol volumes.
 // -----------------------------------------------------------------------------
 @PointClass base(Targetname) color(180 200 255) size(-8 -8 -8, 8 8 8) = light_ao :
@@ -71,7 +71,7 @@
 	]
 	Samples(integer) : "Samples" : 16 : "Hemisphere rays per luxel (quality vs compile time)."
 	Distance(float) : "Distance" : "48" : "AO ray length in world units."
-	Strength(float) : "Strength" : "1.0" : "Darkening strength. 0 = off, 1 = normal, above 1 boosts (e.g. 1.5–3). Max 8."
+	Strength(float) : "Strength" : "1.0" : "Darkening strength. 0 = off, 1 = normal, above 1 boosts (e.g. 1.5-3). Max 8."
 	Bias(float) : "Bias" : "0.25" : "Offset along surface normal to reduce self-occlusion (too high causes bright edge leaks)."
 	Denoise(choices) : "Denoise" : 0 : "Optional edge-preserving filter on the AO lightmap (reduces ray noise)." =
 	[
@@ -83,7 +83,7 @@
 ]
 
 // -----------------------------------------------------------------------------
-// light_ao_vol — AO override volume (brush)
+// light_ao_vol - AO override volume (brush)
 // Place like a trigger (tools/toolstrigger or nodraw).
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname) color(180 200 255) = light_ao_vol :
@@ -98,7 +98,7 @@
 	]
 	Samples(integer) : "Samples" : 16 : "Hemisphere rays per luxel inside this volume."
 	Distance(float) : "Distance" : "48" : "AO ray length in world units."
-	Strength(float) : "Strength" : "1.0" : "Darkening strength. 0 = off, 1 = normal, above 1 boosts (e.g. 1.5–3). Max 8."
+	Strength(float) : "Strength" : "1.0" : "Darkening strength. 0 = off, 1 = normal, above 1 boosts (e.g. 1.5-3). Max 8."
 	Bias(float) : "Bias" : "0.25" : "Offset along surface normal to reduce self-occlusion (too high causes bright edge leaks)."
 	BlendDistance(float) : "Blend Distance" : 0 : "World units for the soft fade (smootherstep). Where the fade sits is set by Blend Mode. 0 = hard cut."
 	BlendMode(choices) : "Blend Mode" : 2 : "Where Blend Distance is applied relative to the brush face." =
@@ -111,7 +111,7 @@
 ]
 
 // -----------------------------------------------------------------------------
-// light_absorb — light absorber volume (brush)
+// light_absorb - light absorber volume (brush)
 // Place like a trigger (tools/toolstrigger or nodraw).
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname) color(120 80 160) = light_absorb :
@@ -140,7 +140,7 @@
 ]
 
 // -----------------------------------------------------------------------------
-// light_bounce_vol — local bounce_boost / bounce_chroma overrides (brush)
+// light_bounce_vol - local bounce_boost / bounce_chroma overrides (brush)
 // Place like a trigger (tools/toolstrigger or nodraw).
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname) color(255 160 80) = light_bounce_vol :
@@ -168,7 +168,42 @@
 ]
 
 // -----------------------------------------------------------------------------
-// light_volume — soft sphere point light (POINT entity)
+// light_spot - stock spot + optional IES photometric profile (CustomVRAD)
+// Replaces the stock light_spot definition when this FGD is loaded after the game FGD.
+// Keep stock lightprop/lightcone helpers (iconsprite draws a white billboard plane).
+// IES is bake-only (not exported to engine worldlights). When IES is set, VRAD ignores
+// _inner_cone / _cone / _exponent for the lightmap bake.
+// -----------------------------------------------------------------------------
+@PointClass base(Targetname, Angles, Light) lightprop("models/editor/spot.mdl") lightcone() line(255 220 50, targetname, target) sphere(_fifty_percent_distance) sphere(_zero_percent_distance) = light_spot :
+	"Spot light. CustomVRAD: set IES to an .ies photometric file to drive the beam shape. " +
+	"When IES is set, Inner/Outer cone and Focus are ignored for the bake (engine dynamic lighting still uses cones). " +
+	"Use IESBrightness for bake intensity (leave Brightness at 0 to disable engine dynamic light). " +
+	"ProjectedTexture: materials/ path to a planar VTF (framed to the outer cone) or cubemap / spherical envmap VTF; auto-detected. " +
+	"If both IES and ProjectedTexture are set, IES acts as an angular mask on the projection. " +
+	"Editor: thin frustum = forward beam; yellow line appears when Target is set. " +
+	"Asymmetric IES/projection: rotate Yaw (or Roll) to spin around the beam."
+[
+	target(target_destination) : "Entity to point at" : : "The name of an entity in the map that the spotlight will point at. This will override the spotlight's angles."
+	_inner_cone(integer) : "Inner (bright) angle (ignored if IES set)" : 30 : "Inner spotlight cone degrees. Ignored for bake when IES is set."
+	_cone(integer) : "Outer (fading) angle (ignored if IES set)" : 45 : "Outer spotlight cone degrees. Ignored for bake when IES is set, except it still frames planar ProjectedTexture images. Still drives the editor cone preview."
+	_exponent(integer) : "Focus (ignored if IES set)" : 1 : "Cone fringe exponent. Ignored for bake when IES is set."
+	_distance(integer) : "Maximum distance" : 0 : "This is the distance that light is allowed to cast, in inches."
+	pitch(angle_negative_pitch) : "Pitch" : -90
+	spawnflags(Flags) = [ 1 : "Initially dark" : 0 ]
+	IES(string) : "IES Profile" : "" : "Filename under garrysmod/IES/ (e.g. museum_spot.ies). Also checks IES/maps/<map>/. Bake-only - replaces cone angles. With ProjectedTexture, used as angular mask."
+	IESScale(float) : "IES Scale" : "1" : "Scales IES angular response (1 = peak matches bake brightness)."
+	IESBrightness(float) : "IES Brightness" : "-1" : "Bake brightness (same units as _light 4th). -1 = use stock Brightness. When >= 0, overrides stock brightness for the lightmap bake only - engine worldlights still use Brightness above (set that to 0 to disable dynamic light)."
+	IESMaxIntensity(float) : "IES Max Lightmap Intensity" : "0" : "Caps max RGB of this light's direct contribution per luxel sample (0 = off). Use to tame hot IES peaks without lowering overall brightness."
+	ProjectedTexture(string) : "Projected Texture" : "" : "Material path under materials/ (e.g. lights/gobos/logo). Planar VTF = framed to outer cone; cubemap = omnidirectional. Auto-detected. Bake-only. Multiplies light RGB; with IES, IES masks the projection."
+	ProjectedTextureMode(choices) : "2D Projection Mode" : "fill" : "How a planar ProjectedTexture is framed in the outer cone. Ignored for cubemaps / spherical maps." =
+	[
+		"fill" : "Fill - square sides touch the cone (corners clipped)"
+		"fit" : "Fit - whole square inside the cone (corners visible)"
+	]
+]
+
+// -----------------------------------------------------------------------------
+// light_volume - soft sphere point light (POINT entity)
 // Same editor look/keys as stock light (Light base), plus Radius.
 // Requires garrysmod.fgd (or equivalent) loaded before this FGD.
 // -----------------------------------------------------------------------------

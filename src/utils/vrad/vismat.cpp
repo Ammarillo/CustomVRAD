@@ -46,7 +46,7 @@ public:
 
 	FORCEINLINE void TestMakeTransfer( Vector start, Vector stop, int ndxShooter, int ndxReciever )
 	{
-		// Flush before overflow — one patch can queue more tests than MAX_PATCHES
+		// Flush before overflow - one patch can queue more tests than MAX_PATCHES
 		// when the map has dense subdivision (luxel scale 2, etc.).
 		if ( m_nTests >= MAX_PATCHES )
 			Finish();

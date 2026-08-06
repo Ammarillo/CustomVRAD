@@ -1,6 +1,6 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
-// light_absorb — compile-time light absorber volumes (CustomVRAD).
+// light_absorb - compile-time light absorber volumes (CustomVRAD).
 //
 //=============================================================================//
 

@@ -96,8 +96,8 @@
 \title{%
   \vspace{-1.2em}
   {\color{cvBlue}\Huge\bfseries CustomVRAD}\\[0.35em]
-  {\Large Algorithm Reference}\\[0.5em]
-  {\normalsize\color{cvMuted} Path-traced and radiosity lightmap baking for Source~SDK~2013 / Garry's~Mod}
+  {\Large Technical Report: Lightmap Baking Algorithms}\\[0.5em]
+  {\normalsize\color{cvMuted} Path-traced and radiosity pipelines for Source~SDK~2013 / Garry's~Mod}
 }
 \author{CustomVRAD contributors}
 \date{\today}
@@ -106,13 +106,17 @@
 \maketitle
 \begin{abstract}
 \noindent
-CustomVRAD is a drop-in 64-bit replacement for Valve's VRAD lightmap compiler.
-It extends the classic patch radiosity pipeline with an optional DirectX~Raytracing
-(DXR) path tracer, hero-wavelength spectral transport, contact-hardening soft shadows,
-textured emissive and filter materials, volume overrides, multi-scale ambient occlusion,
-and several lightmap-quality post-processes.
-This document describes the implemented algorithms, their mathematical formulation,
-parameter semantics, and the relationship between the classic and path-traced bake modes.
+CustomVRAD is a 64-bit lightmap compiler derived from Valve VRAD (Source~SDK~2013)
+for Garry's~Mod. It retains the classical patch-radiosity pipeline and optionally
+replaces world-face (and static-prop) lighting with a DirectX~Raytracing (DXR)
+path tracer. Extensions include hero-wavelength spectral transport, contact-hardening
+soft shadows, textured emissive and filter materials, spatial volume overrides,
+multi-scale ambient occlusion, IESNA photometric spot evaluation, directional
+projected-texture modulation on \ent{light\_spot}, and lightmap post-processes
+(denoising, seam stitching, edge pull).
+This document states the algorithms as implemented: estimators, coordinate
+conventions, parameter semantics, and the relationship between classic and
+path-traced bake modes.
 \end{abstract}
 
 \tableofcontents
@@ -122,27 +126,27 @@ parameter semantics, and the relationship between the classic and path-traced ba
 \section{System overview}
 %═══════════════════════════════════════════════════════════════════════════════
 
-CustomVRAD produces HDR (and LDR) lightmaps compatible with the Source engine.
-Two mutually exclusive world-face lighting pipelines exist:
+CustomVRAD produces HDR and LDR lightmaps compatible with the Source engine.
+World-face lighting uses exactly one of two pipelines:
 
 \begin{enumerate}[leftmargin=1.6em]
-  \item \textbf{Classic radiosity} --- stock VRAD \code{BuildFacelights} plus iterative
-        patch gather, optionally accelerated by OpenCL (\flag{-gpu}).
-  \item \textbf{Path tracing} --- D3D12 DXR baker activated by \flag{-pathtrace} /
-        \flag{-dxr}. On success it replaces world-face direct lighting \emph{and}
-        radiosity bounce. Static props can share the same integrator under
+  \item \textbf{Classic radiosity} --- stock VRAD \code{BuildFacelights} and
+        iterative patch gather, optionally accelerated by OpenCL (\flag{-gpu}).
+  \item \textbf{Path tracing} --- D3D12 DXR baker (\flag{-pathtrace} /
+        \flag{-dxr}). On success it replaces world-face direct lighting and
+        radiosity bounce. Static props may share the integrator under
         \flag{-StaticPropLighting}.
 \end{enumerate}
 
-Leaf ambient cubes, detail props, and engine-exported worldlights remain on stock
-paths (with CustomVRAD volume-aware extensions where noted).
-Failure of DXR init or bake falls back to classic radiosity for world faces
-(and CPU prop gather for props).
+Leaf ambient cubes, detail props, and engine-exported worldlights remain on
+stock paths, with volume-aware CustomVRAD extensions where noted.
+If DXR initialisation or bake fails, the compiler falls back to classic
+radiosity for world faces (and CPU gather for props).
 
-\begin{notebox}[Two GPU paths]
-  \flag{-pt\_gpu} drives the DXR RayQuery luxel baker.
-  \flag{-gpu} is an independent OpenCL path that accelerates classic radiosity
-  gather and batched AO occlusion. They are not interchangeable.
+\begin{notebox}[GPU backends]
+  \flag{-pt\_gpu} selects the DXR RayQuery luxel baker.
+  \flag{-gpu} selects an independent OpenCL path for classic radiosity gather
+  and batched AO occlusion. The two backends are not interchangeable.
 \end{notebox}
 
 \subsection{Data flow}
@@ -654,6 +658,125 @@ Replaces stock's fixed $30$ random cone rays:
 $0^\circ$ $=$ hard sun. Typical soft look: $0.5^\circ$--$3^\circ$.
 
 %═══════════════════════════════════════════════════════════════════════════════
+\section{Photometric spots and projected textures}
+\label{sec:photometric}
+%═══════════════════════════════════════════════════════════════════════════════
+
+Bake-only extensions on stock \ent{light\_spot}. Engine-exported worldlights
+retain cone keys for dynamic lighting; lightmap evaluation may substitute an
+IESNA intensity table and/or a projected Valve Texture Format (VTF) multiplier.
+
+\subsection{IESNA photometry}
+\label{sec:ies}
+
+When the entity key \code{IES} names an LM-63 file under \texttt{garrysmod/IES/}
+(or a per-map subdirectory \texttt{IES/maps/\textit{mapname}/}), the angular candela table
+replaces \code{\_inner\_cone}, \code{\_cone}, and \code{\_exponent} for the bake.
+Only \texttt{TILT=NONE} profiles are supported. Distance attenuation
+(\code{\_constant\_attn}, \ldots) is unchanged.
+
+Let $\vect{b}$ be the beam axis and $\vect{r}$ a right vector from entity angles.
+For a unit direction $\vect{\omega}$ from light to sample, vertical and horizontal
+angles $(\theta,\phi)$ index a peak-normalized table $I(\theta,\phi)\in[0,1]$.
+The photometric weight is $w_{\mathrm{IES}}=s\,I(\theta,\phi)$ with scale
+$s=\texttt{IESScale}$ (default~$1$). Optional \code{IESBrightness}${}\ge 0$
+overrides stock \code{\_light} brightness for the bake only;
+\code{IESMaxIntensity} caps per-sample RGB after attenuation.
+
+\subsection{Projected texture classification}
+\label{sec:projtex}
+
+The key \code{ProjectedTexture} names a material under \texttt{materials/}
+(optional \texttt{materials/} prefix and \texttt{.vtf} suffix are stripped).
+The loader classifies the VTF:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  Kind & Detection & Domain \\
+  \midrule
+  Planar (2D) & No cubemap / no usable six-face layout & Spot cone \\
+  Cubemap & Six faces (\code{IsCubeMap} / ENVMAP + face count) & Full sphere \\
+  Spherical 2D & ENVMAP without six faces & Full sphere \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Spherical 2D maps use equirectangular sampling when width $\ge\tfrac{3}{2}$ height;
+otherwise an OpenGL-style spheremap / matcap projection. Cubemap VTFs (including
+VTF~$7.5$ with CRC resources) are decoded to RGBA face arrays; GPU upload stores
+six consecutive \code{Texture2DArray} layers per cubemap in Source
+\code{CUBEMAP\_FACE\_*} order ($+X,-X,+Y,-Y,+Z,-Z$).
+
+\subsection{Planar framing in the outer cone}
+
+For planar projections, let $\alpha=\arccos(\texttt{\_cone})$ (outer half-angle)
+and $\vect{\omega}$ the light-to-sample direction. With $\cos\theta=\vect{\omega}\cdot\vect{b}$:
+\begin{equation}
+  u'=\frac{\vect{\omega}\cdot\vect{r}}{\cos\theta\,\tan\alpha},
+  \qquad
+  v'=\frac{\vect{\omega}\cdot\vect{u}}{\cos\theta\,\tan\alpha},
+\end{equation}
+where $\vect{u}$ completes a right-handed basis. Texture coordinates are
+\begin{equation}
+  (u,v)=\bigl(\tfrac12+\tfrac12\,f\,u',\;
+              \tfrac12+\tfrac12\,f\,v'\bigr),
+\end{equation}
+with framing factor $f=1$ for \code{ProjectedTextureMode=fill} (square sides on
+the cone; corners clipped) and $f=\sqrt{2}$ for \code{fit} (square inscribed in
+the cone). Samples with $(u,v)\notin[0,1]^{2}$ contribute zero (hard mask).
+Cubemap and spherical modes ignore the cone and evaluate over $4\pi$.
+
+\subsection{Cubemap direction mapping}
+\label{sec:cubemap}
+
+Entity angles define a light-local frame $(\vect{r},\vect{u},\vect{b})$
+(right, up, beam). A world direction $\vect{\omega}$ maps to Source cube axes
+(Z-up) by
+\begin{equation}
+  \vect{d}
+  =
+  \bigl(
+    \vect{\omega}\cdot\vect{r},\;
+    \vect{\omega}\cdot\vect{b},\;
+    \vect{\omega}\cdot\vect{u}
+  \bigr),
+\end{equation}
+i.e.\ $(d_x,d_y,d_z)=(\mathrm{right},\,\mathrm{forward},\,\mathrm{up})$.
+Face selection and face coordinates follow the Direct3D cubemap table
+(identical to hardware \code{texCUBE} / Source VTF layout):
+\begin{equation}
+\begin{aligned}
+  +X&:\; sc=-d_z,\; tc=-d_y, &
+  -X&:\; sc=+d_z,\; tc=-d_y, \\
+  +Y&:\; sc=+d_x,\; tc=+d_z, &
+  -Y&:\; sc=+d_x,\; tc=-d_z, \\
+  +Z&:\; sc=+d_x,\; tc=-d_y, &
+  -Z&:\; sc=-d_x,\; tc=-d_y,
+\end{aligned}
+\end{equation}
+with major-axis magnitude $m$ and
+\begin{equation}
+  u=\tfrac12\bigl(sc/m+1\bigr),
+  \qquad
+  v=\tfrac12\bigl(tc/m+1\bigr).
+\end{equation}
+Faces clamp at edges. CPU and GPU bakers share this convention.
+
+\subsection{Composite intensity}
+
+Let $L_0$ be the attenuated spot intensity (photometric or cone),
+$\vect{P}\in[0,1]^{3}$ the projected RGB sample, and $w_{\mathrm{IES}}$ the
+optional IES weight. The bake contribution uses
+\begin{equation}
+  L = L_0\, w_{\mathrm{IES}}\, \vect{P}
+\end{equation}
+(componentwise; missing IES or projection $\Rightarrow$ factor~$1$).
+When both IES and \code{ProjectedTexture} are set, IES acts solely as an
+angular mask on the projection. Evaluation is wired through classic gather,
+CPU PathLi, GPU PathLi, and static-prop lighting.
+
+%═══════════════════════════════════════════════════════════════════════════════
 \section{Denoising}
 \label{sec:denoise}
 %═══════════════════════════════════════════════════════════════════════════════
@@ -838,9 +961,11 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \code{vrad\_gpu.*} & OpenCL BVH + gather \\
   \code{ao.cpp} & Multi-scale AO \\
   \code{absorb.cpp} / \code{bounce\_vol.cpp} & Volume effects \\
+  \code{ies\_profile.*} & IESNA LM-63 load + angular eval \\
+  \code{light\_projection.*} & Projected VTF load, CPU sample, GPU arrays \\
   \code{pathtrace\_*denoise*} & OIDN / OptiX / Sakai \\
   \code{vradstaticprops.cpp} & Prop SSE + pathtrace vertgrid \\
-  \code{lightmap.cpp} & Edge pull, final face lighting \\
+  \code{lightmap.cpp} & Edge pull, final face lighting, spot parse \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -861,15 +986,19 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \item Sakai et~al.\ --- Statistical lightmap filtering (2024 inspiration for the Sakai denoiser).
   \item Intel Open Image Denoise --- \code{RTLightmap} model.
   \item NVIDIA OptiX --- HDR AI denoiser.
-  \item Valve Source SDK 2013 --- stock VRAD radiosity / lightmap pipeline.
+  \item IESNA LM-63 --- standard file format for luminous intensity distributions.
+  \item Microsoft Direct3D --- cubemap face selection and $(s,t)$ mapping
+        (\code{texCUBE} / environment maps).
+  \item Valve Source SDK 2013 --- stock VRAD radiosity / lightmap pipeline;
+        VTF cubemap face order (\code{CUBEMAP\_FACE\_*}).
 \end{itemize}
 
 \vspace{1.5em}
 {\color{cvMuted}\footnotesize
 \noindent
-This document describes algorithms as implemented in the CustomVRAD tree.
-Defaults and clamps may change; the CLI help from \texttt{vrad.exe} and
-\texttt{configs/full.cfg} are authoritative for shipping presets.
+Algorithms are described as implemented in the CustomVRAD source tree.
+CLI defaults and clamps may change between revisions; \texttt{vrad.exe} help
+output and \texttt{configs/full.cfg} define shipping presets.
 }
 
 \end{document}

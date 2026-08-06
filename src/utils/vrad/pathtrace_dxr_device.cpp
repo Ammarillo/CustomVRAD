@@ -31,6 +31,7 @@
 #include "envvolume.h"
 #include "bounce_vol.h"
 #include "pt_spectral_hlsl.h"
+#include "ies_profile.h"
 
 #pragma comment( lib, "d3d12.lib" )
 #pragma comment( lib, "dxgi.lib" )
@@ -528,7 +529,7 @@ bool PathTraceDXR_DeviceInit( int adapterIndex )
 	g_ptDev.device->CheckFeatureSupport( D3D12_FEATURE_D3D12_OPTIONS5, &opt5, sizeof( opt5 ) );
 	if ( opt5.RaytracingTier < D3D12_RAYTRACING_TIER_1_1 )
 	{
-		// RayQuery needs 1.1; still try — some drivers report 1.0 but support inline
+		// RayQuery needs 1.1; still try - some drivers report 1.0 but support inline
 		Msg( "[PathTrace-DXR] Warning: driver reports RT tier %u (RayQuery prefers 1.1).\n",
 			 (unsigned)opt5.RaytracingTier );
 	}
@@ -805,7 +806,7 @@ bool PathTraceDXR_DeviceInit( int adapterIndex )
 	PtWaitGPU();
 	g_ptDev.tlasVA = g_ptDev.tlas->GetGPUVirtualAddress();
 
-	// Keep upload alive until GPU done — already waited.
+	// Keep upload alive until GPU done - already waited.
 
 	// ---- Root signature + PSO ----
 	D3D12_DESCRIPTOR_RANGE ranges[3] = {};
@@ -863,7 +864,7 @@ bool PathTraceDXR_DeviceInit( int adapterIndex )
 		return false;
 	}
 
-	// Descriptor heap: 0=TLAS, 1=rays, 2=flags, 3=hits UAV — rebuilt each dispatch for rays/hits
+	// Descriptor heap: 0=TLAS, 1=rays, 2=flags, 3=hits UAV - rebuilt each dispatch for rays/hits
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
 	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	heapDesc.NumDescriptors = 4;
@@ -961,7 +962,7 @@ static bool PathTraceDXR_TraceClosest_CPU( const Vector *origins, const Vector *
 			if ( tmax < tmin )
 				tmax = tmin;
 
-			// Degenerate / non-finite rays → force a miss (avoids KD AV / NaN storms).
+			// Degenerate / non-finite rays -> force a miss (avoids KD AV / NaN storms).
 			const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
 			if ( d2 < 1e-20f || !_finite( d.x ) || !_finite( d.y ) || !_finite( d.z ) ||
 				 !_finite( o.x ) || !_finite( o.y ) || !_finite( o.z ) || ( tmax - tmin ) < 1e-8f )
@@ -1215,7 +1216,7 @@ bool PathTraceDXR_TraceClosest( const Vector *origins, const Vector *dirs, const
 		return false;
 
 	// Large batches: DXR RayQuery (Frostbite/Bakery style). Tiny batches: SSE (avoids submit overhead).
-	// Instanced prop TLAS needs PrimBase remap in the RayQuery CS — keep SSE for that path.
+	// Instanced prop TLAS needs PrimBase remap in the RayQuery CS - keep SSE for that path.
 	if ( g_ptDev.ready && nRays >= (int)kPtGpuMinRays && !g_ptDev.useInstancedAS )
 	{
 		if ( PathTraceDXR_TraceClosest_GPU( origins, dirs, tmins, tmaxs, outT, outFlags, outHit, outNormal, nRays ) )

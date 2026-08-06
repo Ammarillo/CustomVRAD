@@ -294,7 +294,7 @@ static FilterMaterial_t *FindOrLoadFilterMaterial( const char *pMaterialName, co
 			pMat->strength = pVMT->GetFloat( "$vrad_filterstrength", 1.0f );
 			pMat->thickness = pVMT->GetFloat( "$vrad_filterthickness", 1.0f );
 			// Light filters are two-sided by default (stacked gels multiply).
-			// "$vrad_filter_onesided" "1" → front-face tint only; "$nocull" "1" forces two-sided.
+			// "$vrad_filter_onesided" "1" -> front-face tint only; "$nocull" "1" forces two-sided.
 			const bool onesided = pVMT->GetInt( "$vrad_filter_onesided", 0 ) != 0
 				|| ParseBoolish( pVMT->GetString( "$vrad_filter_onesided", NULL ) );
 			const bool nocullKey = pVMT->GetInt( "$nocull", 0 ) != 0
@@ -303,8 +303,8 @@ static FilterMaterial_t *FindOrLoadFilterMaterial( const char *pMaterialName, co
 			if ( pVMT->FindKey( "$vrad_filteropacity" ) )
 				pMat->opacity = pVMT->GetFloat( "$vrad_filteropacity", 0.05f );
 			else
-				// Do NOT map $alpha → opacity: glass $alpha is for framebuffer blend,
-				// not optical density — it made stacked panes go black.
+				// Do NOT map $alpha -> opacity: glass $alpha is for framebuffer blend,
+				// not optical density - it made stacked panes go black.
 				pMat->opacity = 0.05f;
 
 			pMat->strength = clamp( pMat->strength, 0.0f, 1.0f );
@@ -438,7 +438,7 @@ static inline int WrapOrClamp( int v, int size, bool bClamp )
 
 static Vector ComputeTransmittance( const FilterMaterial_t *pMat, float r, float g, float b )
 {
-	// Display RGB (0..1) → linear via square (matches bounce_albedo / Valve reflectivity).
+	// Display RGB (0..1) -> linear via square (matches bounce_albedo / Valve reflectivity).
 	Vector rgb( r * r, g * g, b * b );
 	if ( pMat->thickness != 1.0f )
 	{
@@ -446,7 +446,7 @@ static Vector ComputeTransmittance( const FilterMaterial_t *pMat, float r, float
 		rgb.y = powf( max( rgb.y, 1e-6f ), pMat->thickness );
 		rgb.z = powf( max( rgb.z, 1e-6f ), pMat->thickness );
 	}
-	// Strength: perceptual lerp white → filter in Oklab (Ottosson / CSS color-mix).
+	// Strength: perceptual lerp white -> filter in Oklab (Ottosson / CSS color-mix).
 	const Vector white( 1.0f, 1.0f, 1.0f );
 	Vector tint = Oklab_LerpLinearSRGB( white, rgb, clamp( pMat->strength, 0.0f, 1.0f ) );
 	const float pass = 1.0f - pMat->opacity;
@@ -584,8 +584,8 @@ bool VRadFilter_BuildGpuUpload( const uint32_t *triIds, uint32_t nTris,
 	if ( !g_bFilterAny )
 		return true;
 
-	// Unique textures → layer index
-	CUtlDict<int, int> layerOf; // key = "%p" → layer
+	// Unique textures -> layer index
+	CUtlDict<int, int> layerOf; // key = "%p" -> layer
 	CUtlVector<FilterRGBA_t *> layerTex;
 	const int kMaxLayers = 256;
 	const int kMaxDim = 2048;
@@ -601,13 +601,13 @@ bool VRadFilter_BuildGpuUpload( const uint32_t *triIds, uint32_t nTris,
 			return layerOf[idx];
 		if ( layerTex.Count() >= kMaxLayers )
 		{
-			Warning( "Colored glass ($vrad_filter): GPU texture array full (%d) — remaining use face averages.\n",
+			Warning( "Colored glass ($vrad_filter): GPU texture array full (%d) - remaining use face averages.\n",
 					 kMaxLayers );
 			return -1;
 		}
 		if ( pTex->width > kMaxDim || pTex->height > kMaxDim )
 		{
-			Warning( "Colored glass ($vrad_filter): texture %dx%d exceeds GPU slice limit %d — using average.\n",
+			Warning( "Colored glass ($vrad_filter): texture %dx%d exceeds GPU slice limit %d - using average.\n",
 					 pTex->width, pTex->height, kMaxDim );
 			return -1;
 		}
@@ -661,7 +661,7 @@ bool VRadFilter_BuildGpuUpload( const uint32_t *triIds, uint32_t nTris,
 			m[3] = 2.0f; // textured
 			m[7] = ( pTex->clampU ? 1.0f : 0.0f ) + ( pTex->clampV ? 2.0f : 0.0f ) + ( pMat->nocull ? 4.0f : 0.0f );
 			m[16] = (float)layer;
-			// y = scale from full-res textureVecs → loaded mip (fixes false tiling)
+			// y = scale from full-res textureVecs -> loaded mip (fixes false tiling)
 			m[17] = (float)pTex->width / (float)max( pTex->origWidth, 1 );
 			m[18] = (float)pTex->width;
 			m[19] = (float)pTex->height;

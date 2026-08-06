@@ -267,6 +267,7 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClInclude Include="macro_texture.h" />
     <ClInclude Include="bounce_albedo.h" />
     <ClInclude Include="bounce_vol.h" />
+    <ClInclude Include="ies_profile.h" />
     <ClInclude Include="vrad_emit.h" />
     <ClInclude Include="vrad_emit_area.h" />
     <ClInclude Include="vrad_filter.h" />
@@ -385,6 +386,8 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClCompile Include="ao.cpp" />
     <ClCompile Include="bounce_albedo.cpp" />
     <ClCompile Include="bounce_vol.cpp" />
+    <ClCompile Include="ies_profile.cpp" />
+    <ClCompile Include="light_projection.cpp" />
     <ClCompile Include="vrad_emit.cpp" />
     <ClCompile Include="vrad_emit_area.cpp" />
     <ClCompile Include="vrad_filter.cpp" />

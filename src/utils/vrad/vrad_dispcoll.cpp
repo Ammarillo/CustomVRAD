@@ -179,7 +179,7 @@ void CVRADDispColl::BaseFacePlaneToDispUV( Vector const &vecPlanePt, Vector2D &d
 void CVRADDispColl::DispUVToSurfPoint( Vector2D const &dispUV, Vector &vecPoint, float flPushEps )
 {
 	// Clamp onto the surface. Callers that pass UV slightly outside [0,1] (e.g. a
-	// mistaken half-step) used to early-out and leave vecPoint untouched/zero —
+	// mistaken half-step) used to early-out and leave vecPoint untouched/zero -
 	// that produced black lightmap edges on the max-U/max-V sides.
 	Vector2D uv = dispUV;
 	if ( uv.x < 0.0f ) uv.x = 0.0f;

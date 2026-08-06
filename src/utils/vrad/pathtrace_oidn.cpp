@@ -45,9 +45,9 @@ bool PathTraceOIDN_Init()
 
 	PathTraceOIDN_ClearUnlocked();
 
-	// Host luxel grids → CPU device (GPU rejects shared host pointers).
+	// Host luxel grids -> CPU device (GPU rejects shared host pointers).
 	// numThreads=1 per execute: each bake worker has its own filter. Default OIDN
-	// thread pools (all cores × N workers) oversubscribe and blow bake time.
+	// thread pools (all cores x N workers) oversubscribe and blow bake time.
 	g_oidnDevice = oidnNewDevice( OIDN_DEVICE_TYPE_CPU );
 	if ( !g_oidnDevice )
 	{
@@ -143,7 +143,7 @@ bool PathTraceOIDN_DenoiseRGB( float *rgb, int width, int height )
 		work = scratch.data();
 	}
 
-	// CPU device: shared host images — no OIDNBuffer copy round-trip.
+	// CPU device: shared host images - no OIDNBuffer copy round-trip.
 	oidnSetSharedFilterImage( filter, "color", work, OIDN_FORMAT_FLOAT3,
 							  (size_t)padW, (size_t)padH, 0, 0, 0 );
 	oidnSetSharedFilterImage( filter, "output", work, OIDN_FORMAT_FLOAT3,
