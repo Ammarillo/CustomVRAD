@@ -437,7 +437,7 @@ extern float g_flTexbounceClean;
 
 // DXT / JPEG / resize chroma noise on white/grey albedo shows up as yellowish
 // (or pink/green) bounce. Soft-kill low Oklab chroma; keep real painted colors.
-static inline void SanitizeCompressionChroma( Vector &lin )
+void BounceAlbedo_SanitizeCompressionChroma( Vector &lin )
 {
 	if ( g_flTexbounceClean <= 0.0f )
 		return;
@@ -503,6 +503,6 @@ bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLi
 	outLinearRGB.x = SrgbByteToLinear( p[0] );
 	outLinearRGB.y = SrgbByteToLinear( p[1] );
 	outLinearRGB.z = SrgbByteToLinear( p[2] );
-	SanitizeCompressionChroma( outLinearRGB );
+	BounceAlbedo_SanitizeCompressionChroma( outLinearRGB );
 	return true;
 }

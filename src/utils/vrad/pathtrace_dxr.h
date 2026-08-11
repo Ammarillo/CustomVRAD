@@ -55,6 +55,11 @@ bool PathTraceDXR_BakePropSamples( const struct PtGpuBakeLuxel *samples, unsigne
 								   bool bEndSession = true,
 								   unsigned progressBase = 0, unsigned progressTotal = 0 );
 
+// Direct light only (0 bounces): local lights, sun, sky, emit surfaces — including
+// $vrad_filter colored-glass transmission. Used for fog_volume LightBoost.
+bool PathTraceDXR_BakeDirectOnlySamples( const struct PtGpuBakeLuxel *samples, unsigned nSamples,
+										 struct PtGpuBakeResult *outResults, int spp = 64 );
+
 // Close an open prop bake session with no leftover jobs (finish progress line + dark stats).
 void PathTraceDXR_PropBakeClose( const char *tag, unsigned totalSamples );
 

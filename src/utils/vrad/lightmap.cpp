@@ -28,6 +28,8 @@
 #include "ao.h"
 #include "absorb.h"
 #include "bounce_vol.h"
+#include "fog_volume.h"
+#include "water_medium.h"
 #include "map_shared.h"
 #include "vrad_emit.h"
 #include "ies_profile.h"
@@ -1073,6 +1075,8 @@ void FreeDLights()
 	LightEnv_ClearVolumes();
 	Absorb_Clear();
 	BounceVol_Clear();
+	FogVolume_Clear();
+	WaterMedium_Clear();
 
 	directlight_t *pNext;
 	for( directlight_t *pCur=activelights; pCur; pCur=pNext )
@@ -2123,6 +2127,27 @@ void CreateDirectLights (void)
 	{
 		e = &entities[i];
 		name = ValueForKey (e, "classname");
+		if (!strcmp(name, "fog_volume"))
+			FogVolume_ParseEntity( e );
+		else if (!strcmp(name, "fog_volume_blocker"))
+			FogVolume_ParseBlockerEntity( e );
+	}
+	if ( FogVolume_HasVolumes() )
+		Msg( "fog_volume: %d volume(s) parsed\n", FogVolume_VolumeCount() );
+
+	for (i=0 ; i<(unsigned)num_entities ; i++)
+	{
+		e = &entities[i];
+		name = ValueForKey (e, "classname");
+		if (!strcmp(name, "water_light_vol"))
+			WaterMedium_ParseOverrideEntity( e );
+	}
+	WaterMedium_BuildFromBSP();
+
+	for (i=0 ; i<(unsigned)num_entities ; i++)
+	{
+		e = &entities[i];
+		name = ValueForKey (e, "classname");
 		if (strncmp (name, "light", 5))
 			continue;
 
@@ -3165,6 +3190,37 @@ void GatherSampleLightSSE( SSE_sampleLightOutput_t &out, directlight_t *dl, int 
 		out.m_flSunAmount = MulSIMD( out.m_flSunAmount, absorbScale );
 		for ( int b = 0; b < normalCount; b++ )
 			out.m_flDot[b] = MulSIMD( out.m_flDot[b], absorbScale );
+	}
+
+	// Mode A underwater Beer-Lambert + Kd (classic direct path).
+	if ( WaterMedium_IsActive() && WaterMedium_GetMode() != WATER_MEDIUM_OFF )
+	{
+		for ( int s = 0; s < 4; ++s )
+		{
+			Vector samplePos = pos.Vec( s );
+			Vector T( 1, 1, 1 );
+			if ( dl->light.type == emit_skylight )
+			{
+				// Ocean optics: downwelling irradiance at depth (not segment T × Kd).
+				T = WaterMedium_DownwellingScale( samplePos );
+			}
+			else if ( dl->light.type == emit_skyambient )
+			{
+				T = WaterMedium_DownwellingScale( samplePos );
+			}
+			else
+			{
+				T = WaterMedium_SegmentTransmittance( samplePos, dl->light.origin );
+			}
+			const float tScale = max( T.x, max( T.y, T.z ) );
+			out.m_flFalloff = SetComponentSIMD( out.m_flFalloff, s,
+				SubFloat( out.m_flFalloff, s ) * tScale );
+			out.m_flSunAmount = SetComponentSIMD( out.m_flSunAmount, s,
+				SubFloat( out.m_flSunAmount, s ) * tScale );
+			for ( int b = 0; b < normalCount; b++ )
+				out.m_flDot[b] = SetComponentSIMD( out.m_flDot[b], s,
+					SubFloat( out.m_flDot[b], s ) * tScale );
+		}
 	}
 
 	// NOTE: Notice here that if the light is on the back side of the face

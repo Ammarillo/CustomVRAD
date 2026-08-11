@@ -1,7 +1,9 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
 // Optional baked ambient occlusion (-ao / light_ao / light_ao_vol).
-// Cosine-weighted hemisphere rays; modulates final lightmap luxels.
+// Cosine-hemisphere ambient obscurance (distance falloff to occluders).
+// Under -pathtrace with GI, post-multiply is skipped (PT already occludes)
+// unless -ao_force.
 //
 //=============================================================================//
 
@@ -9,6 +11,7 @@
 #include "lightmap.h"
 #include "ao.h"
 #include "vrad_gpu.h"
+#include "pathtrace_dxr.h"
 #include "mathlib/halton.h"
 #include <vector>
 
@@ -20,15 +23,15 @@ float	g_flAOBias = 0.25f;
 bool	g_bAODenoise = false;
 int		g_nAODenoiseRadius = 1;
 float	g_flAODenoiseStrength = 1.0f;
+bool	g_bAOForce = false;
 
-// Allow rays slightly behind the geometric hemisphere so wall/floor
-// contacts occlude each other (pure hemisphere leaves a bright rim).
-static const float kAOWrap = 0.25f;
 // Fraction of Bias used as along-ray start offset (reduces skim misses).
 static const float kAORayBiasScale = 0.5f;
 // Mild bright-spike soften only (heavy min-filters caused black voids + blockiness).
 static const float kAOSpikeGap = 0.18f;
 static const float kAOSpikeSoft = 0.35f;
+// Ambient obscurance power: vis = (t/R)^k on hit (1 = linear Landis, 2 = stronger near contacts).
+static const float kAOObscurancePower = 1.0f;
 
 struct AOVolumeInfo_t
 {
@@ -112,6 +115,25 @@ int AO_VolumeCount()
 bool AO_ShouldRun()
 {
 	return g_bAO || s_nVolumes > 0;
+}
+
+bool AO_ShouldApplyToLightmaps()
+{
+	if ( !AO_ShouldRun() )
+		return false;
+
+	// Path-traced GI already includes geometric occlusion in every path.
+	// Multiplying hemisphere AO on top double-darkens corners (not physical).
+	if ( PathTraceDXR_IsActive() && !g_bAOForce )
+	{
+		int bounces = g_nPathTraceBounces;
+		if ( bounces < 0 )
+			bounces = do_fast ? 1 : 3;
+		if ( bounces > 0 )
+			return false;
+		// bounces==0 (direct+sky only): AO stands in for missing ambient — keep it.
+	}
+	return true;
 }
 
 void AO_ParseGlobalEntity( entity_t *e )
@@ -466,27 +488,24 @@ static void GetLuxelNormal( int facenum, const facelight_t *fl, int luxel, Vecto
 	VectorNormalize( outNormal );
 }
 
-// Build ray start/end for one AO sample. Uses wrapped-sphere directions so
-// concave contacts (wall/floor) see each other, plus along-ray bias.
+// Build ray start/end for one AO sample. Cosine-hemisphere (physical ambient
+// obscurance): reject backfacing dirs, weight by n·ω.
 static bool MakeAORay( const Vector &pos, const Vector &normal,
 					   float flDist, float flBias,
 					   DirectionalSampler_t &sampler,
 					   Vector &outStart, Vector &outEnd, float &outWeight )
 {
-	// Try a few sphere samples until one is inside the wrapped cone.
-	for ( int attempt = 0; attempt < 8; ++attempt )
+	for ( int attempt = 0; attempt < 16; ++attempt )
 	{
 		Vector dir = sampler.NextValue();
 		float nd = DotProduct( dir, normal );
-		if ( nd < -kAOWrap )
+		if ( nd <= 1e-4f )
 			continue;
 
 		float rayBias = max( 0.05f, flBias * kAORayBiasScale );
 		outStart = pos + normal * flBias + dir * rayBias;
 		outEnd = outStart + dir * flDist;
-		// Keep a little weight on near-horizon / slight backface rays so
-		// contact occlusion contributes, without over-darkening flats.
-		outWeight = max( nd, 0.08f );
+		outWeight = nd; // cosine weight for uniform-sphere samples
 		return true;
 	}
 
@@ -497,6 +516,19 @@ static bool MakeAORay( const Vector &pos, const Vector &normal,
 	outEnd = outStart + dir * flDist;
 	outWeight = 1.0f;
 	return true;
+}
+
+// Hit distance → ambient obscurance visibility (1 = open, 0 = fully blocked at surface).
+static inline float AOObscuranceFromHitT( float hitT, float rayLen )
+{
+	if ( rayLen <= 1e-6f )
+		return 1.0f;
+	if ( hitT >= rayLen * 0.999f )
+		return 1.0f; // miss / hit at far plane
+	float u = clamp( hitT / rayLen, 0.0f, 1.0f );
+	if ( kAOObscurancePower == 1.0f )
+		return u;
+	return powf( u, kAOObscurancePower );
 }
 
 static void TraceAORays4( const Vector *starts, const Vector *ends, const float *weights,
@@ -517,13 +549,25 @@ static void TraceAORays4( const Vector *starts, const Vector *ends, const float 
 		end4.Z( i ) = ends[src].z;
 	}
 
-	fltx4 fractionVisible = Four_Ones;
-	TestLine( start4, end4, &fractionVisible, -1 );
+	FourRays myrays;
+	myrays.origin = start4;
+	myrays.direction = end4;
+	myrays.direction -= myrays.origin;
+	fltx4 len = myrays.direction.length();
+	myrays.direction *= ReciprocalSIMD( len );
+
+	RayTracingResult rt_result;
+	g_RtEnv.Trace4Rays( myrays, Four_Zeros, len, &rt_result, TRACE_ID_STATICPROP | -1, nullptr );
 
 	for ( int i = 0; i < count; ++i )
 	{
 		float w = weights[i];
-		*pSumVis += SubFloat( fractionVisible, i ) * w;
+		float rayLen = SubFloat( len, i );
+		float hitT = rayLen;
+		if ( rt_result.HitIds[i] != -1 )
+			hitT = min( SubFloat( rt_result.HitDistance, i ), rayLen );
+		float vis = AOObscuranceFromHitT( hitT, rayLen );
+		*pSumVis += vis * w;
 		*pSumW += w;
 	}
 }
@@ -576,7 +620,8 @@ static bool ComputeFaceAO_GPU( int facenum, const facelight_t *fl, float *pAOOut
 	std::vector<Vector> starts( nPad );
 	std::vector<Vector> ends( nPad );
 	std::vector<float> weights( nPad, 0.0f );
-	std::vector<unsigned char> visible( nPad, 1 );
+	std::vector<float> hitT( nPad, 0.0f );
+	std::vector<int> hitFlags( nPad, 0 );
 	std::vector<unsigned char> validRay( nPad, 0 );
 
 	DirectionalSampler_t sampler;
@@ -623,7 +668,7 @@ static bool ComputeFaceAO_GPU( int facenum, const facelight_t *fl, float *pAOOut
 		++ray;
 	}
 
-	if ( !VRadGPU_TraceOcclusion( starts.data(), ends.data(), visible.data(), nPad ) )
+	if ( !VRadGPU_TraceClosest( starts.data(), ends.data(), hitT.data(), hitFlags.data(), nPad ) )
 		return false;
 
 	for ( int j = 0; j < nLuxels; ++j )
@@ -636,7 +681,10 @@ static bool ComputeFaceAO_GPU( int facenum, const facelight_t *fl, float *pAOOut
 			if ( !validRay[base + s] )
 				continue;
 			float w = weights[base + s];
-			sum += ( visible[base + s] ? 1.0f : 0.0f ) * w;
+			Vector d = ends[base + s] - starts[base + s];
+			float rayLen = d.Length();
+			float vis = AOObscuranceFromHitT( hitT[base + s], rayLen );
+			sum += vis * w;
 			wsum += w;
 		}
 		pAOOut[j] = ( wsum > 1e-6f ) ? ( sum / wsum ) : 1.0f;

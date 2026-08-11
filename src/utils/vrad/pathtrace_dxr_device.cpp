@@ -30,6 +30,7 @@
 #include "worldsize.h"
 #include "envvolume.h"
 #include "bounce_vol.h"
+#include "water_medium.h"
 #include "pt_spectral_hlsl.h"
 #include "ies_profile.h"
 

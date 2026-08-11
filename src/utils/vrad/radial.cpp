@@ -795,7 +795,7 @@ void FinalLightFace( int iThread, int facenum )
 
 	// Optional AO: compute once per face (style-independent geometry occlusion).
 	CUtlVector<float> aoFactors;
-	if ( AO_ShouldRun() && fl->numluxels > 0 )
+	if ( AO_ShouldApplyToLightmaps() && fl->numluxels > 0 )
 	{
 		aoFactors.SetCount( fl->numluxels );
 		ComputeFaceAmbientOcclusion( facenum, fl, aoFactors.Base() );
@@ -899,7 +899,7 @@ void FinalLightFace( int iThread, int facenum )
 				}
 			}
 
-			if ( AO_ShouldRun() && aoFactors.Count() == fl->numluxels )
+			if ( AO_ShouldApplyToLightmaps() && aoFactors.Count() == fl->numluxels )
 			{
 				float aoScale = AOScaleFromFactor( aoFactors[j], fl->luxel[j] );
 				for ( bumpSample = 0; bumpSample < bumpSampleCount; ++bumpSample )

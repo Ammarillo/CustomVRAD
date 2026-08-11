@@ -42,6 +42,9 @@ extern float	g_flAOBias;
 extern bool		g_bAODenoise;
 extern int		g_nAODenoiseRadius;		// 1=3x3, 2=5x5, ...
 extern float	g_flAODenoiseStrength;	// 0..1 blend toward filtered
+// When pathtrace already has GI, post-multiply AO is physically wrong (double occlusion).
+// Default: skip. -ao_force keeps the artistic multiply anyway.
+extern bool		g_bAOForce;
 
 void AO_ClearEntities();
 // Point entity light_ao - map-wide defaults + enable toggle.
@@ -51,6 +54,8 @@ void AO_ParseVolumeEntity( entity_t *e );
 
 bool AO_HasVolumes();
 bool AO_ShouldRun(); // CLI/global enable or any volume present
+// True when FinalLightFace should compute+multiply AO (false under pathtrace GI unless -ao_force).
+bool AO_ShouldApplyToLightmaps();
 int  AO_VolumeCount();
 
 // Weighted blend of default + volumes at world position.

@@ -1102,6 +1102,9 @@ void CVRADDispColl::AddPolysForRayTrace( void )
 
 		Vector fullCoverage;
 		fullCoverage.x = 1.0f;
-		g_RtEnv.AddTriangle( TRACE_ID_OPAQUE, m_aVerts[v[0]], m_aVerts[v[1]], m_aVerts[v[2]], fullCoverage );
+		const unsigned triId = ( m_iParent >= 0 )
+			? ( TRACE_ID_OPAQUE | ( (unsigned)( m_iParent + 1 ) & 0x00FFFFFFu ) )
+			: TRACE_ID_OPAQUE;
+		g_RtEnv.AddTriangle( triId, m_aVerts[v[0]], m_aVerts[v[1]], m_aVerts[v[2]], fullCoverage );
 	}
 }

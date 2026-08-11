@@ -251,6 +251,8 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClInclude Include="vrad_gpu.h" />
     <ClInclude Include="ao.h" />
     <ClInclude Include="absorb.h" />
+    <ClInclude Include="water_medium.h" />
+    <ClInclude Include="fog_volume.h" />
     <ClInclude Include="pathtrace_dxr.h" />
     <ClInclude Include="pathtrace_dxr_device.h" />
     <ClInclude Include="pathtrace_oidn.h" />
@@ -392,6 +394,8 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClCompile Include="vrad_emit_area.cpp" />
     <ClCompile Include="vrad_filter.cpp" />
     <ClCompile Include="absorb.cpp" />
+    <ClCompile Include="water_medium.cpp" />
+    <ClCompile Include="fog_volume.cpp" />
     <ClCompile Include="pt_spectral_hlsl.cpp" />
     <ClCompile Include="pathtrace_dxr.cpp" />
     <ClCompile Include="pathtrace_dxr_device.cpp" />

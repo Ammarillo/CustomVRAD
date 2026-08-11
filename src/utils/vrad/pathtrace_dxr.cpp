@@ -19,6 +19,7 @@
 #include "bounce_vol.h"
 #include "bounce_albedo.h"
 #include "absorb.h"
+#include "water_medium.h"
 #include "vrad_emit.h"
 #include "vrad_emit_area.h"
 #include "vrad_filter.h"
@@ -283,6 +284,21 @@ static Vector PtFilterFaceNormal( int facenum )
 
 // Probe along dir with thin-sheet $vrad_filter any-hit. Returns true if an opaque
 // occluder blocks before tmax. outT multiplies RGB transmittance (1 = clear).
+static void PtMulWaterSegment( Vector &T, const Vector &a, const Vector &b )
+{
+	if ( !WaterMedium_IsActive() )
+		return;
+	T *= WaterMedium_SegmentTransmittance( a, b );
+}
+
+// Sky/sun irradiance at a submerged point: Kd only (Mode A). Do not stack with segment T.
+static void PtMulWaterSky( Vector &T, const Vector &pos )
+{
+	if ( !WaterMedium_IsActive() )
+		return;
+	T *= WaterMedium_DownwellingScale( pos );
+}
+
 static bool PtProbeOccluder( const Vector &pos, const Vector &dir, float tmin, float tmax,
 							 float *pHitT, bool bSunSkyCountsAsClear, Vector *pTrans = nullptr )
 {
@@ -319,19 +335,37 @@ static bool PtProbeOccluder( const Vector &pos, const Vector &dir, float tmin, f
 		if ( !PathTraceDXR_TraceClosest( origins, dirs, tmins, tmaxs, t, flags, hit, 1 ) )
 		{
 			if ( pHitT ) *pHitT = tmax;
-			if ( pTrans ) *pTrans = T;
+			if ( pTrans )
+			{
+				if ( bSunSkyCountsAsClear )
+					PtMulWaterSky( T, pos );
+				else
+					PtMulWaterSegment( T, pos + dir * tmin, pos + dir * tmax );
+				*pTrans = T;
+			}
 			return false;
 		}
 		if ( !hit[0] )
 		{
 			if ( pHitT ) *pHitT = tmax;
-			if ( pTrans ) *pTrans = T;
+			if ( pTrans )
+			{
+				if ( bSunSkyCountsAsClear )
+					PtMulWaterSky( T, pos );
+				else
+					PtMulWaterSegment( T, pos + dir * tmin, pos + dir * tmax );
+				*pTrans = T;
+			}
 			return false;
 		}
 		if ( bSunSkyCountsAsClear && ( flags[0] & TRACE_ID_SKY ) )
 		{
 			if ( pHitT ) *pHitT = tmax;
-			if ( pTrans ) *pTrans = T;
+			if ( pTrans )
+			{
+				PtMulWaterSky( T, pos );
+				*pTrans = T;
+			}
 			return false;
 		}
 		if ( bSunSkyCountsAsClear && LightEnv_HasShadowCastFilters() )
@@ -340,7 +374,11 @@ static bool PtProbeOccluder( const Vector &pos, const Vector &dir, float tmin, f
 			if ( LightEnv_ShouldIgnoreSkyOccluder( pos, hitP ) )
 			{
 				if ( pHitT ) *pHitT = tmax;
-				if ( pTrans ) *pTrans = T;
+				if ( pTrans )
+				{
+					PtMulWaterSky( T, pos );
+					*pTrans = T;
+				}
 				return false;
 			}
 		}
@@ -372,11 +410,22 @@ static bool PtProbeOccluder( const Vector &pos, const Vector &dir, float tmin, f
 			continue;
 		}
 		if ( pHitT ) *pHitT = t[0];
-		if ( pTrans ) *pTrans = T;
+		if ( pTrans )
+		{
+			// Shadowed: water along path irrelevant (hard block). Keep filter T unused.
+			*pTrans = T;
+		}
 		return true;
 	}
 	if ( pHitT ) *pHitT = tmax;
-	if ( pTrans ) *pTrans = T;
+	if ( pTrans )
+	{
+		if ( bSunSkyCountsAsClear )
+			PtMulWaterSky( T, pos );
+		else
+			PtMulWaterSegment( T, pos + dir * tmin, pos + dir * tmax );
+		*pTrans = T;
+	}
 	return false;
 }
 
@@ -525,6 +574,12 @@ static Vector PtGetHitAlbedo( const Vector &hitPos, const Vector &hitNormal, boo
 			Vector tex;
 			if ( BounceAlbedo_SampleFace( bestFace, hitPos, tex ) )
 				albedo = tex;
+			else
+				BounceAlbedo_SanitizeCompressionChroma( albedo );
+		}
+		else
+		{
+			BounceAlbedo_SanitizeCompressionChroma( albedo );
 		}
 	}
 
@@ -559,7 +614,11 @@ static Vector PtVisibilityRGB( const Vector &from, const Vector &to )
 	Vector delta = to - from;
 	float dist = VectorNormalize( delta );
 	if ( dist <= g_flPtOccludeBias * 2.0f )
-		return Vector( 1, 1, 1 );
+	{
+		Vector T( 1, 1, 1 );
+		PtMulWaterSegment( T, from, to );
+		return T;
+	}
 
 	const float tmax = dist - min( g_flPtOccludeBias, dist * 0.25f );
 	Vector T;
@@ -972,6 +1031,7 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 	default:
 		break;
 	}
+	// Sky/sun water attenuation is already in the probe transmittance (Kd / Mode C skip).
 	return sum;
 }
 
@@ -1152,7 +1212,10 @@ static Vector PtSampleSkyAmbient( const Vector &pos, const Vector &dir )
 	(void)dir;
 	Vector intensity;
 	SkyAmbient_ComputeAtPos( pos, intensity );
-	return intensity * Absorb_DirectScale( pos );
+	intensity *= Absorb_DirectScale( pos );
+	if ( WaterMedium_IsActive() )
+		intensity *= WaterMedium_DownwellingScale( pos );
+	return intensity;
 }
 
 // BSDF hit on emit_surface. Disabled: emit lights are NEE-only (stock GatherSampleLight).
@@ -1169,6 +1232,7 @@ static bool PtSurfaceEmissionContrib( const Vector &prevPos, const Vector &prevN
 
 // Full unidirectional path tracer (Veach/PBRT style):
 // NEE+MIS at every vertex (incl. luxel = direct), BSDF bounce, emissive hits with MIS, RR.
+// With -uw_volume: homogeneous free-flight medium events inside water.
 static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned int seed, int sppIndex,
 						int maxBounces, int facenum, float *pSunAmt )
 {
@@ -1179,6 +1243,11 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 	int skipFace = facenum;
 	float sunAmt = 0.0f;
 	const float invPi = 1.0f / (float)M_PI;
+	const bool bVolMode = WaterMedium_IsActive() && WaterMedium_GetMode() == WATER_MEDIUM_VOLUME;
+	int mediumScatters = 0;
+	const int maxMed = WaterMedium_MaxScatter();
+	bool bInMedium = false;
+	Vector medDir( 0, 0, 1 );
 
 	// -pt_bounces N = N indirect hops after the luxel (primary NEE). Path depth = N+1.
 	int pathDepth = maxBounces + 1;
@@ -1188,12 +1257,13 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 	for ( int bounce = 0; bounce < pathDepth; ++bounce )
 	{
 		// --- Next event estimation (all light types) + MIS ---
-		// Soft area sampling is expensive: default only on luxel (direct). Indirect uses hard NEE.
 		float sunB = 0.0f;
 		unsigned neeFlags = PT_NEE_SURFACE;
 		if ( bounce == 0 || g_nPtSoftMode != 0 )
 			neeFlags |= PT_NEE_SOFT;
-		Vector nee = PtSampleDirect( pos, normal,
+		// Medium vertices: use last scatter dir as shading normal so NEE prefers forward lobe.
+		Vector neeN = bInMedium ? medDir : normal;
+		Vector nee = PtSampleDirect( pos, neeN,
 									 seed + (unsigned)bounce * 31u + (unsigned)sppIndex * 17u,
 									 &sunB, skipFace, neeFlags );
 		nee = PtClampFirefly( nee, 2500.0f );
@@ -1201,12 +1271,37 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 		if ( bounce == 0 )
 			sunAmt = sunB;
 
-		// --- BSDF sample (cosine-weighted Lambert) ---
+		// --- Direction sample: BSDF on surface, or continue medium dir ---
 		float u1 = PtHash( seed + (unsigned)bounce * 13u + sppIndex * 7u + 11u );
 		float u2 = PtHash( seed + (unsigned)bounce * 17u + sppIndex * 11u + 13u );
-		Vector dir = PtCosineHemisphere( normal, u1, u2 );
-		const float cosTheta = max( 0.0f, DotProduct( normal, dir ) );
-		const float pdfBsdf = cosTheta * invPi;
+		Vector dir;
+		float pdfBsdf = 0.0f;
+		if ( bInMedium )
+		{
+			dir = medDir;
+			pdfBsdf = 1.0f; // already sampled via HG previous event
+		}
+		else
+		{
+			dir = PtCosineHemisphere( normal, u1, u2 );
+			const float cosTheta = max( 0.0f, DotProduct( normal, dir ) );
+			pdfBsdf = cosTheta * invPi;
+		}
+
+		float maxDist = (float)MAX_TRACE_LENGTH;
+		float tFree = maxDist;
+		int medBody = -1;
+		Vector sigmaT( 0, 0, 0 );
+		bool bTryMedium = false;
+		if ( bVolMode && mediumScatters < maxMed && WaterMedium_PointInWater( pos, &medBody ) )
+		{
+			float uMed = PtHash( seed + (unsigned)bounce * 53u + sppIndex * 29u + 77u );
+			if ( WaterMedium_SampleFreeFlight( pos, dir, uMed, &tFree, &sigmaT, &medBody ) )
+			{
+				bTryMedium = true;
+				maxDist = tFree + 1e-3f;
+			}
+		}
 
 		float curTMin = 0.25f;
 		float tHit = -1.0f;
@@ -1221,7 +1316,7 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 			Vector origins[1] = { pos };
 			Vector dirs[1] = { dir };
 			float tmins[1] = { curTMin };
-			float tmaxs[1] = { (float)MAX_TRACE_LENGTH };
+			float tmaxs[1] = { maxDist };
 			float t[1];
 			unsigned int flags[1], hit[1];
 			Vector nOut[1];
@@ -1264,9 +1359,59 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 			break;
 		}
 
+		// Mode C: free-flight scatter before surface
+		if ( bTryMedium && ( !bHit || tHit > tFree ) )
+		{
+			Vector scatterPos = pos + dir * tFree;
+			// Beer-Lambert to scatter point
+			throughput *= WaterMedium_SegmentTransmittance( pos, scatterPos );
+			Vector albedoM = WaterMedium_ScatterAlbedo( medBody );
+			// Soft sky veiling at medium events (single-scatter fill). Without this,
+			// HG + absorption eats ambient and pools go black.
+			{
+				Vector veilAmb( 0, 0, 0 );
+				SkyAmbient_ComputeAtPos( scatterPos, veilAmb );
+				const WaterIops_t *ioV = WaterMedium_GetIops( medBody );
+				Vector fog = ioV ? ioV->fogColor : Vector( 0.05f, 0.12f, 0.18f );
+				const float kVeil = 0.12f;
+				radiance.x += throughput.x * albedoM.x * veilAmb.x * fog.x * kVeil;
+				radiance.y += throughput.y * albedoM.y * veilAmb.y * fog.y * kVeil;
+				radiance.z += throughput.z * albedoM.z * veilAmb.z * fog.z * kVeil;
+			}
+			throughput *= albedoM;
+			++mediumScatters;
+
+			float ug1 = PtHash( seed + (unsigned)bounce * 71u + sppIndex * 37u + 3u );
+			float ug2 = PtHash( seed + (unsigned)bounce * 73u + sppIndex * 41u + 5u );
+			const WaterIops_t *io = WaterMedium_GetIops( medBody );
+			float g = io ? io->g : 0.8f;
+			Vector wi;
+			WaterMedium_SampleHG( g, ug1, ug2, dir, wi );
+			pos = scatterPos;
+			medDir = wi;
+			bInMedium = true;
+			normal = wi;
+			skipFace = -1;
+
+			if ( throughput.x + throughput.y + throughput.z < 1e-4f )
+				break;
+			if ( bounce >= 1 )
+			{
+				float q = min( 0.95f, max( throughput.x, max( throughput.y, throughput.z ) ) );
+				float r = PtHash( seed + (unsigned)bounce * 41u + 99u + (unsigned)sppIndex );
+				if ( r > q )
+					break;
+				throughput *= ( 1.0f / max( q, 1e-3f ) );
+			}
+			continue;
+		}
+
 		if ( !bHit )
 		{
-			// Sky only via BSDF (no skyambient NEE) -> weight 1.
+			// Path exited to sky. Mode C: Beer-Lambert through water (Kd is off in volume mode).
+			// Mode A: sky irradiance uses Kd only via PtSampleSkyAmbient (no segment stack).
+			if ( bVolMode )
+				throughput *= WaterMedium_SegmentTransmittance( pos, pos + dir * (float)MAX_TRACE_LENGTH );
 			radiance += PtClampFirefly( throughput * PtSampleSkyAmbient( pos, dir ), 2500.0f );
 			break;
 		}
@@ -1277,6 +1422,10 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 			hitNormal = -dir;
 		if ( DotProduct( hitNormal, dir ) > 0.0f )
 			hitNormal = -hitNormal;
+
+		// Mode A/C: Beer-Lambert along path segment to the surface
+		if ( WaterMedium_IsActive() )
+			throughput *= WaterMedium_SegmentTransmittance( pos, hitPos );
 
 		// --- Emissive surface hit (MIS vs NEE; same units as surface NEE) ---
 		float pdfLight = 0.0f;
@@ -1291,24 +1440,17 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 
 		Vector albedo = PtGetHitAlbedo( hitPos, hitNormal, true, false, (int)bounce );
 		albedo *= Absorb_BounceScale( hitPos, pos );
-		// Energy scale only (light_bounce_vol / -bounce_boost). No -bounce_chroma -
-		// Oklab sat boost is artistic and breaks physical colored transport.
 		{
 			BounceVolSettings_t bv;
 			BounceVol_Resolve( hitPos, bv );
 			albedo *= bv.boost;
 		}
-		// PBRT: diffuse rho in [0,1] per channel (energy-conserving reflectance).
 		albedo.x = min( 1.0f, max( 0.0f, albedo.x ) );
 		albedo.y = min( 1.0f, max( 0.0f, albedo.y ) );
 		albedo.z = min( 1.0f, max( 0.0f, albedo.z ) );
 
-		// Lambert + cosine sampling => throughput *= albedo (linear RGB x texbounce).
 		throughput *= albedo;
 
-		// light_env_vol inbound Oklab tint is artistic - skip for physical RGB transport.
-
-		// Russian roulette after first bounce (Veach efficiency-optimized style).
 		if ( bounce >= 1 )
 		{
 			float q = min( 0.95f, max( throughput.x, max( throughput.y, throughput.z ) ) );
@@ -1320,7 +1462,8 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 
 		pos = hitPos + hitNormal * 0.5f;
 		normal = hitNormal;
-		skipFace = -1; // allow all surface lights after leaving the receiver face
+		bInMedium = false;
+		skipFace = -1;
 
 		if ( throughput.x + throughput.y + throughput.z < 1e-4f )
 			break;
@@ -2371,7 +2514,7 @@ static void PtBuildTriAlbedo( std::vector<float> &rgb )
 	}
 	BounceAlbedo_EnsureCache();
 
-	int nTex = 0, nFlat = 0, nProp = 0;
+	int nTex = 0, nFlat = 0, nProp = 0, nFaced = 0;
 	for ( uint32_t i = 0; i < n; ++i )
 	{
 		Vector a, b, c;
@@ -2395,8 +2538,64 @@ static void PtBuildTriAlbedo( std::vector<float> &rgb )
 		if ( VectorNormalize( nrm ) < 1e-6f )
 			nrm.Init( 0, 0, 1 );
 
-		// Raw texture/reflectivity only - no -bounce_chroma (that is artistic Oklab sat).
-		Vector alb = PtGetHitAlbedo( centroid, nrm, true, false, 0 );
+		Vector alb( 0.45f, 0.45f, 0.45f );
+		bool got = false;
+
+		// Prefer face id packed into TRACE_ID_OPAQUE (facenum+1) / FILTER (raw facenum).
+		int facenum = -1;
+		if ( flags & TRACE_ID_FILTER )
+			facenum = (int)( flags & 0x00FFFFFFu );
+		else if ( flags & TRACE_ID_OPAQUE )
+		{
+			const unsigned packed = flags & 0x00FFFFFFu;
+			if ( packed != 0 )
+				facenum = (int)packed - 1;
+		}
+
+		if ( facenum >= 0 && facenum < numfaces )
+		{
+			Vector acc( 0, 0, 0 );
+			int ns = 0;
+			const Vector pts[4] = { a, b, c, centroid };
+			for ( int s = 0; s < 4; ++s )
+			{
+				Vector tex;
+				if ( BounceAlbedo_SampleFace( facenum, pts[s], tex ) )
+				{
+					acc += tex;
+					++ns;
+				}
+			}
+			if ( ns > 0 )
+			{
+				alb = acc * ( 1.0f / (float)ns );
+				got = true;
+				++nFaced;
+			}
+			else
+			{
+				const int ti = g_pFaces[facenum].texinfo;
+				if ( ti >= 0 && ti < texinfo.Count() )
+				{
+					const int td = texinfo[ti].texdata;
+					if ( td >= 0 && td < numtexdata )
+					{
+						alb = dtexdata[td].reflectivity;
+						BounceAlbedo_SanitizeCompressionChroma( alb );
+						got = true;
+						++nFaced;
+					}
+				}
+			}
+		}
+
+		if ( !got )
+		{
+			// Legacy: nearest patch in cluster (can bleed from colorful neighbors).
+			alb = PtGetHitAlbedo( centroid, nrm, true, false, 0 );
+			BounceAlbedo_SanitizeCompressionChroma( alb );
+		}
+
 		rgb[i * 3 + 0] = alb.x;
 		rgb[i * 3 + 1] = alb.y;
 		rgb[i * 3 + 2] = alb.z;
@@ -2405,8 +2604,8 @@ static void PtBuildTriAlbedo( std::vector<float> &rgb )
 		else
 			++nFlat;
 	}
-	Msg( "[PathTrace-DXR] Tri albedo: %d textured, %d flat/grey, %d prop-model (neutral).\n",
-		 nTex, nFlat, nProp );
+	Msg( "[PathTrace-DXR] Tri albedo: %d textured, %d flat/grey, %d prop-model (neutral), %d face-tagged.\n",
+		 nTex, nFlat, nProp, nFaced );
 }
 
 // Per-triangle $vrad_filter GPU meta + Texture2DArray of unique filter images.
@@ -3264,6 +3463,31 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 		fflush( stdout );
 	}
 	return true;
+}
+
+bool PathTraceDXR_BakeDirectOnlySamples( const PtGpuBakeLuxel *samples, unsigned nSamples,
+										 PtGpuBakeResult *outResults, int spp )
+{
+	if ( !PathTraceDXR_CanBakeProps() || !samples || !outResults || nSamples == 0 )
+		return false;
+
+	// A 0-bounce session returns direct light only — locals, sun, sky, emit
+	// surfaces — with $vrad_filter glass transmission applied by shadow rays.
+	// Any open session has different bounce settings; close it first.
+	if ( PathTraceDXR_GpuBakeIsActive() )
+		PathTraceDXR_GpuBakeEnd();
+
+	const int savedSpp = g_nPathTracePropSamples;
+	const int savedBounces = g_nPathTracePropBounces;
+	g_nPathTracePropSamples = max( 1, spp );
+	g_nPathTracePropBounces = 0;
+
+	const bool ok = PathTraceDXR_BakePropSamples( samples, nSamples, outResults,
+												  false /* prop quality */, true /* end session */ );
+
+	g_nPathTracePropSamples = savedSpp;
+	g_nPathTracePropBounces = savedBounces;
+	return ok;
 }
 
 void PathTraceDXR_PropBakeClose( const char *tag, unsigned totalSamples )

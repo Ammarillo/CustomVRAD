@@ -1,0 +1,65 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Lint VRAD configs",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        "${workspaceFolder}/tools/lint_vrad_cfg.py",
+        "--style",
+        "${workspaceFolder}/configs"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": {
+        "owner": "vrad-cfg",
+        "fileLocation": ["absolute"],
+        "pattern": {
+          "regexp": "^(.*)\\((\\d+),(\\d+)\\):\\s+(error|warning|info):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "clear": true
+      },
+      "group": "test"
+    },
+    {
+      "label": "Lint current VRAD config",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        "${workspaceFolder}/tools/lint_vrad_cfg.py",
+        "--style",
+        "${file}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": {
+        "owner": "vrad-cfg",
+        "fileLocation": ["absolute"],
+        "pattern": {
+          "regexp": "^(.*)\\((\\d+),(\\d+)\\):\\s+(error|warning|info):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      }
+    }
+  ]
+}

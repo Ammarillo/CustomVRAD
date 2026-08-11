@@ -1,679 +1,666 @@
 # CustomVRAD
 
-Custom **64-bit VRAD** for **Garry’s Mod** / Source SDK 2013. Drop-in lighting compile with map entities and CLI options built on top of stock VRAD.
+**A 64-bit lightmap compiler for Garry's Mod / Source SDK 2013.**
 
-Compatible lightmap / BSP lighting output for the engine. Experimental — validate looks on your maps before shipping.
+CustomVRAD is a drop-in replacement for Valve's VRAD that preserves engine-compatible HDR/LDR lightmap and BSP lighting output while extending the bake with path-traced global illumination, spectral transport, photometric spots, spatial volume overrides, physically motivated underwater media, and BSP-shipped volumetric fog. The implementation is experimental: validate appearance on target maps before shipping content.
 
-**Repo:** https://github.com/Ammarillo/CustomVRAD  
-**FGD:** [`fgd/customvrad.fgd`](fgd/customvrad.fgd)  
-**Algorithms:** [`docs/algorithms.tex`](docs/algorithms.tex) (technical report; compile with `pdflatex`)
 
----
+| Resource              | Location                                                                                                     |
+| --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Repository            | [https://github.com/Ammarillo/CustomVRAD](https://github.com/Ammarillo/CustomVRAD)                           |
+| Entity definitions    | `[fgd/customvrad.fgd](fgd/customvrad.fgd)`                                                                   |
+| Algorithmic monograph | `[docs/algorithms.tex](docs/algorithms.tex)` → `[docs/algorithms.pdf](docs/algorithms.pdf)`                  |
+| Flag catalog / linter | `[tools/vrad_cfg_flags.json](tools/vrad_cfg_flags.json)`, `[tools/lint_vrad_cfg.py](tools/lint_vrad_cfg.py)` |
+| Config preset         | `[configs/full.cfg](configs/full.cfg)`                                                                       |
 
-## What’s included
 
-| Feature | Type | Summary |
-|---------|------|---------|
-| `light_env_vol` | brush entity | Local sky / sun / ambient override volumes |
-| Volume sun in leaf cubes | bake | Sky-visible leaf samples accumulate volume-blended sun into ambient cubes |
-| `light_ao` / `light_ao_vol` | point / brush | Baked AO with multi-scale, selective direct/bounce/sky factors, bent normals |
-| `light_absorb` | brush entity | Volumes that damp bounce (and optional direct) light |
-| `light_volume` | point entity | Soft sphere point light (scattered origins, like soft sun) |
-| `light_spot` `IES` / `IESScale` / `IESBrightness` / `IESMaxIntensity` | entity keys | IESNA LM-63 photometric intensity for spots (bake-only; replaces cone angles) |
-| `light_spot` `ProjectedTexture` | entity key | Planar or envmap/cubemap VTF projection (auto-detect; bake-only) |
-| Soft sun | bake | Faster, smoother `SunSpreadAngle` / `-softsun` cone sampling |
-| Cross-face bounce weld | bake | Opt-in (`-bounce_weld`): edge-weighted bounce across coplanar seams |
-| Lightmap seam stitching | bake | Blends luxels across coplanar VBSP face splits (`-nostitch` to disable) |
-| `-gpu` | CLI | OpenCL bounce gather; sky occlusion stays CPU with `-TextureShadows` |
-| `-pathtrace` / `-dxr` | CLI | D3D12 DXR path-traced world + static-prop lightmaps (GPU baker + `$vrad_emit` area lights) |
-| `-config` / `-cfg` | CLI | Load a text preset of VRAD flags (keeps Hammer compile strings short) |
-| `-coarse` / `-adaptivechop` / `-texbounce` / `-energy` / `-cavity` / `-maxtransfer` / `-bounce_soft` / `-bounce_boost` / `-bounce_chroma` | CLI | Faster / tunable radiosity (`-energy` cavity damp opt-in) |
-| VMT `$vrad_emit*` | material | Textured emission; pathtrace uses PBRT-style area mesh NEE |
-| VMT `$vrad_filter*` | material | Colored glass light transmission (pathtrace CPU + GPU) |
-| Prop lighting speedups | bake | 4-wide SSE direct + GPU-culled bounce; `-pathtrace` GPU PathLi for props |
-| Threading | runtime | Auto core detect (incl. >64), up to **256** threads |
-
-Stock VRAD flags (`-hdr`, `-final`, `-StaticPropLighting`, `-textureshadows`, etc.) still work. Run `vrad.exe` with no args for the stock help text. Full CLI tables: [VRAD CLI reference](#vrad-cli-reference--all-parameters).
+Formal estimators, MIS weights, IOP fits, and coordinate conventions are stated in the algorithm report. This README is the operational companion: scope, authoring contract, CLI semantics, and build procedure.
 
 ---
 
-## Install / Hammer
 
-1. Build or copy `bin\vrad.exe` + `bin\vrad_dll.dll` (and required Valve DLLs — see [Build](#build-windows)).
-2. Point Hammer’s **Custom VRAD** (or expert compile) at this `vrad.exe`.
+
+## 1. Scope and bake contract
+
+
+
+### 1.1 What is produced
+
+CustomVRAD writes Source lightmaps (world faces; optionally static-prop vertex/texel lighting) and related BSP lighting data. Leaf ambient cubes, detail-prop lighting, and engine-exported worldlights remain on stock VRAD paths, with CustomVRAD volume-aware extensions where noted below.
+
+### 1.2 Two mutually exclusive world-face pipelines
+
+
+| Pipeline              | Activation                             | Role                                                                              |
+| --------------------- | -------------------------------------- | --------------------------------------------------------------------------------- |
+| **Classic radiosity** | Default, or pathtrace failure fallback | `BuildFacelights` + iterative patch gather; optional OpenCL (`-gpu`)              |
+| **DXR path tracing**  | `-pathtrace` / `-dxr`                  | Unidirectional PathLi with NEE; replaces world-face direct + radiosity on success |
+
+
+Exactly one pipeline owns world-face irradiance. Static props may share PathLi under `-StaticPropLighting`. Stock CLI (`-hdr`, `-final`, `-StaticPropLighting`, `-textureshadows`, …) remains valid; `vrad.exe` with no arguments prints Valve's help text.
+
+### 1.3 Physical vs artistic operators
+
+Operators fall into two classes:
+
+- **Physical / physically motivated** -- linear RGB or hero-λ transport, Beer-Lambert media, PBRT-style area lights, IESNA tables, Kd downwelling. Prefer these for predictive bakes.
+- **Artistic** -- `-bounce_boost`, `-bounce_chroma`, `-ao_force`, bounce-volume chroma, env-vol inbound Oklab tint. Documented explicitly; they are not unbiased estimators.
+
+---
+
+
+
+## 2. Feature inventory
+
+
+| Feature                          | Kind          | Estimator / contract (summary)                                              |
+| -------------------------------- | ------------- | --------------------------------------------------------------------------- |
+| `light_env_vol`                  | Brush         | Local sun / sky / ambient override; bake-only (not exported as worldlights) |
+| Leaf-cube volume sun             | Bake          | Sky-visible samples accumulate volume-blended sun into ambient cubes        |
+| `light_ao` / `light_ao_vol`      | Point / brush | Multi-scale hemisphere AO; skipped under pathtrace GI unless `-ao_force`    |
+| `light_absorb`                   | Brush         | Soft damp of bounce (optional direct)                                       |
+| `light_bounce_vol`               | Brush         | Local `-bounce_boost` / `-bounce_chroma` / energy mode                      |
+| `light_volume`                   | Point         | Soft-sphere origin sampling; exported as hard point light                   |
+| `fog_volume` (+ blocker)         | Brush         | 3D light grid + screenspace fog packed into BSP (`lua_run`)                 |
+| `water_light_vol`                | Brush         | Optional underwater IOP override (`-underwater` / `-uw_volume`)             |
+| `light_spot` IES / projected VTF | Entity keys   | Bake-only photometry / gobo; engine cone keys unchanged for dynamics        |
+| Soft sun                         | Bake          | Low-discrepancy cone + adaptive CHSS-style count                            |
+| `-pathtrace` / `-dxr`            | CLI           | DXR PathLi (GPU RayQuery default; CPU SSE optional)                         |
+| `-pt_spectral`                   | CLI           | Hero-wavelength GPU transport (default on); `-pt_nospectral` → RGB          |
+| `-underwater` / `-uw_volume`     | CLI           | `underwater` = Beer-Lambert+Kd; `uw_volume` = free-flight volume PT         |
+| `$vrad_emit*`                    | VMT           | Textured emission; pathtrace area-mesh NEE                                  |
+| `$vrad_filter*`                  | VMT           | Colored thin-sheet transmission (pathtrace only)                            |
+| `-gpu`                           | CLI           | OpenCL radiosity gather / batched AO (independent of DXR)                   |
+| `-config`                        | CLI           | Text preset of flags                                                        |
+| Seam stitch / edge pull          | Bake          | Coplanar luxel stitch (default on); edge sample inset (default on)          |
+| Threading                        | Runtime       | Auto core detect (incl. >64); up to **256** workers                         |
+
+
+---
+
+
+
+## 3. Installation and Hammer
+
+1. Build or deploy `bin\vrad.exe` + `bin\vrad_dll.dll` and required Valve DLLs ([§14](#14-build-windows)).
+2. Point Hammer **Custom VRAD** (or expert compile) at this `vrad.exe`.
 3. **Tools → Options → Game Configurations → Game Data Files** → add `fgd/customvrad.fgd` **after** `garrysmod.fgd` → restart Hammer.
 
-| Classname | Place as |
-|-----------|----------|
-| `light_env_vol` | Tie brush to entity (trigger / nodraw) |
-| `light_ao` | Point entity (Entity Tool) |
-| `light_ao_vol` | Tie brush to entity |
-| `light_absorb` | Tie brush to entity |
-| `light_volume` | Point entity (Entity Tool) |
 
-Legacy classname `light_environment_volume` is still accepted for env volumes. Stock **VBSP** is fine — these entities are compile-time only.
+| Classname                           | Type         |
+| ----------------------------------- | ------------ |
+| `light_env_vol`                     | Brush        |
+| `light_ao`                          | Point entity |
+| `light_ao_vol`                      | Brush        |
+| `light_absorb`                      | Brush        |
+| `light_bounce_vol`                  | Brush        |
+| `light_volume`                      | Point entity |
+| `fog_volume` / `fog_volume_blocker` | Brush        |
+| `water_light_vol`                   | Brush        |
 
----
 
-## `light_env_vol` — sky / sun volumes
-
-Brush that overrides sky, sun, and ambient **inside** its bounds. Outside (and in the blend shell) mixes with the map `light_environment`. Volume lights are **not** exported as engine worldlights.
-
-1. Keep one map `light_environment` as the global default.
-2. Brush → Tie to Entity → `light_env_vol`.
-3. Set the same lighting keys as `light_environment`.
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `_light` / `_ambient` | (standard) | Sun and ambient color + brightness |
-| `_lightHDR` / `_ambientHDR` | `-1 -1 -1 1` | HDR overrides; leave default to use SDR |
-| `_lightscaleHDR` / `_AmbientScaleHDR` | `1` | HDR scales |
-| `pitch` | `0` | Overrides pitch in Angles |
-| `SunSpreadAngle` | `0` | Soft sun cone (degrees); uses CustomVRAD soft-sun sampler |
-| `BlendDistance` | `0` | Soft fade length (`0` = hard cut). Perlin smootherstep |
-| `BlendMode` | `2` Center | `0` Inside · `1` Outside · `2` Center |
-| `priority` | `0` | Overlapping cores: higher wins; ties → smaller AABB |
-| `BounceVolColor` | No | Recolor bounced light **inside** this volume to the volume’s `_light` hue |
-| `BounceVolBright` | No | With BounceVolColor: also scale bounce luminance vs map env |
-| `OutsideCastShadowIn` | Yes | Outside geometry casts sun/sky shadows **into** this volume |
-| `InsideCastShadowOut` | Yes | Inside geometry casts sun/sky shadows **outside** this volume |
-
-If an entity still has legacy keys (`OutsideCastShadow` / `InsideCastShadow`) that disagree with the new names, VRAD prefers the **legacy** value and prints a warning — delete the unused key in Hammer and re-save.
-
-Bounds use the brush model AABB. Neighbor volumes use a soft Voronoi split so one volume’s outside halo does not tint another’s side.
-
-**Dynamic entities** (players, NPCs, physics props) are lit by the per-leaf ambient cubes. CustomVRAD bakes those volume-aware: rays that hit lit geometry pick up volume-lit lightmaps; rays that hit sky use volume-blended `_ambient`; and when a sample can see the sun through sky, **volume-blended sun** (direction + color × visibility) is accumulated into the cube faces. Shared sky helpers also keep detail-prop and leaf-cube sky paths consistent.
-
-**Note:** the engine’s exported `light_environment` worldlight is still a single global sun for dynamic RT lighting. Leaf-cube sun fill covers most of the volume look for ambient-lit dynamics; full per-volume dynamic sun would need engine changes. Enclosed volumes (no sky visibility) are unaffected.
-
-**Shadow filters** use the hard volume AABB (not the blend shell). Set `OutsideCastShadowIn` to No so outdoor walls/props don’t darken an interior volume; set `InsideCastShadowOut` to No so interior blockers don’t shadow the courtyard outside.
+Legacy classname `light_environment_volume` is accepted for env volumes. Stock **VBSP** is sufficient: lighting volumes are compile-time. `fog_volume` is rewritten by VRAD into map-embedded `lua_run` (no addon).
 
 ---
 
-## Ambient occlusion — `-ao`, `light_ao`, `light_ao_vol`
 
-Multi-scale hemisphere AO baked into lightmaps in `FinalLightFace`.
 
-**Enable via:** CLI `-ao` / `-ao_*`, point `light_ao` (map defaults), and/or brush `light_ao_vol` (local overrides). Combine freely.
+## 4. Spatial volumes (shared membership model)
 
-### CLI
+Brush volumes share a common soft AABB membership: soft-min signed distance, quintic smootherstep shell (`BlendDistance` / `BlendMode`), priority (higher wins; ties → smaller AABB), and soft Voronoi separation so outside halos do not tint neighbours. Shadow filters for env volumes use the **hard** AABB, not the blend shell.
 
-| Flag | Default | Effect |
-|------|---------|--------|
-| `-ao` | off | Enable AO pass |
-| `-ao_samples N` | `16` | Rays per luxel (implies `-ao`; reduced with `-fast`) |
-| `-ao_distance N` | `48` | Ray length (implies `-ao`) |
-| `-ao_strength N` | `1.0` | Darkening `0`–`8` (implies `-ao`) |
-| `-ao_bias N` | `0.25` | Normal offset (implies `-ao`) |
-| `-ao_denoise` | off | Edge-preserving bilateral denoise |
-| `-ao_denoise_radius N` | `1` | Radius `1`–`4` |
-| `-ao_denoise_strength N` | `1.0` | Blend `0`–`1` |
+### 4.1 `light_env_vol` -- local sky / sun / ambient
 
-### Entity keys
+Overrides irradiance **inside** the volume; outside and in the blend shell mix with map `light_environment`. Keep one global `light_environment` as the default.
 
-Shared by `light_ao` and `light_ao_vol` (defaults match CLI): `Enabled`, `Samples`, `Distance`, `Strength`, `Bias`.
 
-`light_ao` only: `Denoise`, `DenoiseRadius`, `DenoiseStrength`.  
-`light_ao_vol` only: `BlendDistance` / `BlendMode` / `priority` (same idea as env vols).
+| Key                                           | Default      | Semantics                                       |
+| --------------------------------------------- | ------------ | ----------------------------------------------- |
+| `_light` / `_ambient`                         | (stock)      | Sun and ambient                                 |
+| `_lightHDR` / `_ambientHDR`                   | `-1 -1 -1 1` | HDR overrides; default inherits SDR             |
+| `_lightscaleHDR` / `_AmbientScaleHDR`         | `1`          | HDR scales                                      |
+| `pitch`                                       | `0`          | Overrides pitch in Angles                       |
+| `SunSpreadAngle`                              | `0`          | Soft sun cone (degrees)                         |
+| `BlendDistance`                               | `0`          | Soft fade (`0` = hard cut)                      |
+| `BlendMode`                                   | `2` Center   | `0` Inside · `1` Outside · `2` Center           |
+| `priority`                                    | `0`          | Overlap resolution                              |
+| `BounceVolColor` / `BounceVolBright`          | No           | Recolor / rescale bounce to volume `_light` hue |
+| `OutsideCastShadowIn` / `InsideCastShadowOut` | Yes          | Cross-boundary sun/sky shadow filters           |
 
-Volumes soft-blend settings. `Enabled=No` carves AO out; `Enabled=Yes` can add AO when the map default is off. With `-gpu`, AO can use batched OpenCL.
 
----
+Legacy keys `OutsideCastShadow` / `InsideCastShadow` override the new names when present (warning emitted). Leaf ambient cubes accumulate volume-blended sun when samples see the sun through sky. The engine's exported `light_environment` worldlight remains a **single** global sun for dynamic RT lighting; leaf-cube fill approximates the volume look for ambient-lit dynamics only.
 
-## `light_absorb` — absorber volumes
+### 4.2 `light_absorb`
 
-Damps lighting inside a soft-blended brush volume.
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `Strength` | `0.5` | Absorb amount (`0`–`1`) |
-| `AbsorbDirect` | No | Also damp direct lights at luxels |
-| `AbsorbBounce` | Yes | Damp radiosity gather |
-| `BlendDistance` / `BlendMode` / `priority` | like env vols | Soft fade + overlap |
+| Key              | Default  | Semantics                  |
+| ---------------- | -------- | -------------------------- |
+| `Strength`       | `0.5`    | Absorb weight ∈ [0,1]      |
+| `AbsorbDirect`   | No       | Also damp direct at luxels |
+| `AbsorbBounce`   | Yes      | Damp radiosity gather      |
+| Blend / priority | (shared) | Soft membership            |
 
-Start low — high strength can crush bounce.
 
----
 
-## `light_bounce_vol` — bounce boost / chroma / energy volumes
 
-Soft-blended brush volume that overrides artistic radiosity controls locally. Mixes with CLI `-bounce_boost` / `-bounce_chroma` / `-energy` in the blend shell.
+### 4.3 `light_bounce_vol`
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `BounceBoost` | `-1` (inherit CLI) | Bounce brightness scale `0`–`16` inside the volume |
-| `BounceChroma` | `-1` (inherit CLI) | Early-bounce saturation `0`–`8` (strongest on bounce #1) |
-| `EnergyMode` | Inherit | Local cavity-damp: **Energy** or **No Energy**. Soft-blends with CLI |
-| `BlendDistance` / `BlendMode` / `priority` | like env vols | Soft fade + overlap |
+Local artistic radiosity controls soft-blended with CLI `-bounce_boost` / `-bounce_chroma` / `-energy`.
 
-Use with `-texbounce` so there is chroma to boost. Example: `-texbounce -bounce_chroma 1.5` map-wide, then a volume with `BounceChroma 3` over a colorful floor.
 
----
+| Key            | Default        | Semantics                             |
+| -------------- | -------------- | ------------------------------------- |
+| `BounceBoost`  | `-1` (inherit) | Bounce scale ∈ [0,16]                 |
+| `BounceChroma` | `-1` (inherit) | Early-bounce Oklab saturation ∈ [0,8] |
+| `EnergyMode`   | Inherit        | Local cavity damp on/off              |
 
-## `light_volume` — soft sphere point light
 
-Point entity with the same keys as a normal `light` (inherits the stock `Light` base / editor icon), plus **`Radius`** (default **16**). Soft-samples the light origin with low-discrepancy points scattered **inside a sphere** of that radius — same idea as soft sun, but omnidirectional — so shadows get a soft penumbra instead of a hard point-light edge.
+Use with `-texbounce`. Pathtrace ignores `-bounce_chroma` (non-physical); boost may still affect pathtrace albedo/throughput via volumes.
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `_light` / `_lightHDR` / `_lightscaleHDR` | (standard) | Color and brightness |
-| `style` | `0` | Appearance / lightstyle |
-| `_constant_attn` / `_linear_attn` / `_quadratic_attn` | `0` / `0` / `1` | Falloff |
-| `_fifty_percent_distance` / `_zero_percent_distance` | `0` | Alternate falloff (overrides Constant/Linear/Quadratic) |
-| `_hardfalloff` | `0` | Hard fade to zero with falloff distances |
-| `_distance` | `0` | Max distance for engine worldlights |
-| `Radius` | `16` | Soft-sample sphere radius (world units). `0` = hard point |
+### 4.4 `light_volume` -- soft sphere point light
 
-Sample count scales with radius (~16 at default 16, capped at 40; reduced with `-fast`). Fully lit / fully shadowed luxels early-out after a short probe. Exported to the engine as a normal **point** light at the center (softness is bake-only).
+Same keys as stock `light`, plus `Radius` (default **16**). Bake samples origins with low-discrepancy points inside the sphere (omnidirectional soft penumbra). Sample count scales with radius (~16 at default, cap 40; reduced under `-fast`). Exported to the engine as a **hard** point light at the centre.
 
----
+### 4.5 `fog_volume` -- BSP-shipped volumetric fog
 
-## `light_spot` photometry and projected textures
+Bakes a 3D irradiance grid into the BSP pak and packs a GMod screenspace fog draw (**no addon**).
 
-Bake-only extensions on stock `light_spot`. Engine worldlights continue to use
-cone keys for dynamic lighting; the lightmap bake may replace or modulate that
-response with an IESNA table and/or a projected VTF.
+1. Brush → Tie to Entity → `fog_volume` (`tools/toolstrigger`).
+2. Compile fog shaders once ([§4.5.1](#451-shaders)).
+3. VRAD writes `materials/maps/<map>/fog_volume_<hammerid>.vtf/.vmt`, shared `fog_noise.vtf`, packs `shaders/fxc/cvrad_fog_*.vcs`, and rewrites the entity to `lua_run`.
 
-### IESNA profiles (`IES`)
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `IES` | (empty) | LM-63 `.ies` path under `garrysmod/IES/` (also `IES/maps/<map>/`) |
-| `IESScale` | `1` | Scales the peak-normalized angular table |
-| `IESBrightness` | `-1` | Bake brightness (same units as `_light`’s 4th component). `-1` uses stock `_light`. Values `≥ 0` override bake intensity only; set `_light` brightness to `0` to suppress engine dynamic light |
-| `IESMaxIntensity` | `0` | Per-luxel RGB cap on this light’s direct contribution (`0` = off) |
+| Key                            | Default       | Semantics                                   |
+| ------------------------------ | ------------- | ------------------------------------------- |
+| `Enabled` / `StartEnabled`     | Yes           | Bake skip / runtime `cvf_en`                |
+| `FogColor`                     | `200 220 255` | Tint                                        |
+| `Density`                      | `0.02`        | Optical density per world unit              |
+| `LightBoost`                   | `1.0`         | Direct-light multiplier in fog (0-16)       |
+| `Anisotropy`                   | `0`           | HG g ∈ [−1,1]                               |
+| `GridSpacing`                  | `32`          | Grid step; ≤ **64³** samples                |
+| `StepCount`                    | `32`          | Raymarch steps (8-128)                      |
+| `BlendDistance` / `BlendMode`  | `0` / Center  | Soft edge; Outside/Center expand bake+march |
+| `NoiseScale` / `NoiseCoverage` | `0` / `0.45`  | FBM atlas (`0` = off)                       |
+| `WindSpeed` / `WindDir`        | `8` / `0`     | World-space scroll; yaw quantized 45°       |
 
-When `IES` is set, the bake ignores `_inner_cone`, `_cone`, and `_exponent`; the
-candela table defines the beam. Distance attenuation is unchanged. Supported on
-classic radiosity and path tracing (CPU/GPU). Only `TILT=NONE` files are accepted.
 
-Place e.g. `garrysmod/IES/light01.ies`, set `IES` to `light01`, and optionally
-`IESBrightness` for bake intensity independent of `_light`.
+**Live tweak (BSP-only):** `cvf_en`, `cvf_de`, `cvf_ns`, `cvf_cov`, `cvf_wspd`, `cvf_wyaw`, `cvf_bd`. FogColor / lighting still need a rebake.
 
-### `ProjectedTexture`
+`fog_volume_blocker`**:** soft carve into overlapping fog (atlas alpha); rewritten to `info_null`.
 
-Material path under `materials/` (e.g. `lights/gobos/logo`). The VTF is classified
-automatically into one of two modes:
+#### 4.5.1 Shaders
 
-| Mode | Detection | Behaviour |
-|------|-----------|-----------|
-| **Planar 2D** | Ordinary 2D VTF | Image framed to the outer cone (`_cone`); see `ProjectedTextureMode` |
-| **Envmap / cubemap** | Cubemap VTF (`TEXTUREFLAGS_ENVMAP`, 6 faces) | Omnidirectional sample; entity angles rotate the projection |
-
-**`ProjectedTextureMode`** (planar only; default `fill`):
-
-| Mode | Geometry |
-|------|----------|
-| `fill` | Square sides lie on the cone; corners are clipped |
-| `fit` | Square inscribed in the cone (`×√2`); full image visible |
-
-Projected RGB multiplies light intensity. With `IES` also set, the IES table is
-an angular mask on the projection. Envmap / cubemap is omnidirectional (no cone
-cull). Cubemap face UVs follow Direct3D / Source `CUBEMAP_FACE_*` (Z-up). See
-[`docs/algorithms.tex`](docs/algorithms.tex) § Photometric spots and projected textures.
-
----
-
-## Soft sun (`SunSpreadAngle` / `-softsun`)
-
-Replaces stock’s fixed 30 random rays:
-
-- **Low-discrepancy cone** (golden-angle spiral) — smooth penumbras, less noise at large angles
-- **Adaptive sample count** — scales with angle (~9 at 2°, up to ~40 at 50°)
-- **Early-out** — fully lit / fully shadowed luxels stop after a short probe; only penumbra pays full cost
-
-`0` = hard sun. Typical soft look: **0.5–3°**. Very large angles (e.g. 50°) still cost more, but less than stock and look cleaner.
-
----
-
-## Cross-face bounce welding
-
-**Off by default.** Enable with `-bounce_weld`.
-
-When enabled, coplanar neighbor faces that share an edge contribute with **edge-distance falloff** when bounce is written into lightmaps. Distant patches no longer smear rectangular GI across the seam. Non-coplanar neighbors keep the stock neighbor splat. Leaving this off matches stock neighbor bleed (smoother ceilings; possible rectangular GI on coplanar splits).
-
-Tunable with `-bounce_soft N` (default `1`; range `0.5`–`4`; `<1` tighter).
-
----
-
-## Lightmap seam stitching
-
-Stock VRAD filters every face's lightmap independently, so coplanar faces split by VBSP (grid splits, brush boundaries) can land on slightly different luxel values along the shared edge — a faint brightness step even on flat, evenly lit surfaces.
-
-After `FinalLightFace`, CustomVRAD blends luxels near each shared edge of coplanar faces toward the neighbor's value at the same world position; at the edge both sides converge to the same average, removing the step. Applies per lightstyle and bump layer; displacements are skipped (they have their own edge rules).
-
-**On by default.** Disable with `-nostitch`.
-
----
-
-## GPU (`-gpu`)
-
-Optional OpenCL path (project links `OpenCL.lib` from `src/lib/public/x64`).
-
-**OpenCL ICD:** usually already on the machine — NVIDIA, AMD, and Intel GPU drivers ship the OpenCL ICD / loader with a normal driver install. You do **not** need a separate OpenCL download for CustomVRAD, and it is **not** bundled in the release zip. If `-gpu` fails to find a device, update your GPU driver; without OpenCL, everything falls back to CPU.
-
-| Flag | Effect |
-|------|--------|
-| `-gpu` | Bounce gather (+ batched AO). Sky/ambient + soft-sun occlusion stay on CPU when `-TextureShadows` is set |
-| `-gpu_maxtris N` | Optional BVH triangle cap (`0` = unlimited) |
-| `-gpu_batch N` | Rays per dispatch (default **32768**; lower = safer vs TDR) |
-
-Also used when present:
-
-- Soft-sun / sky closest-hit batches (**CPU** when `-TextureShadows` — GPU BVH is opaque-only and was causing jagged wall/ceiling contact strips)
-- Static-prop **indirect** ray pre-cull (skip BSP walk for sky / miss)
-
-**Stability:** small ray batches, chunked uploads, device alloc checks, auto CPU fallback on OpenCL errors.  
-**Throughput:** each CPU worker can use its own OpenCL queue + ray buffers (pool up to 64) so dispatches overlap instead of serializing on one queue.
-
-Without `-gpu`, everything falls back to CPU.
-
----
-
-## Radiosity / speed CLI
-
-| Flag | Effect |
-|------|--------|
-| `-coarse` | Patch chop `8` — fewer patches, faster VisLeafs / bounce |
-| `-adaptivechop` | Finer patches where sky visibility contrasts (floor `4` under `-coarse`) |
-| `-texbounce` | Sample `$basetexture` albedo per patch for color bleed (supports VTF 7.5; fallback: flat texdata average) |
-| `-texbounce_clean N` | Soft-kill DXT/JPEG chroma noise on near-greys (Oklab C; default **0.04**; **0**/`-texbounce_noclean` = off). Stops yellowish bounce from “white” walls |
-| `-energy` | Opt-in — cavity-damped radiosity (enclosed bounce darkened; outdoor nearly unchanged) |
-| `-noenergy` / `-valve` | Stock Valve radiosity (no enclosure damp; **default**) |
-| `-cavity N` | Fully-enclosed gather scale vs stock (default `0.70`; range `0.25`–`1`; implies `-energy`) |
-| `-maxtransfer N` | Skip patch transfers farther than N units |
-| `-bounce_soft N` | Bounce luxel splat scale (default `1` = stock) |
-| `-bounce_weld` | Opt-in: cull distant coplanar neighbor bounce (can blotch ceilings; **off by default**) |
-| `-bounce_boost N` | **Artistic** scale of final bounced light after radiosity (`1` = stock; `0`–`16`). Direct lights unchanged. Does not compound across bounces. |
-| `-bounce_chroma N` | **Artistic** early-bounce saturation (`0` = off; `0`–`8`). Keeps luminance; strongest on bounce #1. Use with `-texbounce`. Overridable per-area via `light_bounce_vol`. **Ignored by `-pathtrace`** (linear RGB × texbounce). |
-| `-nostitch` | Disable lightmap seam stitching across coplanar face splits |
-| `-edgepull [N]` | **On by default** — pull edge luxel samples inward (`N` luxels, default `0.5`). Reduces black strips on thin walls / door jambs |
-| `-noedgepull` | Stock Valve sample positions (no edge inset) |
-| `-threads N` | Override thread count (`1`–`256`) |
-
-Auto-detects logical processors (including >64 via processor groups). Work dispatch uses atomics so high thread counts scale better.
-
----
-
-## VMT textured emission (`$vrad_emit*`)
-
-Per-material emissive surfaces driven by VMT keys (no `lights.rad` entry required). Emission color comes from texels — same idea as `-texbounce`.
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `$vrad_emit` | `0` | Set to `1` to enable (optional if strength &gt; 0) |
-| `$vrad_emitstrength` | `200` if emit on without value | Intensity scaler (same role as the 4th number in `lights.rad`) |
-| `$vrad_emitdensity` | `1` | Optional finer patch chop only (`>1` subdivides more) |
-| `$vrad_emitmask` | unset | Optional greyscale mask — white = full emit, black = none |
-| `$vrad_emitmap` / `$vrad_emissivemap` | unset | Optional color map for emitted light. If unset, uses `$basetexture` |
-
-Example:
-
-```
-LightmappedGeneric
-{
-	"$basetexture" "aui/random/rainbow"
-	"$vrad_emit" "1"
-	"$vrad_emitstrength" "400"
-	"$vrad_emitmask" "aui/random/rainbow_emitmask"
-	// optional: "$vrad_emitmap" "aui/random/rainbow_emitcolor"
-}
+```powershell
+.\shaders\build_shaders.ps1 -ShaderCompile C:\path\to\ShaderCompile.exe
 ```
 
-**How it bakes**
-
-- Samples color × mask × strength from the emitmap / `$basetexture`
-- Adds **self-illum** on the emitting face so it glows in the lightmap
-- Under **`-pathtrace`**: builds a **textured triangle area-light mesh** (PBRT-style NEE — power-pick tri, uniform area sample, emission from albedo at the sample). Soft continuous lighting, not a grid of face-center point lights
-- Under classic radiosity: still creates `emit_surface` direct lights for leaf ambient / worldlights
-- `lights.rad` texlights stay on the stock point-proxy path
-- Works with VTF 7.5. Worldlights cap is **65536** (stock 8192)
-
-**Noise control (pathtrace):** raise `-pt_emit_samples` (default **64**) or use `0` for all emit tris every NEE. Pair with `-pt_denoise`.
+Outputs: `shaders/fxc/cvrad_fog_*.vcs`. **Caveat:** clients/servers that block map client Lua will not draw fog.
 
 ---
 
-## VMT colored glass (`$vrad_filter*`)
 
-Thin-sheet colored light transmission through brush glass under **`-pathtrace`** (CPU + GPU). Classic radiosity is unchanged. Opt-in only — ordinary `$translucent` / WINDOW glass still lets light through unfiltered unless you set `$vrad_filter 1`.
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `$vrad_filter` | `0` | `1` enables colored transmission |
-| `$vrad_filtermap` | unset | Optional RGB filter map; else `$basetexture` |
-| `$vrad_filterstrength` | `1` | `0` = no tint, `1` = full texture tint |
-| `$vrad_filteropacity` | `0.05` | Flat absorption (keep low; color comes from the texture) |
-| `$vrad_filterthickness` | `1` | `pow(filterRGB, thickness)` for denser stained glass |
-| `$vrad_filter_onesided` | `0` | `1` = front-face tint only; default is two-sided |
-| `$nocull` | — | Forces two-sided if set |
+## 5. Underwater lighting (physically based bake)
 
-Stacked panes / strength / bounce chroma / env inbound tint use **Oklab** (Björn Ottosson). Energy transport (`albedo × light`, NEE `intensity × vis`) stays linear RGB.
+Auto-detects BSP water via `leafWaterData` / `CONTENTS_WATER`. Optical properties (IOPs) are fit from the water surface VMT (`$fogenable`, `$fogcolor`, `$fogend`) or optional `$vrad_uw_*` / Jerlov presets. Brush `water_light_vol` overrides overlapping bodies.
 
-- Strength: Oklab lerp white → filter  
-- Stacked filters: `L' = L0·L1`, `a' = a0+a1`, `b' = b0+b1`  
-- `-bounce_chroma`: scale Oklab `a,b` (keep `L`)  
-- `light_env_vol` inbound tint: keep light `L`, take tint `a,b`
 
-Transmittance: `T = OklabLerp(white, pow(rgb, thickness), strength) * (1 - opacity)`.
+| Flag               | Mode  | Estimator                                                              |
+| ------------------ | ----- | ---------------------------------------------------------------------- |
+| `-underwater`      | **A** | Beer-Lambert segment transmittance + Kd downwelling for sun/sky        |
+| `-uw_volume`       | **C** | Homogeneous free-flight volume path tracing (implies underwater media) |
+| `-uw_off`          | --    | Force disable                                                          |
+| `-uw_maxscatter N` | C     | Cap medium scatter events (default **8**, max **64**)                  |
 
-Example:
 
-```
-LightmappedGeneric
-{
-	"$basetexture" "aui/glass/stained_red"
-	"%keywords" "glass"
-	"$translucent" "1"
-	"$vrad_filter" "1"
-	"$vrad_filterstrength" "1"
-	"$vrad_filteropacity" "0.05"
-	"$vrad_filterthickness" "1.5"
-}
-```
+**Authoring notes (important):**
 
-**Notes**
+- Source `$fogend` is screenspace fog, not lightmap optical depth. The bake applies an extinction scale s_{\mathrm{bake}}=0.28, scatter fraction 0.45, and \mathbf{k}_d = 0.35\boldsymbol{\sigma}_t, with a per-channel Kd floor of 0.04.
+- Mode A applies **either** segment T (local lights / path segments) **or** Kd (sky/sun irradiance)--not both stacked.
+- Mode C accepts free-flight scatters only **inside** the water AABB (no fake boundary albedo); soft sky veiling reinjects ambient fill.
+- Optional VMT: `$vrad_uw_jerlov`, `$vrad_uw_sigma_a`, `$vrad_uw_sigma_s`, `$vrad_uw_g`.
 
-- Pathtrace only (`-pathtrace` / `-pt_gpu` / `-pt_cpu`). Rays multiply by each pane’s `T` and continue.
-- Two-sided by default so angled/stacked panes blend regardless of facing. Use `$vrad_filter_onesided 1` for front-only.
-- Do not rely on `$alpha` for light opacity (that is framebuffer blend); set `$vrad_filteropacity` explicitly if needed.
-- CPU and GPU both sample the filter texture at the hit (GPU: one `Texture2DArray` layer per unique filter VTF). Face-average fallback if a texture won't fit.
-- Static-prop `-textureshadows` stays grayscale. Classic radiosity form-factor glass is a follow-up.
+CPU + GPU pathtrace implement both modes; Mode A also scales classic direct gathering when pathtrace is off. See algorithms report § Underwater media.
 
 ---
 
-## Static prop lighting (`-StaticPropLighting`)
 
-CustomVRAD speedups on top of stock prop vertex lighting:
 
-- **4 vertices per SSE gather** for direct light (stock duplicated one vert across all lanes)
-- **GPU bounce-ray culling** with `-gpu` (sky / miss rays skip the BSP lightmap walk)
-- **Cleaner bounce on props** — bilinear luxel reads + cheap vertex soften (keeps stock-fast sample counts)
-- **`-pathtrace` + `-StaticPropLighting`** — GPU pathtraces props: **lightmap texels** match world spp/bounces/NEE; **vertex** lighting samples a virtual per-triangle lightmap (`-pt_prop_vertgrid`, default **4**) and barycentric-weights those samples onto verts (denoiser-friendly spatial filter; `0` = old noisy per-vert). Multi-LOD models inherit the same vertex/texel colors on every LOD (shared studio verts + nearest-lit fill). Override spp/bounces with `-pt_prop_samples` / `-pt_prop_bounces`. CPU gather fallback if DXR bake fails.
+## 6. Ambient occlusion
 
-Quality flags like `-StaticPropPolys` / `-TextureShadows` still apply and are expensive — drop them for preview compiles.
+Multi-scale hemisphere ambient obscurance in `FinalLightFace`.
+
+**Pathtrace policy:** with `-pathtrace` and `-pt_bounces` N>0, post-multiply AO is **skipped** (occlusion is already in PathLi). Use `-ao_force` only for artistic double-darkening. With N=0 (direct+sky), AO still applies as a stand-in for missing GI.
+
+
+| Flag                     | Default | Effect                       |
+| ------------------------ | ------- | ---------------------------- |
+| `-ao`                    | off     | Enable AO                    |
+| `-ao_force`              | off     | Apply under pathtrace GI     |
+| `-ao_samples N`          | `16`    | Rays / luxel (implies `-ao`) |
+| `-ao_distance N`         | `48`    | Ray length                   |
+| `-ao_strength N`         | `1.0`   | Darkening ∈ [0,8]            |
+| `-ao_bias N`             | `0.25`  | Normal offset                |
+| `-ao_denoise`            | off     | Bilateral denoise            |
+| `-ao_denoise_radius N`   | `1`     | ∈ [1,4]                      |
+| `-ao_denoise_strength N` | `1.0`   | Blend ∈ [0,1]                |
+
+
+Entities `light_ao` / `light_ao_vol` share `Enabled`, `Samples`, `Distance`, `Strength`, `Bias`. Denoise keys on `light_ao` only; blend/priority on `light_ao_vol`. With `-gpu`, AO may use batched OpenCL.
 
 ---
 
-## Path tracing (`-pathtrace` / `-dxr`)
 
-Optional **D3D12 DXR** baker that replaces stock `BuildFacelights` + radiosity bounce for **world faces** (direct + multi-bounce GI + sky, soft lights, textured `$vrad_emit*` area lights). With **`-StaticPropLighting`**, the same GPU PathLi pass also bakes static prop vertex/lightmap samples. Leaf ambient / detail props stay on the stock path. Falls back to radiosity (world) or CPU prop gather if DXR init/bake fails.
 
-**Colored light (physical):** default **`-pt_spectral`** — hero-wavelength path transport (Smits 1999 RGB→spectrum via PBRT tables, CIE 1931 XYZ → linear sRGB). Lights and albedo multiply in λ-space so colored bounce mixes like a spectral renderer, then projects back for lightmaps. Use **`-pt_nospectral`** for linear RGB. Firefly clamp is luminance-preserving on all bounces; artistic chroma/env tint ignored.
+## 7. Photometric spots and projected textures
 
-Default bake path is the **GPU RayQuery luxel baker** (`-pt_gpu`). Use `-pt_cpu` for the SSE CPU integrator.
+Bake-only extensions on stock `light_spot`. Engine worldlights keep cone keys for dynamic lighting.
 
-Common flags: `-pt_samples`, `-pt_bounces`, `-pt_aa`, `-pt_emit_samples`, `-pt_denoise` / `-pt_denoiser`. Full list: [Path tracing — DXR](#path-tracing--dxr) in the CLI reference below.
+### 7.1 IESNA (`IES`)
 
-**`$vrad_emit*` under pathtrace:** fan-triangulated mesh lights with PBRT-style area sampling. Noise vs speed: `-pt_emit_samples` (`0` = all tris).
 
-**`$vrad_filter*` under pathtrace:** colored transmission through opt-in glass panes (see [VMT colored glass](#vmt-colored-glass-vrad_filter)).
+| Key               | Default | Semantics                                                  |
+| ----------------- | ------- | ---------------------------------------------------------- |
+| `IES`             | (empty) | LM-63 path under `garrysmod/IES/` (also `IES/maps/<map>/`) |
+| `IESScale`        | `1`     | Peak-normalized table scale                                |
+| `IESBrightness`   | `-1`    | Bake brightness override (`-1` = stock `_light`)           |
+| `IESMaxIntensity` | `0`     | Per-luxel RGB cap (`0` = off)                              |
 
-Needs a DXR-capable GPU. Prefer [`configs/full.cfg`](configs/full.cfg).
+
+When `IES` is set, `_inner_cone` / `_cone` / `_exponent` are ignored for the bake. Distance attenuation unchanged. **TILT=NONE** only. Classic + pathtrace (CPU/GPU).
+
+### 7.2 `ProjectedTexture`
+
+Material under `materials/`. Auto classification:
+
+
+| Mode             | Detection       | Domain                            |
+| ---------------- | --------------- | --------------------------------- |
+| Planar 2D        | Ordinary 2D VTF | Outer cone (`fill` / `fit`)       |
+| Envmap / cubemap | Cubemap VTF     | Full sphere; entity angles rotate |
+
+
+Projected RGB multiplies intensity; with IES, the table is an angular mask. Cubemap UVs follow Direct3D / Source `CUBEMAP_FACE_*` (Z-up). Algorithms report § Photometric spots.
+
+---
+
+
+
+## 8. Soft sun
+
+Replaces stock's fixed 30 random cone rays:
+
+- Low-discrepancy golden-angle spiral  
+- Adaptive count (~9 at 2°, ~40 at 50°)  
+- Early-out when fully lit / fully shadowed
+
+`SunSpreadAngle` / `-softsun`: `0` = hard; typical soft look **0.5-3°**.
+
+---
+
+
+
+## 9. Lightmap sample quality
+
+
+
+### 9.1 Cross-face bounce welding (`-bounce_weld`, off by default)
+
+Coplanar neighbours sharing an edge contribute with edge-distance falloff when bounce is written. Tunable with `-bounce_soft N` (default `1`, range 0.5-4).
+
+### 9.2 Seam stitching (on by default; `-nostitch` disables)
+
+After `FinalLightFace`, luxels near shared edges of coplanar faces blend toward the neighbour value at the same world position. Per lightstyle and bump layer; displacements skipped.
+
+### 9.3 Edge pull (on by default; `-noedgepull` disables)
+
+Pulls edge luxel samples inward (`-edgepull [N]`, default **0.5** luxels) to reduce black strips on thin walls / jambs.
+
+---
+
+
+
+## 10. Materials
+
+
+
+### 10.1 Textured emission (`$vrad_emit*`)
+
+
+| Key                                   | Default          | Semantics                         |
+| ------------------------------------- | ---------------- | --------------------------------- |
+| `$vrad_emit`                          | `0`              | Enable (optional if strength > 0) |
+| `$vrad_emitstrength`                  | `200` if emit-on | Intensity scaler                  |
+| `$vrad_emitdensity`                   | `1`              | Optional finer patch chop         |
+| `$vrad_emitmask`                      | unset            | Greyscale mask                    |
+| `$vrad_emitmap` / `$vrad_emissivemap` | unset            | Colour map; else `$basetexture`   |
+
+
+Under `-pathtrace`: fan-triangulated area mesh, PBRT-style NEE (`-pt_emit_samples`, default **64**; `0` = all tris). Classic: `emit_surface` proxies + self-illum. Worldlights cap **65536**.
+
+### 10.2 Colored glass (`$vrad_filter*`)
+
+Pathtrace-only thin-sheet transmission. Ordinary `$translucent` does **not** tint light unless `$vrad_filter 1`.
+
+
+| Key                     | Default | Semantics                 |
+| ----------------------- | ------- | ------------------------- |
+| `$vrad_filter`          | `0`     | Enable                    |
+| `$vrad_filtermap`       | unset   | Else `$basetexture`       |
+| `$vrad_filterstrength`  | `1`     | Oklab lerp white → filter |
+| `$vrad_filteropacity`   | `0.05`  | Flat absorption           |
+| `$vrad_filterthickness` | `1`     | T^{\mathrm{thickness}}    |
+| `$vrad_filter_onesided` | `0`     | Front-only if `1`         |
+
+
+Stacked panes use Oklab (L multiply, a,b add); energy transport stays linear RGB/λ. Up to 64 filter hits; sheet entrance/exit dedup within 12 units.
+
+---
+
+
+
+## 11. Path tracing (`-pathtrace` / `-dxr`)
+
+Unidirectional Lambertian integrator with NEE at every vertex. Default backend: **GPU RayQuery** (`-pt_gpu`). `-pt_cpu` forces the SSE reference (RGB only; ignores spectral).
+
+**Spectral (GPU default):** `-pt_spectral` -- four hero wavelengths, Smits RGB↔SPD, CIE 1931 → linear sRGB. `-pt_nospectral` for linear RGB. Firefly clamp is luminance-preserving.
+
+**Common flags:** `-pt_samples`, `-pt_bounces` (N = indirect hops after luxel; depth =N+1; N=0 ⇒ direct+sky), `-pt_aa`, `-pt_emit_samples`, `-pt_denoise` / `-pt_denoiser` (`oidn`  `optix`  `sakai`), soft-shadow CHSS (`-pt_lightradius`, `-pt_lightpenumbra`, `-pt_softsamples`, `-pt_softmode`). Full table: [§13](#13-vrad-cli-reference).
+
+Needs a DXR-capable GPU. Prefer `-config full` with pathtrace flags uncommented.
 
 ```bat
 vrad.exe -config full -game "<gmod>\garrysmod" "<map>"
 ```
 
+
+
+### 11.1 Static props under pathtrace
+
+With `-StaticPropLighting`, GPU PathLi bakes prop lightmap texels and a virtual per-triangle vertex lattice (`-pt_prop_vertgrid`, default **4**; `0` = one sample/vert). Override spp/bounces with `-pt_prop_samples` / `-pt_prop_bounces`. Classic prop path: 4-wide SSE direct + optional GPU bounce cull.
+
 ---
 
-## VRAD CLI reference — all parameters
 
-Complete command-line flag list for CustomVRAD (stock Valve + CustomVRAD extensions). Values in **bold** are typical defaults. Pass `-game` / map path on the Hammer line — not inside `-config` files.
 
-Also see [`configs/full.cfg`](configs/full.cfg) (same flags, commented for toggling).
+## 12. Classic radiosity and OpenCL
+
+
+| Flag                                                                 | Role                                                          |
+| -------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `-coarse` / `-adaptivechop` / `-chop` / `-maxchop`                   | Patch density                                                 |
+| `-texbounce` / `-texbounce_clean`                                    | Textured albedo; Oklab near-grey chroma kill                  |
+| `-energy` / `-cavity` / `-noenergy`                                  | Opt-in cavity-damped gather (default = stock Valve)           |
+| `-bounce_boost` / `-bounce_chroma` / `-bounce_weld` / `-bounce_soft` | Artistic / weld controls                                      |
+| `-maxtransfer N`                                                     | Cull far patch transfers                                      |
+| `-gpu` / `-gpu_batch` / `-gpu_maxtris`                               | OpenCL gather; sky occlusion stays CPU with `-textureshadows` |
+
+
+`-gpu` and `-pt_gpu` are **independent** backends. OpenCL ICD ships with GPU drivers; not bundled. Errors fall back to CPU.
+
+---
+
+
+
+## 13. VRAD CLI reference
+
+Complete flag list (Valve + CustomVRAD). Bold = typical defaults. Pass `-game` / map path on the Hammer line -- **never** inside `-config` files. Authoritative toggle sheet: `[configs/full.cfg](configs/full.cfg)`.
 
 ### Launcher / paths
 
-| Parameter | Description |
-|-----------|-------------|
-| `-game <dir>` / `-vproject <dir>` | Game directory (materials, maps search path). Required for normal compiles. |
-| `-insert_search_path <dir>` | Extra filesystem search path |
-| `-config` / `-cfg <file>` | Load flags from a text preset (`file`, `file.cfg`, `file.txt`, or `vrad.exe\configs\…`) |
-| `-novconfig` | Do not show GUI on VProject errors |
-| `-steam` | Steam mode (tooling) |
-| `-allowdebug` | Allow debug (tooling) |
+
+| Parameter                               | Description                                                   |
+| --------------------------------------- | ------------------------------------------------------------- |
+| `-game` / `-vproject`                   | Game directory                                                |
+| `-insert_search_path`                   | Extra search path                                             |
+| `-config` / `-cfg <file>`               | Load preset (`file`, `.cfg`, `.txt`, or `vrad.exe\configs\…`) |
+| `-novconfig` / `-steam` / `-allowdebug` | Tooling                                                       |
+
+
+
 
 ### Quality / mode
 
-| Parameter | Description |
-|-----------|-------------|
-| `-hdr` | Bake HDR lightmaps |
-| `-ldr` | Bake LDR lightmaps |
-| `-final` | High quality (= `-extrasky 16`) |
-| `-fast` | Quick/dirty lighting (fewer rays; lower pathtrace defaults) |
-| `-fastambient` | Lower-quality per-leaf ambient sampling |
-| `-extrasky N` | Trace N× as many rays for indirect / sky ambient |
-| `-bounce N` | Max radiosity bounces (default **100**; ignored for world faces when pathtrace succeeds) |
+
+| Parameter                   | Description                                                                    |
+| --------------------------- | ------------------------------------------------------------------------------ |
+| `-hdr` / `-ldr`             | Lightmap format                                                                |
+| `-final`                    | High quality (= `-extrasky 16`)                                                |
+| `-fast` / `-fastambient`    | Reduced sampling                                                               |
+| `-extrasky N` / `-bounce N` | Sky rays / radiosity rounds (**100**; ignored for world if pathtrace succeeds) |
+
+
+
 
 ### Threading / process
 
-| Parameter | Description |
-|-----------|-------------|
-| `-threads N` | Worker threads (`1`–`256`; default = auto-detect cores) |
-| `-low` | Idle process priority |
-| `-verbose` / `-v` | Verbose log output |
-| `-StopOnExit` | Wait for keypress on exit |
-| `-FullMinidumps` | Large crash minidumps |
-| `-rederrors` / `-rederror` | Show errors in red |
+
+| Parameter                                                                    | Description                      |
+| ---------------------------------------------------------------------------- | -------------------------------- |
+| `-threads N`                                                                 | **1-256** (default = auto cores) |
+| `-low` / `-verbose` / `-v` / `-StopOnExit` / `-FullMinidumps` / `-rederrors` | Process / log                    |
+
+
+
 
 ### Static props / detail / shadows
 
-| Parameter | Description |
-|-----------|-------------|
-| `-StaticPropLighting` | Bake static prop vertex lighting |
-| `-StaticPropPolys` | Prop shadows at polygon precision (slower, sharper) |
-| `-StaticPropNormals` | Debug: show prop normals instead of lighting |
-| `-OnlyStaticProps` | Only direct static prop lighting (debug) |
-| `-nossprops` | Disable self-shadowing on static props |
-| `-textureshadows` | Alpha textures block light (sampled along rays) |
-| `-nodetaillight` | Do not light detail props |
-| `-onlydetail` | Only detail props + per-leaf lighting |
-| `-noskyboxrecurse` | No 3D skybox recursion (skybox shadows on world) |
+
+| Parameter                                                         | Description                 |
+| ----------------------------------------------------------------- | --------------------------- |
+| `-StaticPropLighting` / `-StaticPropPolys` / `-StaticPropNormals` | Prop bake / debug           |
+| `-OnlyStaticProps` / `-nossprops`                                 | Prop-only / no self-shadow  |
+| `-textureshadows`                                                 | Alpha textures cast shadows |
+| `-nodetaillight` / `-onlydetail` / `-noskyboxrecurse`             | Detail / skybox             |
+
+
+
 
 ### GPU (OpenCL radiosity)
 
-| Parameter | Description |
-|-----------|-------------|
-| `-gpu` | OpenCL bounce gather; sky occlusion stays CPU when `-textureshadows` |
-| `-gpu_maxtris N` | Optional BVH triangle cap (`0` = unlimited) |
-| `-gpu_batch N` | Rays per OpenCL dispatch (default **32768**) |
 
-### Path tracing — DXR
+| Parameter                         | Description                             |
+| --------------------------------- | --------------------------------------- |
+| `-gpu`                            | OpenCL bounce gather (+ batched AO)     |
+| `-gpu_maxtris N` / `-gpu_batch N` | BVH cap / rays per dispatch (**32768**) |
 
-| Parameter | Description |
-|-----------|-------------|
-| `-pathtrace` / `-dxr` | Path-traced world (+ prop) lightmaps (replaces BuildFacelights + world radiosity) |
-| `-pt_gpu` | GPU RayQuery luxel baker (default when DXR ready) |
-| `-pt_cpu` | Force CPU SSE path tracer (full soft-shadow path) |
-| `-pt_samples N` | Samples per luxel (CLI default **4** / **2** `-fast` / **8** `-final`; max **4096**; configs often **256**–**1024**) |
-| `-pt_bounces N` | Indirect hops after the luxel (**0** = direct+sky only; default **3**; **1** `-fast`; max **16**) |
-| `-pt_prop_samples N` | Prop spp (default **max(8, pt_samples/4)**) |
-| `-pt_prop_bounces N` | Prop indirect hops (**0** = direct+sky; default **same as `-pt_bounces`**) |
-| `-pt_prop_vertgrid N` | Virtual triangle lightmap edge subdiv for vertex lighting (default **4**; **0** = one sample/vert) |
-| `-pt_aa N` | Luxel footprint AA grid **1**–**5** (`1` = off; default **3**) |
-| `-pt_lights N` | Local point/spot NEE samples (`0` = all; sky always all) |
-| `-pt_emit_samples N` | `$vrad_emit` **area** NEE samples (`0` = all tris; default **64**; higher = less noise) |
-| `-pt_lightradius N` | Soft disk radius for `light` / `light_spot` (`0` = hard; world units) |
-| `-pt_lightpenumbra N` | Softness growth vs distance (default **1**) |
-| `-pt_softsamples N` | Max soft visibility rays per NEE (default **16**) |
-| `-pt_softmode direct\|all` | Soft only at luxel (**direct**) or every bounce (**all**) |
-| `-pt_device N` | DXGI adapter index |
-| `-pt_denoise` | Enable pathtrace denoise |
-| `-pt_nodennoise` | Disable pathtrace denoise |
-| `-pt_denoiser oidn\|optix\|sakai` | Denoiser backend (implies `-pt_denoise`; default **oidn**) |
-| `-pt_denoise_radius N` | Sakai filter radius **1**–**8** (default **3**; OIDN/OptiX ignore) |
-| `-pt_denoise_strength N` | Blend **0**–**1** noisy→denoised (default **1**) |
+
+
+
+### Path tracing -- DXR
+
+
+| Parameter                                                                                         | Description                                                                              |
+| ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `-pathtrace` / `-dxr`                                                                             | Enable PathLi baker                                                                      |
+| `-pt_gpu` / `-pt_cpu`                                                                             | GPU (default) / CPU SSE                                                                  |
+| `-pt_samples N`                                                                                   | spp (CLI default **4** / **2** fast / **8** final; max **4096**; configs often 256-1024) |
+| `-pt_bounces N`                                                                                   | Indirect hops (**3**; **1** fast; **0** = direct+sky; max **16**)                        |
+| `-pt_prop_samples` / `-pt_prop_bounces` / `-pt_prop_vertgrid`                                     | Prop spp / hops / vert lattice (**4**)                                                   |
+| `-pt_aa N`                                                                                        | Luxel footprint grid **1-5** (default **3**)                                             |
+| `-pt_lights N`                                                                                    | Local NEE samples (`0` = all)                                                            |
+| `-pt_emit_samples N`                                                                              | Area-emit NEE (**64**; `0` = all tris)                                                   |
+| `-pt_lightradius` / `-pt_lightpenumbra` / `-pt_softsamples` / `-pt_softmode`                      | Soft shadows / CHSS                                                                      |
+| `-pt_spectral` / `-pt_nospectral`                                                                 | Hero-λ (default on GPU) / RGB                                                            |
+| `-pt_device N`                                                                                    | DXGI adapter index                                                                       |
+| `-pt_denoise` / `-pt_nodennoise` / `-pt_denoiser` / `-pt_denoise_radius` / `-pt_denoise_strength` | Denoise                                                                                  |
+
+
+
+
+### Underwater
+
+
+| Parameter          | Description                   |
+| ------------------ | ----------------------------- |
+| `-underwater`      | Mode A: Beer-Lambert + Kd     |
+| `-uw_volume`       | Mode C: free-flight volume PT |
+| `-uw_off`          | Force disable                 |
+| `-uw_maxscatter N` | Medium scatter cap (**8**)    |
+
+
+
 
 ### Ambient occlusion
 
-| Parameter | Description |
-|-----------|-------------|
-| `-ao` | Bake cosine-weighted AO into lightmaps |
-| `-ao_samples N` | AO rays per luxel (default **16**; implies `-ao`) |
-| `-ao_distance N` | AO ray length, world units (default **48**; implies `-ao`) |
-| `-ao_strength N` | Darkening strength (default **1**, max **8**; implies `-ao`) |
-| `-ao_bias N` | Offset along normal (default **0.25**; implies `-ao`) |
-| `-ao_denoise` | Edge-preserving AO denoise (implies `-ao`) |
-| `-ao_denoise_radius N` | Denoise radius **1**–**4** (default **1**) |
-| `-ao_denoise_strength N` | Denoise blend **0**–**1** (default **1**) |
 
-### Radiosity / bounce (world faces skipped if pathtrace succeeds)
+| Parameter                                                                          | Description                |
+| ---------------------------------------------------------------------------------- | -------------------------- |
+| `-ao` / `-ao_force` / `-ao_samples` / `-ao_distance` / `-ao_strength` / `-ao_bias` | AO enable / force / params |
+| `-ao_denoise` / `-ao_denoise_radius` / `-ao_denoise_strength`                      | AO denoise                 |
 
-| Parameter | Description |
-|-----------|-------------|
-| `-texbounce` | Sample `$basetexture` albedo per patch for colored bounce |
-| `-texbounce_clean N` | Kill compression chroma on near-greys (default **0.04**; **0** = off) |
-| `-texbounce_noclean` | Keep raw texture tint (disable clean) |
-| `-coarse` | Larger lighting patches (chop **8**) — faster VisLeafs/bounce |
-| `-adaptivechop` | Finer patch floor under `-coarse` (elongated patches) |
-| `-chop N` | Smallest luxel widths for a bounce patch (edges) |
-| `-maxchop N` | Coarsest luxel widths for a patch (face interiors) |
-| `-bounce_soft N` | Bounce luxel splat scale (default **1** = stock; **0.5**–**4**) |
-| `-bounce_boost N` | Scale final bounced light (**1** = stock; **0**–**16**; direct unchanged) |
-| `-bounce_chroma N` | Early-bounce saturation (**0** = off; **0**–**8**; use with `-texbounce`) |
-| `-bounce_weld` | Cull distant coplanar neighbor bounce (can blotch; **off** by default) |
-| `-energy` | Cavity-damped radiosity — darkens enclosed bounce (**off** by default) |
-| `-noenergy` / `-valve` | Stock Valve radiosity (no enclosure damp; default) |
-| `-cavity N` | Fully-enclosed gather scale vs stock (default **0.70**; **0.25**–**1**; implies `-energy`) |
-| `-maxtransfer N` | Skip patch transfers farther than N units (`0` = off) |
+
+
+
+### Radiosity / bounce
+
+
+| Parameter                                                            | Description             |
+| -------------------------------------------------------------------- | ----------------------- |
+| `-texbounce` / `-texbounce_clean` / `-texbounce_noclean`             | Textured bounce         |
+| `-coarse` / `-adaptivechop` / `-chop` / `-maxchop`                   | Patch chop              |
+| `-bounce_soft` / `-bounce_boost` / `-bounce_chroma` / `-bounce_weld` | Splat / artistic / weld |
+| `-energy` / `-noenergy` / `-valve` / `-cavity`                       | Cavity damp             |
+| `-maxtransfer N`                                                     | Far transfer cull       |
+
+
+
 
 ### Lightmap samples / seams
 
-| Parameter | Description |
-|-----------|-------------|
-| `-edgepull [N]` | Pull edge luxel samples inward (**on** by default; N luxels, default **0.5**) |
-| `-noedgepull` | Stock Valve sample positions (no edge inset) |
-| `-nostitch` | Disable lightmap seam stitching across coplanar face splits |
-| `-centersamples` | Move sample centers |
-| `-noextra` | Disable supersampling |
-| `-debugextra` | Debug data in lightmaps to visualize supersampling |
-| `-dlightmap` | Force direct lighting into a different lightmap than radiosity |
-| `-luxeldensity N` | Rescale all luxels (default **1**). **Avoid with Hammer lightmap scale 2** — values &gt;1 invert and coarsen |
-| `-smooth N` | Smoothing-group threshold in degrees (default **45**) |
+
+| Parameter                                                                                  | Description                      |
+| ------------------------------------------------------------------------------------------ | -------------------------------- |
+| `-edgepull [N]` / `-noedgepull`                                                            | Edge inset (default on, **0.5**) |
+| `-nostitch`                                                                                | Disable seam stitch              |
+| `-centersamples` / `-noextra` / `-debugextra` / `-dlightmap` / `-luxeldensity` / `-smooth` | Stock sample controls            |
+
+
+
 
 ### Sun / sky / displacements
 
-| Parameter | Description |
-|-----------|-------------|
-| `-softsun N` | Treat sun as area light of size N degrees (soft shadows; typical **0**–**5**; default **0**). Prefer entity `SunSpreadAngle` when possible |
-| `-LargeDispSampleRadius` | Wider bounce gather on displacements (fixes splotches; slower) |
-| `-dispchop N` | Displacement chop size (default **8**) |
-| `-disppatchradius N` | Displacement patch radius (default **512**) |
-| `-maxdispsamplesize N` | Max displacement sample size (default **512**) |
 
-### Extra lights / debug / MPI
+| Parameter                                                                          | Description                                       |
+| ---------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `-softsun N`                                                                       | Soft sun degrees (prefer entity `SunSpreadAngle`) |
+| `-LargeDispSampleRadius` / `-dispchop` / `-disppatchradius` / `-maxdispsamplesize` | Displacement                                      |
 
-| Parameter | Description |
-|-----------|-------------|
-| `-lights <file>` | Additional lights file beyond `lights.rad` / map |
-| `-dump` | Write debugging `.txt` files |
-| `-dumpnormals` | Write normals to debug files |
-| `-dumptrace` | Write ray-tracing environment to debug files |
-| `-dumppropmaps` | Dump prop lightmaps |
-| `-loghash` | Log sample hash table to `samplehash.txt` |
-| `-mpi` | Use VMPI distributed compile |
-| `-mpi_ListParams` | List VMPI parameters |
-| `-mpi_pw <pw>` | Password for a specific VMPI worker set |
 
-### Debug-build only (`ALLOWDEBUGOPTIONS` — ignored in Release)
 
-| Parameter | Description |
-|-----------|-------------|
-| `-scale N` | Global light scale |
-| `-ambient R G B` | Add flat ambient |
-| `-dlight N` | Direct light threshold tweak |
-| `-sky N` | Sky scale |
-| `-notexscale` | Disable texture scaling in lighting |
-| `-coring N` | Coring threshold |
+
+### Extra / debug / MPI
+
+
+| Parameter                                   | Description                 |
+| ------------------------------------------- | --------------------------- |
+| `-lights` / `-dump*` / `-loghash` / `-mpi*` | Extra lights / debug / VMPI |
+
+
+
+
+### Debug-build only (`ALLOWDEBUGOPTIONS`)
+
+`-scale`, `-ambient`, `-dlight`, `-sky`, `-notexscale`, `-coring` -- ignored in Release.
 
 ---
 
-## Config presets (`-config`)
 
-Put VRAD flags in a text file so Hammer expert compile stays short:
+
+## 14. Config presets, lint, and editor support
 
 ```bat
--config "PathToCustomVRAD\configs\quality" -game $gamedir $path\$file
+-config "PathToCustomVRAD\configs\full" -game $gamedir $path\$file
 ```
 
-| Preset | File | Intent |
-|--------|------|--------|
-| **full** | [`configs/full.cfg`](configs/full.cfg) | **All flags**, grouped — uncomment to toggle |
-| quality | [`configs/quality.cfg`](configs/quality.cfg) | Final + props + AO + GPU |
-| preview | [`configs/preview.cfg`](configs/preview.cfg) | Fast look |
-| pathtrace | [`configs/pathtrace.cfg`](configs/pathtrace.cfg) | DXR path-traced lightmaps |
-| ao | [`configs/ao.cfg`](configs/ao.cfg) | Strong AO focus |
 
-Start from **`full.cfg`** if you want every option listed. Commented lines (`# …`) are off; uncomment to enable.
+| Preset   | File                                   | Role                                                 |
+| -------- | -------------------------------------- | ---------------------------------------------------- |
+| **full** | `[configs/full.cfg](configs/full.cfg)` | Complete commented flag sheet -- uncomment to enable |
 
-**Format:** one flag (or `flag value`) per line / space-separated. `#` and `//` comments. Do **not** put `-game` or the map path in the config — keep those on the Hammer command line.
 
-**Path lookup:** tries `path`, `path.cfg`, `path.txt`, then the same next to `vrad.exe` and `vrad.exe\configs\`.
+**Format:** one flag (or `flag value`) per line; `#` / `//` comments. Do **not** embed `-game`, `-config`, or the map path. CLI args after `-config` override the file.
 
-CLI args after `-config` still apply and can override (e.g. `-config preview -final`).
+**Path lookup:** `path`, `path.cfg`, `path.txt`, then beside `vrad.exe` and `vrad.exe\configs\`.
+
+**Lint:**
+
+```powershell
+python tools/lint_vrad_cfg.py --style configs
+```
+
+Validates arity, enums, banned Hammer-only flags, and conflicts. Catalog: `tools/vrad_cfg_flags.json`. Cursor/VS Code task: **Lint VRAD configs**.
+
+**Syntax highlighting:**
+
+```powershell
+python tools/install_vrad_cfg_highlight.py
+```
+
+Then **Developer: Reload Window**. Grammar: `tools/vscode-vrad-cfg/`; colours: `.vscode/settings.json`.
 
 ---
 
-## Example commands
 
-**Using a config preset (recommended for Hammer):**
+
+## 15. Example commands
+
+**Config-driven (recommended):**
 
 ```bat
-PathToCustomVRAD\bin\vrad.exe -config "PathToCustomVRAD\configs\quality" -game $gamedir $path\$file
+PathToCustomVRAD\bin\vrad.exe -config "PathToCustomVRAD\configs\full" -game $gamedir $path\$file
 ```
 
-**Quality (explicit flags):**
+**Quality radiosity:**
 
 ```bat
 PathToCustomVRAD\bin\vrad.exe -hdr -final -StaticPropLighting -textureshadows -texbounce -ao -ao_samples 32 -gpu -game "PathToGarrysMod\garrysmod" "PathToMap\map"
 ```
 
-**Preview:**
+**Pathtrace:**
 
 ```bat
-PathToCustomVRAD\bin\vrad.exe -hdr -fast -coarse -ao -ao_samples 8 -gpu -game "PathToGarrysMod\garrysmod" "PathToMap\map"
+vrad.exe -hdr -pathtrace -pt_samples 256 -pt_bounces 6 -pt_aa 2 -StaticPropLighting -textureshadows -game "<gmod>\garrysmod" "<map>"
 ```
 
-**AO-focused:**
+**Underwater (attenuation):**
 
 ```bat
-vrad.exe -ao -ao_samples 32 -ao_distance 64 -ao_strength 0.85 -ao_denoise -gpu -hdr -game "<gmod>\garrysmod" "<map>"
+vrad.exe -config full -underwater -game "<gmod>\garrysmod" "<map>"
 ```
 
 ---
 
-## Build (Windows)
 
-**Needs:** Visual Studio 2022 (Desktop C++, MSVC v143, Windows 10/11 SDK). OpenCL SDK/ICD only if you use `-gpu`.
 
-**Recommended:** run `build.ps1` at the repo root. It always does a full rebuild of `vrad_dll` (no stale object files — a mixed incremental build once produced a DLL that crashed mid-bake), auto-picks an MSBuild with the v143 toolset, and verifies `bin\vrad_dll.dll` was actually written. `.\build.ps1 -Incremental` for fast iteration only.
+## 16. Build (Windows)
 
-Manual alternative:
+**Requires:** Visual Studio 2022 (Desktop C++, MSVC v143, Windows 10/11 SDK). OpenCL only if using `-gpu`.
 
-1. Open `src/Source GPU compiles tool (L-I).sln`
-2. Build **Release | x64**
-3. Outputs under `/bin/` — mainly `vrad_dll_win64` / launcher
+**Recommended:** `.\build.ps1` at repo root -- full rebuild of `vrad_dll`, MSBuild auto-select, verifies `bin\vrad_dll.dll`. Use `.\build.ps1 -Incremental` only for iteration.
 
-**Runtime next to `vrad.exe`:**
+Manual: open `src/Source GPU compiles tool (L-I).sln` → **Release | x64**.
+
+**Runtime next to** `vrad.exe`**:**
 
 ```
 vrad.exe
 vrad_dll.dll
 tier0.dll
 vstdlib.dll
-vphysics.dll          ← use GMod's vphysics_stub.dll copied as vphysics.dll
+vphysics.dll          ← GMod vphysics_stub.dll renamed
 bin/x64/filesystem_stdio.dll
 bin/x64/vphysics.dll  ← same stub
 ```
 
-Do **not** use GMod `bin/win64/vphysics.dll` here — it needs GMod’s `tier0` and fails with `Unable to load vphysics DLL`.
-
-**Platform:** Windows only.
+Do **not** use GMod `bin/win64/vphysics.dll` (wrong `tier0`). **Platform:** Windows only.
 
 ---
 
-## License
 
-**SOURCE 1 SDK LICENSE** — see [LICENSE](LICENSE). Derived work remains under the same non-commercial terms.
 
-Based on Source SDK 2013 tooling adapted for Garry’s Mod (64-bit), including work from [Ficool2’s Source SDK 2013 fork](https://github.com/ficool2/source-sdk-2013).
+## 17. License and provenance
+
+**SOURCE 1 SDK LICENSE** -- see [LICENSE](LICENSE). Derived work remains under the same non-commercial terms.
+
+Based on Source SDK 2013 tooling adapted for Garry's Mod (64-bit), including work from [Ficool2's Source SDK 2013 fork](https://github.com/ficool2/source-sdk-2013). Algorithms and defaults are as implemented in the source tree; `vrad.exe` help and `configs/full.cfg` define shipping presets when they diverge from older prose.

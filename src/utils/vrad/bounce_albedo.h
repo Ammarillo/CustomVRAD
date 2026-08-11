@@ -11,6 +11,9 @@
 // Returns false if no basetexture could be loaded (caller keeps flat reflectivity).
 bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLinearRGB );
 
+// Soft-kill DXT/JPEG chroma on near-greys (uses -texbounce_clean threshold).
+void BounceAlbedo_SanitizeCompressionChroma( Vector &linRGB );
+
 // Preload all texdata albedos (safe to call multiple times).
 void BounceAlbedo_EnsureCache( void );
 

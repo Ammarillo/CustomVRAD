@@ -1,0 +1,104 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "VRAD Config",
+  "scopeName": "source.vrad-cfg",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#bannedFlags"
+    },
+    {
+      "include": "#knownFlags"
+    },
+    {
+      "include": "#unknownFlags"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.vrad-cfg",
+          "begin": "(^[ \\t]+)?(?=#)",
+          "end": "$",
+          "beginCaptures": {
+            "1": {
+              "name": "punctuation.whitespace.comment.leading.vrad-cfg"
+            }
+          },
+          "patterns": [
+            {
+              "name": "markup.heading.section.vrad-cfg",
+              "match": "={3,}.*$"
+            },
+            {
+              "name": "markup.heading.subsection.vrad-cfg",
+              "match": "-{3,}.*$"
+            },
+            {
+              "name": "keyword.flag.commented.vrad-cfg",
+              "match": "(?i)(?<!\\w)(?:-LargeDispSampleRadius|-ao_denoise_strength|-pt_denoise_strength|-StaticPropLighting|-ao_denoise_radius|-maxdispsamplesize|-pt_denoise_radius|-StaticPropNormals|-texbounce_noclean|-pt_lightpenumbra|-pt_prop_vertgrid|-disppatchradius|-noskyboxrecurse|-OnlyStaticProps|-pt_emit_samples|-pt_prop_bounces|-pt_prop_samples|-StaticPropPolys|-texbounce_clean|-mpi_ListParams|-pt_lightradius|-pt_softsamples|-textureshadows|-bounce_chroma|-centersamples|-FullMinidumps|-nodetaillight|-pt_nodennoise|-pt_nospectral|-uw_maxscatter|-adaptivechop|-bounce_boost|-dumppropmaps|-luxeldensity|-ao_distance|-ao_strength|-bounce_soft|-bounce_weld|-dumpnormals|-fastambient|-gpu_maxtris|-maxtransfer|-pt_denoiser|-pt_softmode|-pt_spectral|-allowdebug|-ao_denoise|-ao_samples|-debugextra|-noedgepull|-notexscale|-onlydetail|-pt_bounces|-pt_denoise|-pt_samples|-StopOnExit|-underwater|-dlightmap|-dumptrace|-gpu_batch|-nossprops|-pathtrace|-pt_device|-pt_lights|-rederrors|-texbounce|-uw_volume|-ao_force|-dispchop|-edgepull|-extrasky|-noenergy|-nostitch|-rederror|-ambient|-ao_bias|-loghash|-maxchop|-noextra|-softsun|-threads|-verbose|-bounce|-cavity|-coarse|-coring|-dlight|-energy|-lights|-pt_cpu|-pt_gpu|-smooth|-uw_off|-final|-pt_aa|-scale|-steam|-valve|-chop|-dump|-fast|-dxr|-gpu|-hdr|-ldr|-low|-mpi|-sky|-ao|-v)(?!\\w)"
+            },
+            {
+              "name": "constant.numeric.commented.vrad-cfg",
+              "match": "\\b\\d+(\\.\\d+)?\\b"
+            }
+          ]
+        },
+        {
+          "name": "comment.line.double-slash.vrad-cfg",
+          "begin": "(^[ \\t]+)?(?=//)",
+          "end": "$",
+          "beginCaptures": {
+            "1": {
+              "name": "punctuation.whitespace.comment.leading.vrad-cfg"
+            }
+          }
+        }
+      ]
+    },
+    "bannedFlags": {
+      "name": "invalid.illegal.banned-flag.vrad-cfg",
+      "match": "(?i)(?<!\\w)(?:-insert_search_path|-novconfig|-vproject|-config|-game|-cfg)(?!\\w)"
+    },
+    "knownFlags": {
+      "name": "keyword.control.flag.vrad-cfg",
+      "match": "(?i)(?<!\\w)(?:-LargeDispSampleRadius|-ao_denoise_strength|-pt_denoise_strength|-StaticPropLighting|-ao_denoise_radius|-maxdispsamplesize|-pt_denoise_radius|-StaticPropNormals|-texbounce_noclean|-pt_lightpenumbra|-pt_prop_vertgrid|-disppatchradius|-noskyboxrecurse|-OnlyStaticProps|-pt_emit_samples|-pt_prop_bounces|-pt_prop_samples|-StaticPropPolys|-texbounce_clean|-mpi_ListParams|-pt_lightradius|-pt_softsamples|-textureshadows|-bounce_chroma|-centersamples|-FullMinidumps|-nodetaillight|-pt_nodennoise|-pt_nospectral|-uw_maxscatter|-adaptivechop|-bounce_boost|-dumppropmaps|-luxeldensity|-ao_distance|-ao_strength|-bounce_soft|-bounce_weld|-dumpnormals|-fastambient|-gpu_maxtris|-maxtransfer|-pt_denoiser|-pt_softmode|-pt_spectral|-allowdebug|-ao_denoise|-ao_samples|-debugextra|-noedgepull|-notexscale|-onlydetail|-pt_bounces|-pt_denoise|-pt_samples|-StopOnExit|-underwater|-dlightmap|-dumptrace|-gpu_batch|-nossprops|-pathtrace|-pt_device|-pt_lights|-rederrors|-texbounce|-uw_volume|-ao_force|-dispchop|-edgepull|-extrasky|-noenergy|-nostitch|-rederror|-ambient|-ao_bias|-loghash|-maxchop|-noextra|-softsun|-threads|-verbose|-bounce|-cavity|-coarse|-coring|-dlight|-energy|-lights|-pt_cpu|-pt_gpu|-smooth|-uw_off|-final|-pt_aa|-scale|-steam|-valve|-chop|-dump|-fast|-dxr|-gpu|-hdr|-ldr|-low|-mpi|-sky|-ao|-v)(?!\\w)"
+    },
+    "unknownFlags": {
+      "name": "entity.name.tag.flag.unknown.vrad-cfg",
+      "match": "(?<!\\w)-[A-Za-z_][\\w.\\-]*(?!\\w)"
+    },
+    "strings": {
+      "name": "string.quoted.double.vrad-cfg",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.vrad-cfg",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.vrad-cfg",
+          "match": "(?<![\\w.])-?\\d+\\.\\d+(?!\\w)"
+        },
+        {
+          "name": "constant.numeric.integer.vrad-cfg",
+          "match": "(?<![\\w.])-?\\d+(?!\\w)"
+        }
+      ]
+    }
+  }
+}

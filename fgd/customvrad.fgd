@@ -203,6 +203,96 @@
 ]
 
 // -----------------------------------------------------------------------------
+// fog_volume - volumetric fog volume (brush)
+// Place like a trigger (tools/toolstrigger or nodraw).
+// CustomVRAD bakes a 3D light grid into the BSP pak and rewrites this entity to
+// lua_run_on_client with a short stub that draws fullscreen fog (no addon).
+// -----------------------------------------------------------------------------
+@SolidClass base(Targetname) color(140 180 220) = fog_volume :
+	"Volumetric fog volume for CustomVRAD + Garry's Mod. " +
+	"VRAD bakes a 3D light grid and packs shaders/materials into the BSP. " +
+	"At compile end the entity becomes lua_run_on_client (map-embedded, no addon) " +
+	"which draws a screenspace_general raymarch using the baked light volume. " +
+	"Brush is bounds-only (use tools/toolstrigger)."
+[
+	Enabled(choices) : "Enabled" : 1 : "Disable to skip bake for this volume (no fog material / lua)." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	StartEnabled(choices) : "Start Enabled" : 1 : "Runtime on/off at map load (ConVar cvf_en). Toggle live with cvf_en 0/1." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	FogColor(color255) : "Fog Color" : "200 220 255" : "Fog albedo / tint (RGB). Brightness is driven by the baked light grid."
+	Density(float) : "Density" : "0.02" : "Optical density per world unit. Start low (0.01-0.05)."
+	LightBoost(float) : "Direct Light Boost" : "1.0" : "Multiplier on DIRECT light in the fog (bounce/ambient unaffected). 1 = neutral, 2-4 = light shafts pop, values clamp at white."
+	Anisotropy(float) : "Anisotropy" : "0" : "Henyey-Greenstein phase anisotropy (-1 back .. 0 isotropic .. 1 forward)."
+	GridSpacing(float) : "Grid Spacing" : "32" : "World units between light-grid samples. Lower = sharper lighting, heavier bake. Clamped to max 64^3 samples."
+	StepCount(integer) : "Raymarch Steps" : 32 : "Screenspace raymarch quality (8-128)."
+	BlendDistance(float) : "Blend Distance" : 0 : "World units for soft fade at the volume edge (0-2047). Outside/Center also expand the baked light grid by this amount. 0 = hard cut."
+	BlendMode(choices) : "Blend Mode" : 2 : "Where Blend Distance is applied relative to the brush face. Outside/Center expand raymarch + light-grid bake by Blend Distance." =
+	[
+		0 : "Inside (fade inward from face)"
+		1 : "Outside (fade outward from face)"
+		2 : "Center (fade straddles face)"
+	]
+	NoiseScale(float) : "Noise Scale" : "0" : "Baked 3D FBM noise scale (0=off). World frequency; typical 0.01-0.05. Try 0.02. Noise is packed into the BSP as a tileable 32^3 atlas."
+	NoiseCoverage(float) : "Noise Coverage" : "0.45" : "Cloud coverage 0-1. Lower = more holes / thinner puffs."
+	WindSpeed(float) : "Wind Speed" : "8" : "World-space scroll speed (units/sec). Decimals OK (e.g. 0.5, 2.5). Start low."
+	WindDir(float) : "Wind Dir (yaw)" : "0" : "Wind direction in degrees (0 = +X, 90 = +Y). Quantized to 45° steps."
+	priority(integer) : "Priority" : 0 : "When volumes overlap, higher priority wins for soft-edge conflicts (runtime uses independent draws)."
+]
+
+// -----------------------------------------------------------------------------
+// fog_volume_blocker - carves fog out of overlapping fog_volume brushes
+// Place like a trigger. Soft edge via BlendDistance. Compile-only (rewritten to info_null).
+// -----------------------------------------------------------------------------
+@SolidClass base(Targetname) color(220 100 80) = fog_volume_blocker :
+	"Blocks CustomVRAD volumetric fog inside this brush. " +
+	"Overlaps any fog_volume; fog density is carved out (baked into the light-grid atlas alpha). " +
+	"Use tools/toolstrigger. Removed at compile end (info_null)."
+[
+	Enabled(choices) : "Enabled" : 1 =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	BlendDistance(float) : "Blend Distance" : 16 : "Soft fade from blocker face into the blocked interior (world units). 0 = hard cut."
+]
+
+// -----------------------------------------------------------------------------
+// water_light_vol - override underwater bake IOPs for BSP water
+// Place like a trigger over water. Does not create water — overrides leafWaterData.
+// Requires -underwater or -uw_volume on the VRAD command line.
+// -----------------------------------------------------------------------------
+@SolidClass base(Targetname) color(40 120 180) = water_light_vol :
+	"CustomVRAD underwater lighting override. " +
+	"Overlaps BSP water (leafWaterData) and replaces / tweaks absorption & scattering used during bake. " +
+	"Water materials still supply $fogcolor / $fogend by default (UseVmt). " +
+	"Compile with -underwater (Beer-Lambert+Kd) or -uw_volume (homogeneous volume PT)."
+[
+	Enabled(choices) : "Enabled" : 1 =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	UseVmt(choices) : "Use VMT Fog" : 1 : "Start from the water surface VMT $fog* / $vrad_uw_* then apply entity overrides." =
+	[
+		0 : "No (entity only)"
+		1 : "Yes"
+	]
+	Jerlov(string) : "Jerlov Type" : "" : "Optional Jerlov preset: I, IA, IB, II, III, 1C, 3C, 5C, 7C, 9C. Empty = keep VMT/fog fit."
+	SigmaA(string) : "Sigma A (RGB)" : "" : "Absorption coefficients per channel (1/unit). Empty = unchanged."
+	SigmaS(string) : "Sigma S (RGB)" : "" : "Scattering coefficients per channel (1/unit). Empty = unchanged."
+	Anisotropy(float) : "HG Anisotropy" : "0.8" : "Henyey-Greenstein g for -uw_volume (−1..1)."
+	FogColor(color255) : "Fog Color" : "13 31 46" : "Optional override of water fog tint used to fit extinction."
+	FogEnd(float) : "Fog End" : "" : "Optional visibility distance (hammer units). Empty = leave VMT $fogend."
+	priority(integer) : "Priority" : 0 : "Higher wins when several water_light_vol brushes overlap the same water body."
+]
+
+// -----------------------------------------------------------------------------
 // light_volume - soft sphere point light (POINT entity)
 // Same editor look/keys as stock light (Light base), plus Radius.
 // Requires garrysmod.fgd (or equivalent) loaded before this FGD.

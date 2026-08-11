@@ -27,10 +27,22 @@
 #include "vrad_emit.h"
 #include "ao.h"
 #include "absorb.h"
+#include "fog_volume.h"
+#include "water_medium.h"
 #include "radial.h"
 #include "byteswap.h"
 
 #define ALLOWDEBUGOPTIONS (0 || _DEBUG)
+
+static bool g_bUwCliEnable = false;
+static bool g_bUwCliVolume = false;
+static bool g_bUwCliForceOff = false;
+static int g_nUwMaxScatter = 8;
+
+static void WaterMedium_ApplyCli()
+{
+	WaterMedium_SetCli( g_bUwCliEnable, g_bUwCliVolume, g_bUwCliForceOff, g_nUwMaxScatter );
+}
 
 static FileHandle_t pFpTrans = NULL;
 
@@ -2443,9 +2455,10 @@ bool RadWorld_Go()
 		{
 			if ( AO_ShouldRun() )
 			{
-				Msg( "FinalLightFace + AO (default samples=%d distance=%.1f strength=%.2f, volumes=%d)%s\n",
+				Msg( "FinalLightFace + AO (default samples=%d distance=%.1f strength=%.2f, volumes=%d)%s%s\n",
 					 g_nAOSamples, g_flAODistance, g_flAOStrength, AO_VolumeCount(),
-					 VRadGPU_HasScene() ? " [GPU occlusion]" : " [CPU]" );
+					 VRadGPU_HasScene() ? " [GPU occlusion]" : " [CPU]",
+					 AO_ShouldApplyToLightmaps() ? "" : " (skipped on pathtrace GI — use -ao_force to override)" );
 			}
 			RunThreadsOnIndividual (numfaces, true, FinalLightFace);
 
@@ -2715,6 +2728,9 @@ void VRAD_ComputeOtherLighting()
 	{
 		StaticPropMgr()->ComputeLighting( THREADINDEX_MAIN );
 	}
+
+	// Volumetric fog light grids + lua_run rewrite (needs leaf ambient).
+	FogVolume_BakeAndEmbed();
 }
 
 extern void CloseDispLuxels();
@@ -2874,6 +2890,41 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 		{
 			g_bPathTraceSpectral = false;
 			Msg( "PathTrace spectral (-pt_nospectral): RGB transport.\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-underwater" ) )
+		{
+			g_bUwCliEnable = true;
+			g_bUwCliVolume = false;
+			g_bUwCliForceOff = false;
+			WaterMedium_ApplyCli();
+			Msg( "Underwater lighting (-underwater): Beer-Lambert + Kd (mode A).\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-uw_volume" ) )
+		{
+			g_bUwCliEnable = true;
+			g_bUwCliVolume = true;
+			g_bUwCliForceOff = false;
+			WaterMedium_ApplyCli();
+			Msg( "Underwater lighting (-uw_volume): homogeneous volume path tracing (mode C).\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-uw_off" ) )
+		{
+			g_bUwCliForceOff = true;
+			g_bUwCliEnable = false;
+			g_bUwCliVolume = false;
+			WaterMedium_ApplyCli();
+			Msg( "Underwater lighting (-uw_off): forced disabled.\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-uw_maxscatter" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nUwMaxScatter = atoi( argv[i] );
+				if ( g_nUwMaxScatter < 1 ) g_nUwMaxScatter = 1;
+				if ( g_nUwMaxScatter > 64 ) g_nUwMaxScatter = 64;
+				WaterMedium_ApplyCli();
+				Msg( "Underwater max medium scatters (-uw_maxscatter): %d\n", g_nUwMaxScatter );
+			}
 		}
 		else if ( !Q_stricmp( argv[i], "-pt_emit_samples" ) )
 		{
@@ -3196,8 +3247,14 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 		else if ( !Q_stricmp( argv[i], "-ao" ) )
 		{
 			g_bAO = true;
-			Msg( "Ambient occlusion (-ao): samples=%d distance=%.1f strength=%.2f bias=%.2f\n",
+			Msg( "Ambient occlusion (-ao): samples=%d distance=%.1f strength=%.2f bias=%.2f (obscurance)\n",
 				 g_nAOSamples, g_flAODistance, g_flAOStrength, g_flAOBias );
+		}
+		else if ( !Q_stricmp( argv[i], "-ao_force" ) )
+		{
+			g_bAOForce = true;
+			g_bAO = true;
+			Msg( "AO force (-ao_force): apply post-multiply even under pathtrace GI (artistic; double-occludes).\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-ao_samples" ) )
 		{
@@ -3791,6 +3848,10 @@ void PrintUsage( int argc, char **argv )
 		"  -pt_emit_samples N : $vrad_emit area NEE samples (0=all tris; default 64; higher=less noise).\n"
 		"  -pt_spectral    : Hero-wavelength spectral transport (Smits RGB->SPD + CIE; default ON).\n"
 		"  -pt_nospectral  : Disable spectral; linear RGB path transport.\n"
+		"  -underwater     : Bake underwater Beer-Lambert + Kd from BSP water / VMT fog (mode A).\n"
+		"  -uw_volume      : Full homogeneous volume path tracing in water (mode C; implies underwater).\n"
+		"  -uw_off         : Force-disable underwater medium bake.\n"
+		"  -uw_maxscatter N: Max medium scatter events for -uw_volume (default 8; max 64).\n"
 		"  -pt_lightradius N : Soft disk radius for light/light_spot (0=hard; world units; CHSS).\n"
 		"  -pt_lightpenumbra N : Softness growth vs distance for soft lights (default 1).\n"
 		"  -pt_softsamples N : Max soft visibility rays per NEE (default 16; sun+locals).\n"
@@ -3820,7 +3881,8 @@ void PrintUsage( int argc, char **argv )
 		"  -edgepull [N]   : Pull edge luxel samples inward (default ON, N=0.5 luxels). Helps thin walls.\n"
 		"  -noedgepull     : Disable edge sample pull-in (stock Valve sample positions).\n"
 		"  -maxtransfer N  : Skip patch transfers farther than N units (faster VisLeafs).\n"
-		"  -ao             : Bake cosine-weighted ambient occlusion into lightmaps.\n"
+		"  -ao             : Bake cosine-hemisphere ambient obscurance into lightmaps.\n"
+		"  -ao_force       : Apply AO multiply even under -pathtrace GI (default skips; physically wrong).\n"
 		"  -ao_samples N   : AO rays per luxel (default 16). Implies -ao.\n"
 		"  -ao_distance N  : AO ray length in world units (default 48). Implies -ao.\n"
 		"  -ao_strength N  : AO darkening strength (default 1, max 8; >1 boosts). Implies -ao.\n"

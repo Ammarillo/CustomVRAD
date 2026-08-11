@@ -27,6 +27,7 @@ StructuredBuffer<float> IesAtlas : register(t21); // layers * IesResV * IesResH,
 StructuredBuffer<float4> LightsE : register(t22); // 3 x float4 per light: proj basis/mode/layer
 Texture2DArray<float4> ProjCookies : register(t23);
 Texture2DArray<float4> ProjCubes : register(t24); // 6 faces per cubemap
+StructuredBuffer<float4> WaterVols : register(t25); // 5 x float4 per water body
 RWStructuredBuffer<float4> OutRGB : register(u0);
 SamplerState g_ptLinearClamp : register(s0);
 
@@ -60,6 +61,10 @@ cbuffer CB : register(b0)
 	uint SpectralMode;	// 1 = hero-wavelength Smits+CIE spectral transport
 	uint IesResV;		// GPU IES atlas vertical samples (0..180 deg)
 	uint IesResH;		// GPU IES atlas horizontal samples (0..360 deg)
+	uint WaterVolCount;
+	uint WaterMode;		// 0=off, 1=Beer+Kd, 2=volume
+	uint UwMaxScatter;
+	uint WaterPad;
 };
 
 #ifndef PT_ENABLE_VOLUMES
@@ -77,6 +82,172 @@ static const float FILTER_ADVANCE = 0.15f;
 // Max world-unit gap between enter/exit of the same thin brush sheet.
 static const float FILTER_SHEET_THICK = 12.0f;
 
+// ---- Water medium (Beer-Lambert + optional volume) ----
+float4 WVolA( uint i ) { return WaterVols[i * 5 + 0]; } // mins.xyz, sigmaA.x
+float4 WVolB( uint i ) { return WaterVols[i * 5 + 1]; } // maxs.xyz, sigmaA.y
+float4 WVolC( uint i ) { return WaterVols[i * 5 + 2]; } // sigmaA.z, sigmaS.xyz
+float4 WVolD( uint i ) { return WaterVols[i * 5 + 3]; } // g, surfaceZ, kd.xy
+float4 WVolE( uint i ) { return WaterVols[i * 5 + 4]; } // kd.z, fog.rgb
+
+bool PointInWaterBody( uint i, float3 p )
+{
+	float4 a = WVolA( i );
+	float4 b = WVolB( i );
+	return all( p >= a.xyz ) && all( p <= b.xyz );
+}
+
+int WaterBodyAt( float3 p )
+{
+	if ( WaterVolCount == 0 || WaterMode == 0 )
+		return -1;
+	[loop] for ( uint i = 0; i < WaterVolCount; ++i )
+	{
+		if ( PointInWaterBody( i, p ) )
+			return (int)i;
+	}
+	return -1;
+}
+
+float SegLenInAabb( float3 a, float3 b, float3 mins, float3 maxs )
+{
+	float3 d = b - a;
+	float t0 = 0.0f, t1 = 1.0f;
+	[unroll] for ( int i = 0; i < 3; ++i )
+	{
+		float orig = a[i];
+		float dir = d[i];
+		float mn = mins[i];
+		float mx = maxs[i];
+		if ( abs( dir ) < 1e-12f )
+		{
+			if ( orig < mn || orig > mx )
+				return 0.0f;
+			continue;
+		}
+		float inv = 1.0f / dir;
+		float ta = ( mn - orig ) * inv;
+		float tb = ( mx - orig ) * inv;
+		if ( ta > tb ) { float tmp = ta; ta = tb; tb = tmp; }
+		t0 = max( t0, ta );
+		t1 = min( t1, tb );
+		if ( t0 > t1 )
+			return 0.0f;
+	}
+	return ( t1 - t0 ) * length( d );
+}
+
+float3 WaterSigmaT( uint i )
+{
+	float4 a = WVolA( i );
+	float4 b = WVolB( i );
+	float4 c = WVolC( i );
+	float3 sigA = float3( a.w, b.w, c.x );
+	float3 sigS = c.yzw;
+	return sigA + sigS;
+}
+
+float3 WaterSegT( float3 from, float3 to )
+{
+	float3 T = 1.0f;
+	if ( WaterVolCount == 0 || WaterMode == 0 )
+		return T;
+	[loop] for ( uint i = 0; i < WaterVolCount; ++i )
+	{
+		float4 a = WVolA( i );
+		float4 b = WVolB( i );
+		float L = SegLenInAabb( from, to, a.xyz, b.xyz );
+		if ( L <= 1e-4f )
+			continue;
+		float3 st = WaterSigmaT( i );
+		T *= exp( -st * L );
+	}
+	return saturate( T );
+}
+
+float3 WaterKdScale( float3 pos )
+{
+	if ( WaterMode == 0 || WaterMode == 2u ) // off or volume PT
+		return 1.0f;
+	int id = WaterBodyAt( pos );
+	if ( id < 0 )
+		return 1.0f;
+	float4 d = WVolD( (uint)id );
+	float4 e = WVolE( (uint)id );
+	float depth = max( 0.0f, d.y - pos.z );
+	float3 kd = float3( d.z, d.w, e.x );
+	return max( exp( -kd * depth ), float3( 0.04f, 0.04f, 0.04f ) );
+}
+
+float3 WaterScatterAlbedo( uint i )
+{
+	float3 st = WaterSigmaT( i );
+	float4 c = WVolC( i );
+	float3 sigS = c.yzw;
+	return float3(
+		st.x > 1e-12f ? sigS.x / st.x : 0.0f,
+		st.y > 1e-12f ? sigS.y / st.y : 0.0f,
+		st.z > 1e-12f ? sigS.z / st.z : 0.0f );
+}
+
+float3 SampleHG( float g, float u1, float u2, float3 wo )
+{
+	float cosTheta;
+	if ( abs( g ) < 1e-3f )
+		cosTheta = 1.0f - 2.0f * u1;
+	else
+	{
+		float g2 = g * g;
+		float sqr = ( 1.0f - g2 ) / ( 1.0f - g + 2.0f * g * u1 );
+		cosTheta = clamp( ( 1.0f + g2 - sqr * sqr ) / ( 2.0f * g ), -1.0f, 1.0f );
+	}
+	float sinTheta = sqrt( max( 0.0f, 1.0f - cosTheta * cosTheta ) );
+	float phi = 2.0f * PI * u2;
+	float3 forward = normalize( -wo );
+	float3 t1 = ( abs( forward.x ) > 0.1f )
+		? normalize( cross( float3( 0, 1, 0 ), forward ) )
+		: normalize( cross( float3( 1, 0, 0 ), forward ) );
+	float3 t2 = cross( forward, t1 );
+	return normalize( t1 * ( sinTheta * cos( phi ) ) + t2 * ( sinTheta * sin( phi ) ) + forward * cosTheta );
+}
+
+bool SampleWaterFreeFlight( float3 pos, float3 dir, float u, out float tFree, out uint body )
+{
+	tFree = 0;
+	body = 0;
+	int id = WaterBodyAt( pos );
+	if ( id < 0 )
+		return false;
+	body = (uint)id;
+	float3 st = WaterSigmaT( body );
+	float stMax = max( st.x, max( st.y, st.z ) );
+	if ( stMax < 1e-8f )
+		return false;
+	u = clamp( u, 1e-6f, 1.0f - 1e-6f );
+	float tScatter = -log( 1.0f - u ) / stMax;
+	float4 mins = WVolA( body );
+	float4 maxs = WVolB( body );
+	float tExit = 1e30f;
+	[unroll] for ( int i = 0; i < 3; ++i )
+	{
+		float o = pos[i];
+		float d = dir[i];
+		if ( abs( d ) < 1e-12f )
+			continue;
+		float t1 = ( mins[i] - o ) / d;
+		float t2 = ( maxs[i] - o ) / d;
+		float tFar = max( t1, t2 );
+		if ( tFar > 0.0f )
+			tExit = min( tExit, tFar );
+	}
+	// No medium event if free-flight exits the AABB first (do not fake-scatter at boundary).
+	if ( tScatter >= tExit - 1e-3f )
+		return false;
+	tFree = tScatter;
+	return true;
+}
+
+)HLSL"
+R"HLSL(
 // ---- SPECTRAL_INSERT ----
 
 // ---- Oklab (Bjoern Ottosson) https://bottosson.github.io/posts/oklab/ ----
@@ -674,12 +845,12 @@ float3 VisRGB( float3 from, float3 to, int skipProp )
 	float3 delta = to - from;
 	float dist = length( delta );
 	if ( dist <= OccludeBias * 2.0f )
-		return float3( 1, 1, 1 );
+		return WaterSegT( from, to );
 	delta /= dist;
 	float tmin = OccludeBias;
 	float tmax = dist - min( OccludeBias, dist * 0.25f );
 	if ( tmax <= tmin )
-		return float3( 1, 1, 1 );
+		return WaterSegT( from, to );
 	float3 T = 1;
 	uint lastPrim = 0xFFFFFFFFu;
 	uint lastFace = 0xFFFFFFFFu;
@@ -691,12 +862,12 @@ float3 VisRGB( float3 from, float3 to, int skipProp )
 			break;
 		float t; uint flags, prim; float3 nHit;
 		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, t, flags, prim, nHit ) )
-			return T;
+			return T * WaterSegT( from, to );
 		if ( flags & TRACE_ID_SKY )
-			return T;
+			return T * WaterSegT( from, from + delta * t );
 #if PT_ENABLE_VOLUMES
 		if ( EnvVolCount > 0 && IgnoreSkyOccluder( from, from + delta * t ) )
-			return T;
+			return T * WaterSegT( from, from + delta * t );
 #endif
 		if ( ( flags & TRACE_ID_FILTER ) != 0 || IsFilterPrim( prim ) )
 		{
@@ -715,7 +886,6 @@ float3 VisRGB( float3 from, float3 to, int skipProp )
 				continue;
 			}
 			float3 F = SampleFilterT( prim, from + delta * t );
-			// Meta miss (mode 0) must not hard-block filter hits.
 			if ( max( F.x, max( F.y, F.z ) ) < 1e-5f && ( flags & TRACE_ID_FILTER ) != 0 )
 				F = float3( 1, 1, 1 );
 			T = OklabStackFilter( T, max( F, float3( 1e-4f, 1e-4f, 1e-4f ) ) );
@@ -726,7 +896,7 @@ float3 VisRGB( float3 from, float3 to, int skipProp )
 		}
 		return 0;
 	}
-	return T;
+	return T * WaterSegT( from, to );
 }
 
 bool Occluded( float3 from, float3 to, int skipProp )
@@ -747,12 +917,12 @@ float3 SunVisRGB( float3 pos, float3 axis, int skipProp )
 	{
 		float t; uint flags, prim; float3 nHit;
 		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, t, flags, prim, nHit ) )
-			return T;
+			return T * WaterKdScale( pos );
 		if ( flags & TRACE_ID_SKY )
-			return T;
+			return T * WaterKdScale( pos );
 #if PT_ENABLE_VOLUMES
 		if ( EnvVolCount > 0 && IgnoreSkyOccluder( pos, pos + axis * t ) )
-			return T;
+			return T * WaterKdScale( pos );
 #endif
 		if ( ( flags & TRACE_ID_FILTER ) != 0 || IsFilterPrim( prim ) )
 		{
@@ -781,7 +951,7 @@ float3 SunVisRGB( float3 pos, float3 axis, int skipProp )
 		}
 		return 0;
 	}
-	return T;
+	return T * WaterKdScale( pos );
 }
 
 bool SunBlocked( float3 pos, float3 axis, int skipProp )
@@ -1373,25 +1543,28 @@ R"HLSL(		// emit_surface / $vrad_emit*: hard center NEE + area falloff.
 
 float3 SampleSkyAmb( float3 pos )
 {
+	float3 amb;
 #if PT_ENABLE_VOLUMES
 	if ( EnvVolCount == 0 )
-		return float3( SkyAmbX, SkyAmbY, SkyAmbZ );
-
-	float3 amb = 0;
-	for ( uint i = 0; i < LightCount; ++i )
+		amb = float3( SkyAmbX, SkyAmbY, SkyAmbZ );
+	else
 	{
-		float type = LA0( i ).w;
-		if ( type <= 3.5f )
-			continue;
-		float w = EnvWeight( LightsD[i].y, pos );
-		if ( w <= 0.0f )
-			continue;
-		amb += LA1( i ).xyz * w;
+		amb = 0;
+		for ( uint i = 0; i < LightCount; ++i )
+		{
+			float type = LA0( i ).w;
+			if ( type <= 3.5f )
+				continue;
+			float w = EnvWeight( LightsD[i].y, pos );
+			if ( w <= 0.0f )
+				continue;
+			amb += LA1( i ).xyz * w;
+		}
 	}
-	return amb;
 #else
-	return float3( SkyAmbX, SkyAmbY, SkyAmbZ );
+	amb = float3( SkyAmbX, SkyAmbY, SkyAmbZ );
 #endif
+	return amb * WaterKdScale( pos );
 }
 
 uint SampleLocalCdf( float u )
@@ -1520,6 +1693,7 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 	const bool spectral = ( SpectralMode != 0 );
 	const float dLam = ( SPEC_LMAX - SPEC_LMIN ) / (float)SPEC_WAVES;
 	const float pdfLam = 1.0f / dLam;
+	const bool volMode = ( WaterMode == 2u ) && ( WaterVolCount > 0 );
 
 	float lam0 = 550.0f, lam1 = 550.0f, lam2 = 550.0f, lam3 = 550.0f;
 	float4 beta = 1.0f;
@@ -1537,12 +1711,16 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 	float3 pos = posIn;
 	float3 normal = normalIn;
 	int skipFace = faceNum;
+	bool inMedium = false;
+	float3 medDir = float3( 0, 0, 1 );
+	uint mediumScatters = 0;
 
 	for ( uint bounce = 0; bounce < pathDepth; ++bounce )
 	{
 		bool allowSoft = ( bounce == 0 ) || ( SoftMode != 0 );
 		float sunB = 0;
-		float3 nee = SampleDirect( pos, normal, seed + bounce * 31u + sppIndex * 17u, skipFace, skipProp, allowSoft,
+		float3 neeN = inMedium ? medDir : normal;
+		float3 nee = SampleDirect( pos, neeN, seed + bounce * 31u + sppIndex * 17u, skipFace, skipProp, allowSoft,
 								   bounce == 0, sunB, lam0 );
 		nee = ClampFirefly( nee, FireflyCap );
 		if ( spectral )
@@ -1559,8 +1737,19 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 
 		float u1 = Hash01( seed + bounce * 13u + sppIndex * 7u + 11u );
 		float u2 = Hash01( seed + bounce * 17u + sppIndex * 11u + 13u );
-		float3 dir = CosineHemi( normal, u1, u2 );
+		float3 dir = inMedium ? medDir : CosineHemi( normal, u1, u2 );
 
+		float tFree = MaxTrace;
+		uint medBody = 0;
+		bool tryMed = false;
+		if ( volMode && mediumScatters < UwMaxScatter && WaterBodyAt( pos ) >= 0 )
+		{
+			float uMed = Hash01( seed + bounce * 53u + sppIndex * 29u + 77u );
+			if ( SampleWaterFreeFlight( pos, dir, uMed, tFree, medBody ) )
+				tryMed = true;
+		}
+
+		float maxDist = tryMed ? ( tFree + 1e-3f ) : MaxTrace;
 		float tmin = 0.25f;
 		float t = 0; uint flags = 0, prim = 0; float3 hitN = float3( 0, 0, 1 );
 		bool hit = false;
@@ -1571,7 +1760,7 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 		[loop] for ( int fpass = 0; fpass < MAX_FILTER_HITS + 1; ++fpass )
 		{
 			float t0; uint f0, p0; float3 n0;
-			bool h0 = TraceClosest( pos, dir, tmin, MaxTrace, skipProp, t0, f0, p0, n0 );
+			bool h0 = TraceClosest( pos, dir, tmin, maxDist, skipProp, t0, f0, p0, n0 );
 			if ( !h0 || ( f0 & TRACE_ID_SKY ) )
 			{
 				hit = false;
@@ -1614,8 +1803,72 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 			t = t0; flags = f0; prim = p0; hitN = n0;
 			break;
 		}
+
+		if ( tryMed && ( !hit || t > tFree ) )
+		{
+			float3 scatterPos = pos + dir * tFree;
+			float3 Tw = WaterSegT( pos, scatterPos );
+			float3 albedoM = WaterScatterAlbedo( medBody );
+			float3 fog = WVolE( medBody ).yzw;
+			float3 veilAmb = SampleSkyAmb( scatterPos );
+			const float kVeil = 0.12f;
+			if ( spectral )
+			{
+				float3 veil = albedoM * veilAmb * fog * kVeil;
+				Ls.x += beta.x * SpecIllum( veil, lam0 ) * SpecRefl( Tw, lam0 );
+				Ls.y += beta.y * SpecIllum( veil, lam1 ) * SpecRefl( Tw, lam1 );
+				Ls.z += beta.z * SpecIllum( veil, lam2 ) * SpecRefl( Tw, lam2 );
+				Ls.w += beta.w * SpecIllum( veil, lam3 ) * SpecRefl( Tw, lam3 );
+				beta.x *= SpecRefl( Tw, lam0 ) * SpecRefl( albedoM, lam0 );
+				beta.y *= SpecRefl( Tw, lam1 ) * SpecRefl( albedoM, lam1 );
+				beta.z *= SpecRefl( Tw, lam2 ) * SpecRefl( albedoM, lam2 );
+				beta.w *= SpecRefl( Tw, lam3 ) * SpecRefl( albedoM, lam3 );
+			}
+			else
+			{
+				throughput *= Tw;
+				radiance += throughput * ( albedoM * veilAmb * fog * kVeil );
+				throughput *= albedoM;
+			}
+			mediumScatters++;
+			float ug1 = Hash01( seed + bounce * 71u + sppIndex * 37u + 3u );
+			float ug2 = Hash01( seed + bounce * 73u + sppIndex * 41u + 5u );
+			float g = WVolD( medBody ).x;
+			medDir = SampleHG( g, ug1, ug2, dir );
+			pos = scatterPos;
+			normal = medDir;
+			inMedium = true;
+			skipFace = -1;
+			if ( bounce >= 1 )
+			{
+				float q = spectral
+					? min( 0.95f, ( beta.x + beta.y + beta.z + beta.w ) * 0.25f )
+					: min( 0.95f, max( throughput.x, max( throughput.y, throughput.z ) ) );
+				float r = Hash01( seed + bounce * 41u + 99u + sppIndex );
+				if ( r > q )
+					break;
+				float invQ = 1.0f / max( q, 1e-3f );
+				if ( spectral ) beta *= invQ; else throughput *= invQ;
+			}
+			continue;
+		}
+
 		if ( !hit )
 		{
+			// Mode C: always Beer-Lambert along escape (Kd disabled in volume mode).
+			if ( volMode )
+			{
+				float3 Tw = WaterSegT( pos, pos + dir * MaxTrace );
+				if ( spectral )
+				{
+					beta.x *= SpecRefl( Tw, lam0 );
+					beta.y *= SpecRefl( Tw, lam1 );
+					beta.z *= SpecRefl( Tw, lam2 );
+					beta.w *= SpecRefl( Tw, lam3 );
+				}
+				else
+					throughput *= Tw;
+			}
 			float3 amb = SampleSkyAmb( pos );
 			if ( spectral )
 			{
@@ -1632,6 +1885,19 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 		float3 hitPos = pos + dir * t;
 		if ( dot( hitN, dir ) > 0 )
 			hitN = -hitN;
+
+		{
+			float3 Tw = WaterSegT( pos, hitPos );
+			if ( spectral )
+			{
+				beta.x *= SpecRefl( Tw, lam0 );
+				beta.y *= SpecRefl( Tw, lam1 );
+				beta.z *= SpecRefl( Tw, lam2 );
+				beta.w *= SpecRefl( Tw, lam3 );
+			}
+			else
+				throughput *= Tw;
+		}
 
 		float3 albedo = ( prim < TriCount ) ? TriAlbedo[prim] : float3( 0.45, 0.45, 0.45 );
 		albedo = ApplyBounceVolAlbedo( hitPos, albedo, bounce );
@@ -1663,6 +1929,7 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 
 		pos = hitPos + hitN * 0.5f;
 		normal = hitN;
+		inMedium = false;
 		skipFace = -1;
 		if ( spectral )
 		{
@@ -1743,6 +2010,7 @@ struct PtBakeGpu
 	ComPtr<ID3D12Resource>		emitA, emitE, emitCdf;
 	ComPtr<ID3D12Resource>		envVols;
 	ComPtr<ID3D12Resource>		bounceVols;
+	ComPtr<ID3D12Resource>		waterVols;
 	ComPtr<ID3D12Resource>		albedo;
 	ComPtr<ID3D12Resource>		triFilter; // FilterMeta: 5 float4 / tri
 	ComPtr<ID3D12Resource>		filterAtlas; // Texture2DArray
@@ -1766,6 +2034,9 @@ struct PtBakeGpu
 	uint32						emitTriCount = 0;
 	uint32						envVolCount = 0;
 	uint32						bounceVolCount = 0;
+	uint32						waterVolCount = 0;
+	uint32						waterMode = 0;
+	uint32						uwMaxScatter = 8;
 	uint32						sampleOffset = 0;
 	ComPtr<ID3D12Resource>		luxelA, luxelB, luxelC;
 	ComPtr<ID3D12Resource>		luxelAUp, luxelBUp, luxelCUp;
@@ -1788,6 +2059,9 @@ static PtBakeGpu g_ptBake;
 // compile in the same VRAD run (world bake OK -> prop bake recompile crashes). Cache the
 // DXIL so GpuBakeBegin after world->props does not re-enter dxcompiler.
 static ComPtr<ID3DBlob> g_ptLuxelCsCache[2]; // [0]=no volumes, [1]=volumes
+// Bump when luxel CS root signature / WaterVols layout changes.
+static const uint32 kPtLuxelCsCacheGen = 2;
+static uint32 g_ptLuxelCsCacheGen = 0;
 
 static bool PtEnsureDxcLoaded()
 {
@@ -1872,13 +2146,14 @@ static bool PtFindDxcExe( wchar_t outPath[MAX_PATH] )
 	return false;
 }
 
-static bool PtCompileLuxelCsExternal( const char *src, bool enableVolumes, ID3DBlob **ppBlob )
+static bool PtCompileLuxelCsExternal( const char *src, bool enableVolumes, ID3DBlob **ppBlob, bool quiet )
 {
 	*ppBlob = nullptr;
 	wchar_t dxcExe[MAX_PATH];
 	if ( !PtFindDxcExe( dxcExe ) )
 	{
-		Warning( "[PathTrace-DXR] dxc.exe not found for external luxel CS compile.\n" );
+		if ( !quiet )
+			Warning( "[PathTrace-DXR] dxc.exe not found for external luxel CS compile.\n" );
 		return false;
 	}
 
@@ -1903,7 +2178,8 @@ static bool PtCompileLuxelCsExternal( const char *src, bool enableVolumes, ID3DB
 		}
 	}
 
-	wchar_t cmd[2048];
+	// Quote paths; CreateProcessW needs a writable command line.
+	wchar_t cmd[4096];
 	_snwprintf_s( cmd, _TRUNCATE,
 				  L"\"%s\" -E CSMain -T cs_6_5 -HV 2021 -DPT_ENABLE_VOLUMES=%d -Fo \"%S\" \"%S\"",
 				  dxcExe, enableVolumes ? 1 : 0, dxilPath, hlslPath );
@@ -1913,8 +2189,11 @@ static bool PtCompileLuxelCsExternal( const char *src, bool enableVolumes, ID3DB
 	si.dwFlags = STARTF_USESHOWWINDOW;
 	si.wShowWindow = SW_HIDE;
 	PROCESS_INFORMATION pi = {};
-	Msg( "[PathTrace-DXR] In-process DXC failed - compiling luxel CS via dxc.exe...\n" );
-	fflush( stdout );
+	if ( !quiet )
+	{
+		Msg( "[PathTrace-DXR] Compiling luxel CS via dxc.exe...\n" );
+		fflush( stdout );
+	}
 	BOOL ok = CreateProcessW( nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi );
 	if ( !ok )
 	{
@@ -1964,20 +2243,8 @@ static bool PtCompileLuxelCsExternal( const char *src, bool enableVolumes, ID3DB
 	return true;
 }
 
-// SEH-safe wrapper - COM smart pointers cannot live in the same function as __try.
-static HRESULT PtDxcCompileRaw( IDxcCompiler3 *compiler, const DxcBuffer *buf,
-								LPCWSTR *args, UINT32 nArgs, IDxcResult **ppResult )
-{
-	__try
-	{
-		return compiler->Compile( buf, args, nArgs, nullptr, IID_PPV_ARGS( ppResult ) );
-	}
-	__except ( EXCEPTION_EXECUTE_HANDLER )
-	{
-		return E_FAIL;
-	}
-}
-
+// In-process DXC. Do NOT SEH-catch AVs: continuing after dxcompiler AV poisons the
+// heap and later fails with STATUS_STACK_BUFFER_OVERRUN (0xC0000409).
 static bool PtCompileCSNamedInProcess( const char *src, bool enableVolumes, ID3DBlob **ppBlob )
 {
 	*ppBlob = nullptr;
@@ -2008,16 +2275,14 @@ static bool PtCompileCSNamedInProcess( const char *src, bool enableVolumes, ID3D
 	buf.Size = source->GetBufferSize();
 	buf.Encoding = DXC_CP_UTF8;
 
-	IDxcResult *rawResult = nullptr;
-	HRESULT hrCompile = PtDxcCompileRaw( compiler.Get(), &buf, args, _countof( args ), &rawResult );
-	if ( FAILED( hrCompile ) || !rawResult )
+	ComPtr<IDxcResult> result;
+	HRESULT hrCompile = compiler->Compile( &buf, args, _countof( args ), nullptr, IID_PPV_ARGS( &result ) );
+	if ( FAILED( hrCompile ) || !result )
 	{
-		Warning( "[PathTrace-DXR] In-process DXC luxel CS compile crashed or failed (0x%08X).\n",
+		Warning( "[PathTrace-DXR] In-process DXC luxel CS compile failed (0x%08X).\n",
 				 (unsigned)hrCompile );
 		return false;
 	}
-	ComPtr<IDxcResult> result;
-	result.Attach( rawResult );
 
 	HRESULT hrStatus = S_OK;
 	result->GetStatus( &hrStatus );
@@ -2041,16 +2306,89 @@ static bool PtCompileCSNamedInProcess( const char *src, bool enableVolumes, ID3D
 	return true;
 }
 
+static unsigned PtHashBytes( const void *data, size_t n )
+{
+	const unsigned char *p = (const unsigned char *)data;
+	unsigned h = 2166136261u;
+	for ( size_t i = 0; i < n; ++i )
+	{
+		h ^= p[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+static bool PtLoadLuxelCsDiskCache( unsigned hash, bool enableVolumes, ID3DBlob **ppBlob )
+{
+	*ppBlob = nullptr;
+	char tmpDir[MAX_PATH] = {};
+	GetTempPathA( MAX_PATH, tmpDir );
+	char path[MAX_PATH];
+	_snprintf_s( path, _TRUNCATE, "%scvrad_luxel_%08x_v%d.dxil", tmpDir, hash, enableVolumes ? 1 : 0 );
+	HANDLE h = CreateFileA( path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr );
+	if ( h == INVALID_HANDLE_VALUE )
+		return false;
+	DWORD sz = GetFileSize( h, nullptr );
+	if ( sz == 0 || sz == INVALID_FILE_SIZE || sz > 32u * 1024u * 1024u )
+	{
+		CloseHandle( h );
+		return false;
+	}
+	ID3DBlob *blob = nullptr;
+	if ( FAILED( D3DCreateBlob( sz, &blob ) ) || !blob )
+	{
+		CloseHandle( h );
+		return false;
+	}
+	DWORD read = 0;
+	BOOL ok = ReadFile( h, blob->GetBufferPointer(), sz, &read, nullptr );
+	CloseHandle( h );
+	if ( !ok || read != sz )
+	{
+		blob->Release();
+		return false;
+	}
+	*ppBlob = blob;
+	return true;
+}
+
+static void PtSaveLuxelCsDiskCache( unsigned hash, bool enableVolumes, ID3DBlob *blob )
+{
+	if ( !blob )
+		return;
+	char tmpDir[MAX_PATH] = {};
+	GetTempPathA( MAX_PATH, tmpDir );
+	char path[MAX_PATH];
+	_snprintf_s( path, _TRUNCATE, "%scvrad_luxel_%08x_v%d.dxil", tmpDir, hash, enableVolumes ? 1 : 0 );
+	HANDLE h = CreateFileA( path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
+	if ( h == INVALID_HANDLE_VALUE )
+		return;
+	DWORD written = 0;
+	WriteFile( h, blob->GetBufferPointer(), (DWORD)blob->GetBufferSize(), &written, nullptr );
+	CloseHandle( h );
+}
+
 static bool PtCompileCSNamed( const char *src, const char * /*entry*/, bool enableVolumes, ID3DBlob **ppBlob )
 {
-	if ( PtCompileCSNamedInProcess( src, enableVolumes, ppBlob ) )
+	// Prefer out-of-process dxc.exe. In-process dxcompiler.dll intermittently AVs
+	// (HRESULT 0x80004005); the old SEH catch-and-continue left the process poisoned
+	// and later aborted with STATUS_STACK_BUFFER_OVERRUN (0xC0000409).
+	if ( PtCompileLuxelCsExternal( src, enableVolumes, ppBlob, false ) )
 		return true;
-	return PtCompileLuxelCsExternal( src, enableVolumes, ppBlob );
+	Msg( "[PathTrace-DXR] dxc.exe unavailable/failed - trying in-process DXC...\n" );
+	fflush( stdout );
+	return PtCompileCSNamedInProcess( src, enableVolumes, ppBlob );
 }
 
 static bool PtGetOrCompileLuxelCS( bool enableVolumes, ID3DBlob **ppBlob )
 {
 	*ppBlob = nullptr;
+	if ( g_ptLuxelCsCacheGen != kPtLuxelCsCacheGen )
+	{
+		g_ptLuxelCsCache[0].Reset();
+		g_ptLuxelCsCache[1].Reset();
+		g_ptLuxelCsCacheGen = kPtLuxelCsCacheGen;
+	}
 	const int slot = enableVolumes ? 1 : 0;
 	if ( g_ptLuxelCsCache[slot] )
 	{
@@ -2070,16 +2408,31 @@ static bool PtGetOrCompileLuxelCS( bool enableVolumes, ID3DBlob **ppBlob )
 	else
 		Warning( "[PathTrace-DXR] SPECTRAL_INSERT marker missing - spectral HLSL not injected.\n" );
 
+	const unsigned srcHash = PtHashBytes( src.data(), src.size() );
+	ID3DBlob *blob = nullptr;
+	if ( PtLoadLuxelCsDiskCache( srcHash, enableVolumes, &blob ) && blob )
+	{
+		g_ptLuxelCsCache[slot].Attach( blob );
+		*ppBlob = g_ptLuxelCsCache[slot].Get();
+		( *ppBlob )->AddRef();
+		Msg( "[PathTrace-DXR] Loaded GPU luxel CS from disk cache (%u KB, %s).\n",
+			 (unsigned)( g_ptLuxelCsCache[slot]->GetBufferSize() / 1024 ),
+			 enableVolumes ? "volumes" : "lean" );
+		fflush( stdout );
+		return true;
+	}
+
 	Msg( "[PathTrace-DXR] Compiling GPU luxel CS (%u KB source)...\n", (unsigned)( src.size() / 1024 ) );
 	fflush( stdout );
 
-	ID3DBlob *blob = nullptr;
+	blob = nullptr;
 	if ( !PtCompileCSNamed( src.c_str(), "CSMain", enableVolumes, &blob ) || !blob )
 	{
 		Warning( "[PathTrace-DXR] GPU luxel CS compile failed.\n" );
 		return false;
 	}
 
+	PtSaveLuxelCsDiskCache( srcHash, enableVolumes, blob );
 	g_ptLuxelCsCache[slot].Attach( blob ); // takes ownership of the one ref from compile
 	*ppBlob = g_ptLuxelCsCache[slot].Get();
 	( *ppBlob )->AddRef();
@@ -2157,6 +2510,7 @@ void PathTraceDXR_GpuBakeEnd()
 	g_ptBake.emitA.Reset(); g_ptBake.emitE.Reset(); g_ptBake.emitCdf.Reset(); g_ptBake.emitTriCount = 0;
 	g_ptBake.envVols.Reset(); g_ptBake.envVolCount = 0;
 	g_ptBake.bounceVols.Reset(); g_ptBake.bounceVolCount = 0;
+	g_ptBake.waterVols.Reset(); g_ptBake.waterVolCount = 0; g_ptBake.waterMode = 0;
 	g_ptBake.albedo.Reset();
 	g_ptBake.triFilter.Reset();
 	g_ptBake.filterAtlas.Reset();
@@ -2235,10 +2589,10 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 		return false;
 	Msg( "[PathTrace-DXR] GPU luxel CS: %s\n", enableVolumes ? "volumes" : "lean (no volumes)" );
 
-	// Root: table t0..t24 + u0, then 28 constants + linear clamp sampler
+	// Root: table t0..t25 + u0, then 32 constants + linear clamp sampler
 	D3D12_DESCRIPTOR_RANGE ranges[2] = {};
 	ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-	ranges[0].NumDescriptors = 25;
+	ranges[0].NumDescriptors = 26;
 	ranges[0].BaseShaderRegister = 0;
 	ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 	ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -2252,7 +2606,7 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	paramsRS[0].DescriptorTable.pDescriptorRanges = ranges;
 	paramsRS[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 	paramsRS[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-	paramsRS[1].Constants.Num32BitValues = 28;
+	paramsRS[1].Constants.Num32BitValues = 32;
 	paramsRS[1].Constants.ShaderRegister = 0;
 	paramsRS[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
@@ -2298,7 +2652,7 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
 	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	heapDesc.NumDescriptors = 32;
+	heapDesc.NumDescriptors = 40;
 	heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	if ( FAILED( g_ptDev.device->CreateDescriptorHeap( &heapDesc, IID_PPV_ARGS( &g_ptBake.heap ) ) ) )
 		return false;
@@ -2670,6 +3024,38 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 		upBVol->Unmap( 0, nullptr );
 	}
 
+	// Underwater medium bodies (Beer-Lambert / volume PT)
+	WaterGpuBody_t waterBodies[WATER_MEDIUM_MAX_BODIES];
+	int nWater = 0;
+	WaterMedium_GetGpuBodies( waterBodies, WATER_MEDIUM_MAX_BODIES, &nWater );
+	g_ptBake.waterVolCount = (uint32)max( 0, nWater );
+	g_ptBake.waterMode = (uint32)WaterMedium_GetMode();
+	g_ptBake.uwMaxScatter = (uint32)WaterMedium_MaxScatter();
+	const uint32 nWaterUpload = max( g_ptBake.waterVolCount, 1u );
+	const UINT64 waterBytes = (UINT64)nWaterUpload * 5 * sizeof( float ) * 4;
+	ComPtr<ID3D12Resource> upWater;
+	if ( !PtCreateBuffer( waterBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upWater, L"upWater" ) ) return false;
+	if ( !PtCreateBuffer( waterBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.waterVols, L"WaterVols" ) ) return false;
+	{
+		float *pw = nullptr;
+		if ( FAILED( upWater->Map( 0, nullptr, (void **)&pw ) ) || !pw )
+		{
+			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading water volumes.\n" );
+			return false;
+		}
+		memset( pw, 0, (size_t)waterBytes );
+		for ( uint32 i = 0; i < g_ptBake.waterVolCount; ++i )
+		{
+			const WaterGpuBody_t &w = waterBodies[i];
+			pw[i * 20 + 0] = w.mins[0]; pw[i * 20 + 1] = w.mins[1]; pw[i * 20 + 2] = w.mins[2]; pw[i * 20 + 3] = w.sigmaAx;
+			pw[i * 20 + 4] = w.maxs[0]; pw[i * 20 + 5] = w.maxs[1]; pw[i * 20 + 6] = w.maxs[2]; pw[i * 20 + 7] = w.sigmaAy;
+			pw[i * 20 + 8] = w.sigmaAz; pw[i * 20 + 9] = w.sigmaSx; pw[i * 20 + 10] = w.sigmaSy; pw[i * 20 + 11] = w.sigmaSz;
+			pw[i * 20 + 12] = w.g; pw[i * 20 + 13] = w.surfaceZ; pw[i * 20 + 14] = w.kdX; pw[i * 20 + 15] = w.kdY;
+			pw[i * 20 + 16] = w.kdZ; pw[i * 20 + 17] = w.fogR; pw[i * 20 + 18] = w.fogG; pw[i * 20 + 19] = w.fogB;
+		}
+		upWater->Unmap( 0, nullptr );
+	}
+
 	g_ptDev.alloc->Reset();
 	g_ptDev.list->Reset( g_ptDev.alloc.Get(), nullptr );
 	g_ptDev.list->CopyResource( g_ptBake.lightsA.Get(), upA.Get() );
@@ -2707,6 +3093,7 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	g_ptDev.list->CopyResource( g_ptBake.emitCdf.Get(), upEmitCdf.Get() );
 	g_ptDev.list->CopyResource( g_ptBake.envVols.Get(), upEnv.Get() );
 	g_ptDev.list->CopyResource( g_ptBake.bounceVols.Get(), upBVol.Get() );
+	g_ptDev.list->CopyResource( g_ptBake.waterVols.Get(), upWater.Get() );
 	g_ptDev.list->CopyResource( g_ptBake.iesAtlas.Get(), upIes.Get() );
 	auto CopyTex2DArray = [&]( ID3D12Resource *dst, ID3D12Resource *srcUp, uint32 w, uint32 h, uint32 nLayers )
 	{
@@ -2735,8 +3122,8 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	CopyTex2DArray( g_ptBake.projCubes.Get(), upProjCube.Get(),
 					g_ptBake.projCubeW, g_ptBake.projCubeH, g_ptBake.projCubeLayers );
 
-	D3D12_RESOURCE_BARRIER bars[18] = {};
-	for ( int i = 0; i < 18; ++i )
+	D3D12_RESOURCE_BARRIER bars[19] = {};
+	for ( int i = 0; i < 19; ++i )
 	{
 		bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		bars[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -2761,7 +3148,8 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	bars[15].Transition.pResource = g_ptBake.lightsE.Get();
 	bars[16].Transition.pResource = g_ptBake.projCookies.Get();
 	bars[17].Transition.pResource = g_ptBake.projCubes.Get();
-	g_ptDev.list->ResourceBarrier( 18, bars );
+	bars[18].Transition.pResource = g_ptBake.waterVols.Get();
+	g_ptDev.list->ResourceBarrier( 19, bars );
 	g_ptDev.list->Close();
 	ID3D12CommandList *lists[] = { g_ptDev.list.Get() };
 	g_ptDev.queue->ExecuteCommandLists( 1, lists );
@@ -3018,14 +3406,19 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 		srv.Texture2DArray.ArraySize = g_ptBake.projCubeLayers;
 		g_ptDev.device->CreateShaderResourceView( g_ptBake.projCubes.Get(), &srv, at( 24 ) );
 	}
+	// t25 WaterVols
+	{
+		const uint32 nW = max( g_ptBake.waterVolCount, 1u );
+		makeF4( g_ptBake.waterVols.Get(), nW * 5, 25 );
+	}
 	{
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
 		uav.Format = DXGI_FORMAT_UNKNOWN;
 		uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
 		uav.Buffer.NumElements = g_ptBake.luxelCap;
 		uav.Buffer.StructureByteStride = sizeof( float ) * 4;
-		// Heap: SRV t0..t24 (25), then UAV u0 at index 25
-		g_ptDev.device->CreateUnorderedAccessView( g_ptBake.outBuf.Get(), nullptr, &uav, at( 25 ) );
+		// Heap: SRV t0..t25 (26), then UAV u0 at index 26
+		g_ptDev.device->CreateUnorderedAccessView( g_ptBake.outBuf.Get(), nullptr, &uav, at( 26 ) );
 	}
 
 	ID3D12DescriptorHeap *heaps[] = { g_ptBake.heap.Get() };
@@ -3034,7 +3427,7 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 	g_ptDev.list->SetPipelineState( g_ptBake.pso.Get() );
 	g_ptDev.list->SetComputeRootDescriptorTable( 0, g_ptBake.heap->GetGPUDescriptorHandleForHeapStart() );
 
-	UINT cb[28] = {};
+	UINT cb[32] = {};
 	cb[0] = nLuxels;
 	cb[1] = g_ptBake.params.spp;
 	cb[2] = g_ptBake.params.bounces;
@@ -3063,7 +3456,11 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 	cb[25] = g_ptBake.params.spectralMode;
 	cb[26] = max( g_ptBake.iesAtlasResV, 2u );
 	cb[27] = max( g_ptBake.iesAtlasResH, 2u );
-	g_ptDev.list->SetComputeRoot32BitConstants( 1, 28, cb, 0 );
+	cb[28] = g_ptBake.waterVolCount;
+	cb[29] = g_ptBake.waterMode;
+	cb[30] = g_ptBake.uwMaxScatter;
+	cb[31] = 0;
+	g_ptDev.list->SetComputeRoot32BitConstants( 1, 32, cb, 0 );
 	g_ptDev.list->Dispatch( ( nLuxels + 63 ) / 64, 1, 1 );
 
 	D3D12_RESOURCE_BARRIER uavB = {};

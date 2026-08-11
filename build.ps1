@@ -67,7 +67,8 @@ function Assert-FreshFile( [string]$path, [datetime]$notBefore, [bool]$required 
         return
     }
     $t = [System.IO.File]::GetLastWriteTime( $path )
-    if ( $t -lt $notBefore.AddSeconds( -5 ) )
+    # Skip freshness when notBefore is MinValue (incremental "don't care" sentinel).
+    if ( $notBefore -gt [datetime]::MinValue -and $t -lt $notBefore.AddSeconds( -5 ) )
     {
         throw "Output is STALE (written $t, build started $notBefore): $path`nA stale DLL means mixed object files - delete src\utils\vrad\Release and rebuild."
     }

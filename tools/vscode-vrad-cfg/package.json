@@ -1,0 +1,35 @@
+{
+  "name": "vrad-cfg",
+  "displayName": "CustomVRAD Config",
+  "description": "Syntax highlighting for CustomVRAD -config presets (configs/*.cfg).",
+  "version": "0.1.0",
+  "publisher": "customvrad",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "vrad-cfg",
+        "aliases": [
+          "VRAD Config",
+          "vrad-cfg"
+        ],
+        "configuration": "./language-configuration.json",
+        "filenamePatterns": [
+          "**/configs/*.cfg"
+        ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "vrad-cfg",
+        "scopeName": "source.vrad-cfg",
+        "path": "./syntaxes/vrad-cfg.tmLanguage.json"
+      }
+    ]
+  }
+}

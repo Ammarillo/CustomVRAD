@@ -650,6 +650,11 @@ void ComputeDetailPropLighting( int iThread );
 void ComputeIndirectLightingAtPoint( Vector &position, Vector &normal, Vector &outColor, 
 									 int iThread, bool force_fast = false, bool bIgnoreNormals = false );
 
+// Point lighting helpers (static props + fog_volume light grids).
+bool PositionInSolid( Vector &position );
+void ComputeDirectLightingAtPoint( Vector &position, Vector &normal, Vector &outColor, int iThread,
+								   int static_prop_id_to_skip = -1, int nLFlags = 0 );
+
 //-----------------------------------------------------------------------------
 // VRad static props
 //-----------------------------------------------------------------------------

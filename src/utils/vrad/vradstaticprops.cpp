@@ -1154,7 +1154,7 @@ bool PositionInSolid( Vector &position )
 // Trace from a vertex to each direct light source, accumulating its contribution.
 //-----------------------------------------------------------------------------
 void ComputeDirectLightingAtPoint( Vector &position, Vector &normal, Vector &outColor, int iThread,
-								   int static_prop_id_to_skip=-1, int nLFlags = 0)
+								   int static_prop_id_to_skip, int nLFlags )
 {
 	SSE_sampleLightOutput_t	sampleOutput;
 

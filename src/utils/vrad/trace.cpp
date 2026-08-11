@@ -526,6 +526,50 @@ dmodel_t *BrushmodelForEntity( entity_t *pEntity )
 	return NULL;
 }
 
+// Match a brush side to its lightmap face so opaque RT tris can carry a face id.
+static int FindFaceForBrushSide( unsigned short planenum, short texinfoIdx, const Vector &hintPos )
+{
+	if ( texinfoIdx < 0 || texinfoIdx >= texinfo.Count() )
+		return -1;
+	const int wantTexdata = texinfo[texinfoIdx].texdata;
+	int best = -1;
+	float bestDistSqr = 96.0f * 96.0f;
+
+	for ( int i = 0; i < numfaces; ++i )
+	{
+		dface_t *f = &g_pFaces[i];
+		if ( f->dispinfo != -1 )
+			continue;
+		if ( f->planenum != planenum )
+			continue;
+		if ( f->texinfo < 0 || f->texinfo >= texinfo.Count() )
+			continue;
+		if ( texinfo[f->texinfo].texdata != wantTexdata )
+			continue;
+
+		Vector center( 0, 0, 0 );
+		const int nPts = min( (int)f->numedges, MAX_POINTS_ON_WINDING );
+		if ( nPts <= 0 )
+			continue;
+		for ( int e = 0; e < nPts; ++e )
+		{
+			const int surfEdge = dsurfedges[f->firstedge + e];
+			const unsigned short v = ( surfEdge < 0 ) ? dedges[-surfEdge].v[1] : dedges[surfEdge].v[0];
+			center += dvertexes[v].point;
+		}
+		center *= ( 1.0f / (float)nPts );
+		center += face_offset[i];
+
+		const float d = ( center - hintPos ).LengthSqr();
+		if ( d < bestDistSqr )
+		{
+			bestDistSqr = d;
+			best = i;
+		}
+	}
+	return best;
+}
+
 void AddBrushToRaytraceEnvironment( dbrush_t *pBrush, const VMatrix &xform )
 {
 	if ( !( pBrush->contents & MASK_OPAQUE ) )
@@ -570,6 +614,19 @@ void AddBrushToRaytraceEnvironment( dbrush_t *pBrush, const VMatrix &xform )
 		}
 		if ( w )
 		{
+			// Tag opaque tris with face index so pathtrace TriAlbedo samples the
+			// correct $basetexture (avoids nearest-patch bleed from colored neighbors).
+			Vector hint( 0, 0, 0 );
+			for ( int k = 0; k < w->numpoints; ++k )
+				hint += xform.VMul4x3( w->p[k] );
+			if ( w->numpoints > 0 )
+				hint *= ( 1.0f / (float)w->numpoints );
+			const int faceIdx = FindFaceForBrushSide( side->planenum, side->texinfo, hint );
+			// Encode facenum+1 so face 0 is distinguishable from "no face".
+			const unsigned triId = ( faceIdx >= 0 )
+				? ( TRACE_ID_OPAQUE | ( (unsigned)( faceIdx + 1 ) & 0x00FFFFFFu ) )
+				: TRACE_ID_OPAQUE;
+
 			for ( int j = 2; j < w->numpoints; j++ )
 			{
 				v0 = xform.VMul4x3(w->p[0]);
@@ -577,7 +634,7 @@ void AddBrushToRaytraceEnvironment( dbrush_t *pBrush, const VMatrix &xform )
 				v2 = xform.VMul4x3(w->p[j]);
 				Vector fullCoverage;
 				fullCoverage.x = 1.0f;
-				g_RtEnv.AddTriangle(TRACE_ID_OPAQUE, v0, v1, v2, fullCoverage);
+				g_RtEnv.AddTriangle( triId, v0, v1, v2, fullCoverage );
 			}
 			FreeWinding( w );
 		}

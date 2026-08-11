@@ -112,7 +112,9 @@ replaces world-face (and static-prop) lighting with a DirectX~Raytracing (DXR)
 path tracer. Extensions include hero-wavelength spectral transport, contact-hardening
 soft shadows, textured emissive and filter materials, spatial volume overrides,
 multi-scale ambient occlusion, IESNA photometric spot evaluation, directional
-projected-texture modulation on \ent{light\_spot}, and lightmap post-processes
+projected-texture modulation on \ent{light\_spot}, physically based underwater
+media (Beer--Lambert / Kd and homogeneous volume path tracing), BSP-shipped
+volumetric fog grids with a screenspace shader, and lightmap post-processes
 (denoising, seam stitching, edge pull).
 This document states the algorithms as implemented: estimators, coordinate
 conventions, parameter semantics, and the relationship between classic and
@@ -206,6 +208,8 @@ At luxel (or prop sample) $(\vect{x}_0,\vect{n}_0)$ the estimator is
 \end{equation}
 where $m$ is the last surface vertex before termination, and the sky term is
 added when a BSDF sample escapes to the sky (ambient sky is \emph{not} NEE-sampled).
+Under \flag{-uw\_volume}, medium free-flight events may intervene between
+surface vertices (\cref{sec:underwater}).
 
 \paragraph{BSDF.}
 Surfaces are Lambertian,
@@ -607,6 +611,107 @@ Sample count scales with $R$ ($\sim\!16$ at default, cap~$40$; reduced with
 \flag{-fast}). Early-out when fully lit/shadowed. Exported as a hard point light
 at the centre (softness is bake-only).
 
+\subsection{\ent{fog\_volume} (runtime volumetric fog)}
+\label{sec:fogvol}
+
+Bake-time construction of a 3D irradiance grid and packing of a screenspace
+fog draw into the BSP (no addon). Let $\sigma$ be optical density per world
+unit, $g$ Henyey--Greenstein anisotropy, and $\vect{c}$ fog tint.
+Raymarching uses \code{StepCount} steps through an AABB expanded by
+\code{BlendDistance} under Outside/Center blend modes. Grid resolution is
+\code{GridSpacing} clamped so that each axis has at most $64$ samples
+($64^{3}$ cap). Optional FBM noise (\code{NoiseScale}, \code{NoiseCoverage})
+modulates density; wind scrolls the atlas in world space.
+
+\ent{fog\_volume\_blocker} carves fog (soft blend) into atlas alpha and is
+rewritten to \code{info\_null}. Enabled volumes are rewritten to
+\code{lua\_run\_on\_client} stubs that hook \code{RenderScreenspaceEffects}.
+Clients that block map client Lua will not draw fog.
+
+\subsection{\ent{water\_light\_vol}}
+
+Optional override AABB for underwater IOP fitting (\cref{sec:underwater}):
+Jerlov class, $\vect{\sigma}_a$, $\vect{\sigma}_s$, HG $g$, fog colour / end.
+Priority resolves overlapping overrides.
+
+%═══════════════════════════════════════════════════════════════════════════════
+\section{Underwater media}
+\label{sec:underwater}
+%═══════════════════════════════════════════════════════════════════════════════
+
+Physically motivated participating-medium bake for BSP water
+(\code{leafWaterData} / \code{CONTENTS\_WATER}). Units: hammer inches;
+ocean tables in $1/\mathrm{m}$ are scaled by $1/39.3700787$.
+
+\subsection{Modes}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  Flag & Mode & Estimator \\
+  \midrule
+  \flag{-underwater} & A & Beer--Lambert segment $T$ $+$ Kd downwelling for sky/sun \\
+  \flag{-uw\_volume} & C & Homogeneous free-flight volume PT (implies A media) \\
+  \flag{-uw\_off} & --- & Force disable \\
+  \flag{-uw\_maxscatter}~$N$ & C cap & Max medium events (default~$8$, max~$64$) \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Both CPU PathLi and the GPU RayQuery baker implement the modes; Mode~A also
+scales classic \code{GatherSampleLight} for direct sun/sky/local paths.
+
+\subsection{IOP construction from VMT fog}
+
+Source \vmt{fogend} is authored for \emph{screenspace fog}, not lightmap
+optical depth. Fit:
+\begin{equation}
+  \sigma_{\mathrm{lum}}
+  =
+  \frac{-\ln 0.05}{\texttt{fogend}}
+  \cdot s_{\mathrm{bake}},
+  \qquad
+  s_{\mathrm{bake}}=0.28,
+\end{equation}
+channel-biased by inverse fog colour so transport shifts toward the fog tint.
+Scatter fraction $0.45$ of extinction; diffuse downwelling
+\begin{equation}
+  \vect{k}_d = 0.35\,\vect{\sigma}_t
+\end{equation}
+(Kd $\ll$ beam extinction). Optional \vmt{vrad\_uw\_jerlov},
+\vmt{vrad\_uw\_sigma\_a}/\vmt{vrad\_uw\_sigma\_s}, \vmt{vrad\_uw\_g},
+or \ent{water\_light\_vol} overrides. Default fog end when missing: $800$.
+
+\subsection{Mode A (attenuation)}
+
+Segment transmittance through each water AABB of length $L$:
+\begin{equation}
+  T=\exp(-\vect{\sigma}_t L)
+  \quad\text{(componentwise)}.
+\end{equation}
+Sky/sun irradiance at a submerged receiver uses \emph{only}
+\begin{equation}
+  S_{\mathrm{sky}}(\vect{x})=\exp(-\vect{k}_d\, z_{\mathrm{depth}}),
+\end{equation}
+floored at $0.04$ per channel --- not $T\times S_{\mathrm{sky}}$
+(double counting). Local lights use segment $T$ only. Mode~C disables Kd.
+
+\subsection{Mode C (volume path tracing)}
+
+Inside water, free-flight distance $t=-\ln(1-u)/\max(\sigma_t)$ is accepted
+only if $t$ is strictly less than the AABB exit distance; otherwise the ray
+continues as a surface path (no fake boundary scatter). On a medium event,
+throughput is multiplied by $T$ to the event and by scatter albedo
+$\vect{\sigma}_s/\vect{\sigma}_t$, HG direction is resampled, and a small
+sky-veil term reinjects ambient fill. Escapes to sky apply segment $T$
+through the water column (Kd off).
+
+\begin{warnbox}
+  Dense Source water materials with short \vmt{fogend} still darken deep
+  pools; author longer fog ends, Jerlov classes, or \ent{water\_light\_vol}
+  IOPs for clear water.
+\end{warnbox}
+
 %═══════════════════════════════════════════════════════════════════════════════
 \section{Ambient occlusion}
 \label{sec:ao}
@@ -642,6 +747,13 @@ Optional bilateral luxel denoise:
   \Biggr].
 \end{equation}
 With \flag{-gpu}, AO can use batched OpenCL occlusion.
+
+\begin{warnbox}[Pathtrace interaction]
+  Under \flag{-pathtrace} with $N=\texttt{-pt\_bounces}>0$, post-multiply AO is
+  \emph{skipped}: the path tracer already accounts for geometric occlusion.
+  \flag{-ao\_force} re-enables the multiply for artistic double-darkening.
+  With $N=0$ (direct$+$sky only), AO still applies as a stand-in for missing GI.
+\end{warnbox}
 
 %═══════════════════════════════════════════════════════════════════════════════
 \section{Soft sun}
@@ -909,6 +1021,7 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \flag{-pt\_bounces}~$N$ & $3$ ($1$ fast) & Indirect hops; $0$=direct+sky \\
   \flag{-pt\_aa}~$A$ & $3$ & Luxel footprint grid \\
   \flag{-pt\_spectral} & on & Hero-$\lambda$ GPU transport \\
+  \flag{-pt\_nospectral} & --- & Linear RGB path transport \\
   \flag{-pt\_lights}~$K$ & $0$=all & Local NEE samples (bounce$>0$) \\
   \flag{-pt\_emit\_samples} & $64$ & Area-emit NEE draws ($0$=all) \\
   \flag{-pt\_lightradius} & $0$ & Soft disk for point/spot \\
@@ -918,6 +1031,9 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \flag{-pt\_denoise} & off & Enable denoise \\
   \flag{-pt\_denoiser} & oidn & oidn $\mid$ optix $\mid$ sakai \\
   \flag{-pt\_prop\_vertgrid} & $4$ & Prop vertex lattice \\
+  \flag{-underwater} & off & Mode~A Beer--Lambert $+$ Kd \\
+  \flag{-uw\_volume} & off & Mode~C free-flight volume PT \\
+  \flag{-uw\_maxscatter}~$N$ & $8$ & Cap medium scatters (Mode~C) \\
   \flag{-bounce}~$N$ & $100$ & Classic radiosity rounds ($0$=direct) \\
   \flag{-texbounce} & off & Textured radiosity albedo \\
   \flag{-energy}/\flag{-cavity} & off / $0.70$ & Cavity damp \\
@@ -926,6 +1042,7 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \flag{-bounce\_weld} & off & Coplanar edge GI weld \\
   \flag{-gpu} & off & OpenCL classic gather \\
   \flag{-ao} & off & Hemisphere AO pass \\
+  \flag{-ao\_force} & off & AO even under pathtrace GI \\
   \flag{-edgepull} & $0.5$ & Luxel edge inset \\
   \flag{-nostitch} & --- & Disable seam stitch \\
   \bottomrule
@@ -961,11 +1078,14 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \code{vrad\_gpu.*} & OpenCL BVH + gather \\
   \code{ao.cpp} & Multi-scale AO \\
   \code{absorb.cpp} / \code{bounce\_vol.cpp} & Volume effects \\
+  \code{fog\_volume.*} & Fog grid bake + BSP Lua/shader pack \\
+  \code{water\_medium.*} & Underwater IOPs, Beer--Lambert, volume PT hooks \\
   \code{ies\_profile.*} & IESNA LM-63 load + angular eval \\
   \code{light\_projection.*} & Projected VTF load, CPU sample, GPU arrays \\
   \code{pathtrace\_*denoise*} & OIDN / OptiX / Sakai \\
   \code{vradstaticprops.cpp} & Prop SSE + pathtrace vertgrid \\
   \code{lightmap.cpp} & Edge pull, final face lighting, spot parse \\
+  \code{loadcmdline.cpp} & \flag{-config} preset tokenization \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -989,6 +1109,12 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \item IESNA LM-63 --- standard file format for luminous intensity distributions.
   \item Microsoft Direct3D --- cubemap face selection and $(s,t)$ mapping
         (\code{texCUBE} / environment maps).
+  \item Jerlov / Solonenko \& Mobley --- ocean optical water types (IOP tables).
+  \item Jaffe--McGlamery --- classical underwater image formation (direct /
+        forward / backscatter decomposition).
+  \item Monzon et~al.\ (2024) --- spectral underwater radiative transfer
+        (downwelling $K_d$).
+  \item Henyey \& Greenstein --- phase function for volume scattering.
   \item Valve Source SDK 2013 --- stock VRAD radiosity / lightmap pipeline;
         VTF cubemap face order (\code{CUBEMAP\_FACE\_*}).
 \end{itemize}

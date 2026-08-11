@@ -80,6 +80,12 @@
     <ClInclude Include="absorb.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="water_medium.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="fog_volume.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="pathtrace_dxr.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -461,6 +467,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="absorb.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="water_medium.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="fog_volume.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="pathtrace_dxr.cpp">

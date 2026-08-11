@@ -1,0 +1,598 @@
+{
+  "_comment": "CustomVRAD -config flag catalog for tools/lint_vrad_cfg.ps1. arity = number of value args after the flag.",
+  "bannedInConfig": [
+    "-config",
+    "-cfg",
+    "-game",
+    "-vproject",
+    "-insert_search_path",
+    "-novconfig"
+  ],
+  "flags": [
+    {
+      "arity": 0,
+      "name": "-hdr"
+    },
+    {
+      "arity": 0,
+      "name": "-ldr"
+    },
+    {
+      "arity": 0,
+      "name": "-final"
+    },
+    {
+      "arity": 0,
+      "name": "-fast"
+    },
+    {
+      "arity": 0,
+      "name": "-fastambient"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-extrasky"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-bounce"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-threads"
+    },
+    {
+      "arity": 0,
+      "name": "-low"
+    },
+    {
+      "arity": 0,
+      "name": "-verbose"
+    },
+    {
+      "arity": 0,
+      "name": "-v"
+    },
+    {
+      "arity": 0,
+      "name": "-StopOnExit"
+    },
+    {
+      "arity": 0,
+      "name": "-FullMinidumps"
+    },
+    {
+      "arity": 0,
+      "name": "-rederrors"
+    },
+    {
+      "arity": 0,
+      "name": "-rederror"
+    },
+    {
+      "arity": 0,
+      "name": "-StaticPropLighting"
+    },
+    {
+      "arity": 0,
+      "name": "-StaticPropPolys"
+    },
+    {
+      "arity": 0,
+      "name": "-StaticPropNormals"
+    },
+    {
+      "arity": 0,
+      "name": "-OnlyStaticProps"
+    },
+    {
+      "arity": 0,
+      "name": "-nossprops"
+    },
+    {
+      "arity": 0,
+      "name": "-textureshadows"
+    },
+    {
+      "arity": 0,
+      "name": "-nodetaillight"
+    },
+    {
+      "arity": 0,
+      "name": "-onlydetail"
+    },
+    {
+      "arity": 0,
+      "name": "-noskyboxrecurse"
+    },
+    {
+      "arity": 0,
+      "name": "-gpu"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-gpu_maxtris"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-gpu_batch"
+    },
+    {
+      "arity": 0,
+      "name": "-pathtrace"
+    },
+    {
+      "arity": 0,
+      "name": "-dxr"
+    },
+    {
+      "arity": 0,
+      "name": "-pt_gpu"
+    },
+    {
+      "arity": 0,
+      "name": "-pt_cpu"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-pt_device"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "min": 1,
+      "max": 4096,
+      "name": "-pt_samples"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "min": 0,
+      "max": 16,
+      "name": "-pt_bounces"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "min": 1,
+      "max": 5,
+      "name": "-pt_aa"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-pt_lights"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-pt_emit_samples"
+    },
+    {
+      "arity": 0,
+      "name": "-pt_spectral"
+    },
+    {
+      "arity": 0,
+      "name": "-pt_nospectral"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-pt_prop_samples"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-pt_prop_bounces"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-pt_prop_vertgrid"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-pt_lightradius"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-pt_lightpenumbra"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-pt_softsamples"
+    },
+    {
+      "arity": 1,
+      "enum": [
+        "direct",
+        "all",
+        "0",
+        "1"
+      ],
+      "name": "-pt_softmode"
+    },
+    {
+      "arity": 0,
+      "name": "-pt_denoise"
+    },
+    {
+      "arity": 1,
+      "enum": [
+        "oidn",
+        "odin",
+        "optix",
+        "sakai",
+        "stat"
+      ],
+      "name": "-pt_denoiser"
+    },
+    {
+      "arity": 0,
+      "name": "-pt_nodennoise"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "min": 1,
+      "max": 8,
+      "name": "-pt_denoise_radius"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "min": 0,
+      "max": 1,
+      "name": "-pt_denoise_strength"
+    },
+    {
+      "arity": 0,
+      "name": "-underwater"
+    },
+    {
+      "arity": 0,
+      "name": "-uw_volume"
+    },
+    {
+      "arity": 0,
+      "name": "-uw_off"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "min": 1,
+      "max": 64,
+      "name": "-uw_maxscatter"
+    },
+    {
+      "arity": 0,
+      "name": "-ao"
+    },
+    {
+      "arity": 0,
+      "name": "-ao_force"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-ao_samples"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-ao_distance"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-ao_strength"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-ao_bias"
+    },
+    {
+      "arity": 0,
+      "name": "-ao_denoise"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-ao_denoise_radius"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-ao_denoise_strength"
+    },
+    {
+      "arity": 0,
+      "name": "-texbounce"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-texbounce_clean"
+    },
+    {
+      "arity": 0,
+      "name": "-texbounce_noclean"
+    },
+    {
+      "arity": 0,
+      "name": "-coarse"
+    },
+    {
+      "arity": 0,
+      "name": "-adaptivechop"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-chop"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-maxchop"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-bounce_soft"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-bounce_boost"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-bounce_chroma"
+    },
+    {
+      "arity": 0,
+      "name": "-bounce_weld"
+    },
+    {
+      "arity": 0,
+      "name": "-energy"
+    },
+    {
+      "arity": 0,
+      "name": "-noenergy"
+    },
+    {
+      "arity": 0,
+      "name": "-valve"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-cavity"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-maxtransfer"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-edgepull"
+    },
+    {
+      "arity": 0,
+      "name": "-noedgepull"
+    },
+    {
+      "arity": 0,
+      "name": "-nostitch"
+    },
+    {
+      "arity": 0,
+      "name": "-centersamples"
+    },
+    {
+      "arity": 0,
+      "name": "-noextra"
+    },
+    {
+      "arity": 0,
+      "name": "-debugextra"
+    },
+    {
+      "arity": 0,
+      "name": "-dlightmap"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "warn": "Dangerous with Hammer scale 2 \u2014 values >1 invert density.",
+      "name": "-luxeldensity"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-smooth"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-softsun"
+    },
+    {
+      "arity": 0,
+      "name": "-LargeDispSampleRadius"
+    },
+    {
+      "arity": 1,
+      "value": "int",
+      "name": "-dispchop"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-disppatchradius"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "name": "-maxdispsamplesize"
+    },
+    {
+      "arity": 1,
+      "value": "path",
+      "name": "-lights"
+    },
+    {
+      "arity": 0,
+      "name": "-dump"
+    },
+    {
+      "arity": 0,
+      "name": "-dumpnormals"
+    },
+    {
+      "arity": 0,
+      "name": "-dumptrace"
+    },
+    {
+      "arity": 0,
+      "name": "-dumppropmaps"
+    },
+    {
+      "arity": 0,
+      "name": "-loghash"
+    },
+    {
+      "arity": 0,
+      "name": "-mpi"
+    },
+    {
+      "arity": 0,
+      "name": "-mpi_ListParams"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "debugOnly": true,
+      "name": "-scale"
+    },
+    {
+      "arity": 3,
+      "value": "float",
+      "debugOnly": true,
+      "name": "-ambient"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "debugOnly": true,
+      "name": "-dlight"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "debugOnly": true,
+      "name": "-sky"
+    },
+    {
+      "arity": 0,
+      "debugOnly": true,
+      "name": "-notexscale"
+    },
+    {
+      "arity": 1,
+      "value": "float",
+      "debugOnly": true,
+      "name": "-coring"
+    },
+    {
+      "arity": 0,
+      "name": "-steam"
+    },
+    {
+      "arity": 0,
+      "name": "-allowdebug"
+    }
+  ],
+  "conflicts": [
+    {
+      "flags": [
+        "-hdr",
+        "-ldr"
+      ],
+      "severity": "error",
+      "message": "Both -hdr and -ldr are enabled; pick one."
+    },
+    {
+      "flags": [
+        "-pt_gpu",
+        "-pt_cpu"
+      ],
+      "severity": "warning",
+      "message": "Both -pt_gpu and -pt_cpu enabled; last one wins at parse time."
+    },
+    {
+      "flags": [
+        "-pt_spectral",
+        "-pt_nospectral"
+      ],
+      "severity": "warning",
+      "message": "Both -pt_spectral and -pt_nospectral enabled; last one wins."
+    },
+    {
+      "flags": [
+        "-pt_denoise",
+        "-pt_nodennoise"
+      ],
+      "severity": "warning",
+      "message": "Both -pt_denoise and -pt_nodennoise enabled; last one wins."
+    },
+    {
+      "flags": [
+        "-underwater",
+        "-uw_off"
+      ],
+      "severity": "warning",
+      "message": "-uw_off disables underwater even if -underwater is set."
+    },
+    {
+      "flags": [
+        "-uw_volume",
+        "-uw_off"
+      ],
+      "severity": "warning",
+      "message": "-uw_off disables underwater even if -uw_volume is set."
+    },
+    {
+      "flags": [
+        "-energy",
+        "-noenergy"
+      ],
+      "severity": "warning",
+      "message": "Both -energy and -noenergy enabled; last one wins."
+    },
+    {
+      "flags": [
+        "-edgepull",
+        "-noedgepull"
+      ],
+      "severity": "warning",
+      "message": "Both -edgepull and -noedgepull enabled; -noedgepull typically wins."
+    }
+  ]
+}

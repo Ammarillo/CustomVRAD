@@ -1,0 +1,77 @@
+{
+  "files.associations": {
+    "configs/*.cfg": "vrad-cfg"
+  },
+  "editor.tokenColorCustomizations": {
+    "textMateRules": [
+      {
+        "scope": "keyword.control.flag.vrad-cfg",
+        "settings": {
+          "foreground": "#56B6C2",
+          "fontStyle": "bold"
+        }
+      },
+      {
+        "scope": "keyword.flag.commented.vrad-cfg",
+        "settings": {
+          "foreground": "#5C7A7E",
+          "fontStyle": "italic"
+        }
+      },
+      {
+        "scope": "invalid.illegal.banned-flag.vrad-cfg",
+        "settings": {
+          "foreground": "#E06C75",
+          "fontStyle": "bold underline"
+        }
+      },
+      {
+        "scope": "entity.name.tag.flag.unknown.vrad-cfg",
+        "settings": {
+          "foreground": "#E5C07B"
+        }
+      },
+      {
+        "scope": [
+          "constant.numeric.integer.vrad-cfg",
+          "constant.numeric.float.vrad-cfg"
+        ],
+        "settings": {
+          "foreground": "#D19A66"
+        }
+      },
+      {
+        "scope": "constant.numeric.commented.vrad-cfg",
+        "settings": {
+          "foreground": "#7A6A55"
+        }
+      },
+      {
+        "scope": "string.quoted.double.vrad-cfg",
+        "settings": {
+          "foreground": "#98C379"
+        }
+      },
+      {
+        "scope": [
+          "comment.line.number-sign.vrad-cfg",
+          "comment.line.double-slash.vrad-cfg"
+        ],
+        "settings": {
+          "foreground": "#5C6370",
+          "fontStyle": "italic"
+        }
+      },
+      {
+        "scope": [
+          "markup.heading.section.vrad-cfg",
+          "markup.heading.subsection.vrad-cfg"
+        ],
+        "settings": {
+          "foreground": "#C678DD",
+          "fontStyle": "bold"
+        }
+      }
+    ]
+  }
+}
