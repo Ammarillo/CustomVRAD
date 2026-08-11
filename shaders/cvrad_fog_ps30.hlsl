@@ -9,6 +9,10 @@
 // (τ ≈ density * BlendDistance / 2 >> 1). We use a quadratic Lengyel profile
 // and keep the shell optically soft for any Density.
 //
+// Brush shape: VRAD bakes convex plane SDF into light-grid alpha (supports
+// vertex-edited / clipped brushes, not only AABB cubes). Decode range must
+// match kFogSdfRange in fog_volume.cpp.
+//
 // c1 = mins.xyz, maxs.z
 // c2 = maxs.xy, NoiseScale (full float), CurTime()*WindSpeed (full float)
 // c3 = forward * tan(horizFov/2), packFloat
@@ -38,6 +42,7 @@ float2 TexBaseSize : register( c4 );
 float2 Tex1Size    : register( c5 );
 
 static const float kNoiseRes = 32.0;
+static const float kFogSdfRange = 1024.0;
 
 struct PS_INPUT
 {
@@ -56,20 +61,6 @@ float2 RayBox( float3 ro, float3 rd, float3 bmin, float3 bmax )
 	return float2( tEnter, tExit );
 }
 
-// Signed distance to AABB: >0 inside, <0 outside (Euclidean outside).
-float SignedBlendDistance( float3 p, float3 bmin, float3 bmax )
-{
-	float dx = min( p.x - bmin.x, bmax.x - p.x );
-	float dy = min( p.y - bmin.y, bmax.y - p.y );
-	float dz = min( p.z - bmin.z, bmax.z - p.z );
-	if ( dx >= 0.0 && dy >= 0.0 && dz >= 0.0 )
-		return min( dx, min( dy, dz ) );
-
-	float3 o = max( bmin - p, p - bmax );
-	o = max( o, float3( 0, 0, 0 ) );
-	return -length( o );
-}
-
 // Map 0..1 ramp parameter to a Lengyel-style density scale.
 // u=0 at the unfogged side of the blend, u=1 at full density.
 // Quadratic (u^2) → zero derivative at the face (IQ soft boundary) and
@@ -85,12 +76,9 @@ float LengyelDensityScale( float u, float density, float blendDist )
 	return shape * lerp( edgeKeep, 1.0, u );
 }
 
-// Returns local density multiplier for this sample (0 = no fog).
-float FogDensityAt( float3 p, float3 bmin, float3 bmax,
-					float density, float blendDist, float blendMode )
+// dist: signed distance from atlas (>0 inside brush, <0 outside).
+float FogDensityAtDist( float dist, float density, float blendDist, float blendMode )
 {
-	float dist = SignedBlendDistance( p, bmin, bmax );
-
 	if ( blendDist <= 1e-3 )
 		return ( dist >= 0.0 ) ? 1.0 : 0.0;
 
@@ -171,7 +159,7 @@ float SampleNoiseAtlas( float3 uvw )
 	return lerp( nxy0, nxy1, tz );
 }
 
-// Point-sample one grid cell (integer indices). rgb = lighting, a = fog allow.
+// Point-sample one grid cell (integer indices). rgb = lighting, a = encoded SDF.
 float4 FetchLightCell( float ix, float iy, float iz, float nx, float ny, float nz )
 {
 	ix = clamp( ix, 0.0, max( nx - 1.0, 0.0 ) );
@@ -186,7 +174,7 @@ float4 FetchLightCell( float ix, float iy, float iz, float nx, float ny, float n
 
 // Trilinear light-grid sample that down-weights near-black cells (wall /
 // solid holes) so fog does not go black when interpolating near geometry.
-// .a = fog allow from fog_volume_blocker (1 = fog, 0 = blocked).
+// .a = encoded brush SDF (+ blockers); decode with kFogSdfRange.
 float4 SampleLightGrid( float3 p, float3 bmin, float3 bmax, float nx, float ny, float nz )
 {
 	float3 ext = max( bmax - bmin, float3( 1e-3, 1e-3, 1e-3 ) );
@@ -222,7 +210,7 @@ float4 SampleLightGrid( float3 p, float3 bmin, float3 bmax, float nx, float ny, 
 	float w011 = ( 1.0 - tx ) * ty * tz;
 	float w111 = tx * ty * tz;
 
-	// Fog allow is always trilinear (blockers carve density, not only lighting).
+	// Fog allow / SDF is always trilinear (blockers + brush shape).
 	float allow = c000.a * w000 + c100.a * w100 + c010.a * w010 + c110.a * w110
 				+ c001.a * w001 + c101.a * w101 + c011.a * w011 + c111.a * w111;
 
@@ -333,7 +321,10 @@ float4 main( PS_INPUT i ) : COLOR
 		float t = t0 + ( float( s ) + 0.5 ) * dt;
 		float3 p = eye + rd * t;
 
-		float densScale = FogDensityAt( p, bmin, bmax, density, blendDist, blendMode );
+		float4 grid = SampleLightGrid( p, bminR, bmaxR, nx, ny, nz );
+		// Atlas alpha = encoded convex-brush SDF (VRAD); supports cut/vertex-edited volumes.
+		float brushDist = ( grid.a * 2.0 - 1.0 ) * kFogSdfRange;
+		float densScale = FogDensityAtDist( brushDist, density, blendDist, blendMode );
 		float contact = saturate( ( sceneDist - t ) / 24.0 );
 		densScale *= contact;
 
@@ -346,13 +337,6 @@ float4 main( PS_INPUT i ) : COLOR
 			densScale *= cover * lerp( 0.35, 1.0, n );
 		}
 
-		if ( densScale <= 1e-5 )
-			continue;
-
-		// Light grid covers brush±expand (baked); sample at the real march point
-		// so the outer fade has its own lighting instead of stretched edge texels.
-		float4 grid = SampleLightGrid( p, bminR, bmaxR, nx, ny, nz );
-		densScale *= saturate( grid.a ); // fog_volume_blocker allow mask
 		if ( densScale <= 1e-5 )
 			continue;
 

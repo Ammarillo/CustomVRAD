@@ -28,6 +28,8 @@ StructuredBuffer<float4> LightsE : register(t22); // 3 x float4 per light: proj 
 Texture2DArray<float4> ProjCookies : register(t23);
 Texture2DArray<float4> ProjCubes : register(t24); // 6 faces per cubemap
 StructuredBuffer<float4> WaterVols : register(t25); // 5 x float4 per water body
+StructuredBuffer<float4> AlphaMeta : register(t26); // 3 x float4 per tri (texture shadows)
+Texture2DArray<float4> AlphaArray : register(t27);
 RWStructuredBuffer<float4> OutRGB : register(u0);
 SamplerState g_ptLinearClamp : register(s0);
 
@@ -367,12 +369,13 @@ bool ShouldSkipStaticProp( uint flags, int skipProp )
 // UseInstancedAS / PrimBase (t20): Phase-2 multi-BLAS (world + unique models). Flat AS uses identity.
 
 bool TraceClosest( float3 o, float3 d, float tmin, float tmax, int skipProp,
-				   out float tHit, out uint flags, out uint prim, out float3 nHit )
+				   out float tHit, out uint flags, out uint prim, out float3 nHit, out float2 bary )
 {
 	tHit = -1;
 	flags = 0;
 	prim = 0;
 	nHit = float3( 0, 0, 1 );
+	bary = float2( 0, 0 );
 	float curT = tmin;
 	[loop] for ( int skipPass = 0; skipPass < 8; ++skipPass )
 	{
@@ -389,6 +392,7 @@ bool TraceClosest( float3 o, float3 d, float tmin, float tmax, int skipProp,
 		if ( q.CommittedStatus() != COMMITTED_TRIANGLE_HIT )
 			return false;
 		tHit = q.CommittedRayT();
+		bary = q.CommittedTriangleBarycentrics();
 		uint localPrim = q.CommittedPrimitiveIndex();
 		uint inst = q.CommittedInstanceIndex();
 		uint iid = q.CommittedInstanceID();
@@ -426,6 +430,65 @@ bool TraceClosest( float3 o, float3 d, float tmin, float tmax, int skipProp,
 		return true;
 	}
 	return false;
+}
+
+// -textureshadows alpha at hit (0..1). 1 = fully opaque / no alpha mask.
+// AlphaMeta[prim*3].x: 0=off, 1=$alphatest cutout, 2=$translucent soft.
+float SampleShadowAlpha( uint prim, float2 bary )
+{
+	if ( prim >= TriCount )
+		return 1.0f;
+	float4 m0 = AlphaMeta[prim * 3u + 0u];
+	if ( m0.x < 0.5f )
+		return 1.0f;
+	float4 m1 = AlphaMeta[prim * 3u + 1u];
+	float4 m2 = AlphaMeta[prim * 3u + 2u];
+	float w0 = 1.0f - bary.x - bary.y;
+	float2 uv = w0 * m1.xy + bary.x * m1.zw + bary.y * m2.xy;
+	uv = frac( uv );
+	float tw = max( m0.z, 1.0f );
+	float th = max( m0.w, 1.0f );
+	uint aw, ah, al, alod;
+	AlphaArray.GetDimensions( 0, aw, ah, al, alod );
+	float2 uvAtlas = float2( uv.x * ( tw / max( (float)aw, 1.0f ) ),
+							 uv.y * ( th / max( (float)ah, 1.0f ) ) );
+	return saturate( AlphaArray.SampleLevel( g_ptLinearClamp, float3( uvAtlas, m0.y ), 0 ).r );
+}
+
+float ShadowAlphaMode( uint prim )
+{
+	if ( prim >= TriCount )
+		return 0;
+	return AlphaMeta[prim * 3u + 0u].x;
+}
+
+// $alphatest: stochastic cutout (Enderton). $translucent: handled via T*=(1-a) in VisRGB.
+bool AlphaHitBlocks( uint prim, float2 bary, uint seed, uint pass )
+{
+	float a = SampleShadowAlpha( prim, bary );
+	if ( a >= 0.999f )
+		return true;
+	if ( a <= 0.001f )
+		return false;
+	float u = Hash01( seed + pass * 97u + prim * 13u + 41u );
+	return u < a;
+}
+
+// Apply alpha/translucent hit to shadow transmittance. Returns true if ray is fully blocked.
+bool ApplyShadowAlpha( uint prim, float2 bary, uint seed, uint pass, inout float3 T )
+{
+	float mode = ShadowAlphaMode( prim );
+	if ( mode < 0.5f )
+		return true; // opaque (no alpha meta)
+	float a = SampleShadowAlpha( prim, bary );
+	if ( mode >= 1.5f )
+	{
+		// $translucent: expected coverage (matches stock CCoverageCountTexture accumulation).
+		T *= max( 1.0f - a, 0.0f );
+		return max( T.x, max( T.y, T.z ) ) < 1e-5f;
+	}
+	// $alphatest: stochastic any-hit
+	return AlphaHitBlocks( prim, bary, seed, pass );
 }
 
 #if PT_ENABLE_VOLUMES
@@ -840,7 +903,8 @@ bool FilterIsSheetExit( float t, float3 faceN, float lastT, float3 lastN )
 }
 
 // RGB transmittance (1 = clear). Stacked panes: photographic gel multiply T0*T1*...
-float3 VisRGB( float3 from, float3 to, int skipProp )
+// seed: for stochastic alpha-tested foliage (Enderton-style).
+float3 VisRGB( float3 from, float3 to, int skipProp, uint seed )
 {
 	float3 delta = to - from;
 	float dist = length( delta );
@@ -860,8 +924,8 @@ float3 VisRGB( float3 from, float3 to, int skipProp )
 	{
 		if ( tmax <= tmin + 1e-4f )
 			break;
-		float t; uint flags, prim; float3 nHit;
-		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, t, flags, prim, nHit ) )
+		float t; uint flags, prim; float3 nHit; float2 bary;
+		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, t, flags, prim, nHit, bary ) )
 			return T * WaterSegT( from, to );
 		if ( flags & TRACE_ID_SKY )
 			return T * WaterSegT( from, from + delta * t );
@@ -894,18 +958,26 @@ float3 VisRGB( float3 from, float3 to, int skipProp )
 			tmin = FilterAdvancePast( t );
 			continue;
 		}
+		// Texture shadows: $alphatest cutout or $translucent soft coverage.
+		if ( ShadowAlphaMode( prim ) >= 0.5f )
+		{
+			if ( ApplyShadowAlpha( prim, bary, seed, (uint)pass, T ) )
+				return 0;
+			tmin = FilterAdvancePast( t );
+			continue;
+		}
 		return 0;
 	}
 	return T * WaterSegT( from, to );
 }
 
-bool Occluded( float3 from, float3 to, int skipProp )
+bool Occluded( float3 from, float3 to, int skipProp, uint seed )
 {
-	float3 T = VisRGB( from, to, skipProp );
+	float3 T = VisRGB( from, to, skipProp, seed );
 	return max( T.x, max( T.y, T.z ) ) < 1e-5f;
 }
 
-float3 SunVisRGB( float3 pos, float3 axis, int skipProp )
+float3 SunVisRGB( float3 pos, float3 axis, int skipProp, uint seed )
 {
 	float tmin = OccludeBias;
 	float3 T = 1;
@@ -915,8 +987,8 @@ float3 SunVisRGB( float3 pos, float3 axis, int skipProp )
 	float3 lastFilterN = float3( 0, 0, 0 );
 	[loop] for ( int pass = 0; pass < MAX_FILTER_HITS + 1; ++pass )
 	{
-		float t; uint flags, prim; float3 nHit;
-		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, t, flags, prim, nHit ) )
+		float t; uint flags, prim; float3 nHit; float2 bary;
+		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, t, flags, prim, nHit, bary ) )
 			return T * WaterKdScale( pos );
 		if ( flags & TRACE_ID_SKY )
 			return T * WaterKdScale( pos );
@@ -949,14 +1021,21 @@ float3 SunVisRGB( float3 pos, float3 axis, int skipProp )
 			tmin = FilterAdvancePast( t );
 			continue;
 		}
+		if ( ShadowAlphaMode( prim ) >= 0.5f )
+		{
+			if ( ApplyShadowAlpha( prim, bary, seed, (uint)pass, T ) )
+				return 0;
+			tmin = FilterAdvancePast( t );
+			continue;
+		}
 		return 0;
 	}
 	return T * WaterKdScale( pos );
 }
 
-bool SunBlocked( float3 pos, float3 axis, int skipProp )
+bool SunBlocked( float3 pos, float3 axis, int skipProp, uint seed )
 {
-	float3 T = SunVisRGB( pos, axis, skipProp );
+	float3 T = SunVisRGB( pos, axis, skipProp, seed );
 	return max( T.x, max( T.y, T.z ) ) < 1e-5f;
 }
 
@@ -1259,7 +1338,7 @@ void SoftSunDir( float3 axis, float sinExtent, uint i, uint nSoft, uint seed, ou
 }
 
 // Shadow that also returns hit distance (for PCSS). Skips $vrad_filter panes.
-bool OccludedT( float3 from, float3 to, int skipProp, out float tHit )
+bool OccludedT( float3 from, float3 to, int skipProp, uint seed, out float tHit )
 {
 	tHit = 0;
 	float3 delta = to - from;
@@ -1276,8 +1355,8 @@ bool OccludedT( float3 from, float3 to, int skipProp, out float tHit )
 	{
 		if ( tmax <= tmin + 1e-4f )
 			return false;
-		float t; uint flags, prim; float3 nHit;
-		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, t, flags, prim, nHit ) )
+		float t; uint flags, prim; float3 nHit; float2 bary;
+		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, t, flags, prim, nHit, bary ) )
 			return false;
 		if ( flags & TRACE_ID_SKY )
 			return false;
@@ -1296,21 +1375,28 @@ bool OccludedT( float3 from, float3 to, int skipProp, out float tHit )
 			tmin = FilterAdvancePast( t );
 			continue;
 		}
+		// Binary occlusion: stochastic for both $alphatest and $translucent
+		// (fractional T only applies in VisRGB / SunVisRGB).
+		if ( ShadowAlphaMode( prim ) >= 0.5f && !AlphaHitBlocks( prim, bary, seed, (uint)pass ) )
+		{
+			tmin = FilterAdvancePast( t );
+			continue;
+		}
 		tHit = t;
 		return true;
 	}
 	return false;
 }
 
-bool SunBlockedT( float3 pos, float3 axis, int skipProp, out float tHit )
+bool SunBlockedT( float3 pos, float3 axis, int skipProp, uint seed, out float tHit )
 {
 	tHit = MaxTrace;
 	float tmin = OccludeBias;
 	uint lastPrim = 0xFFFFFFFFu;
 	[loop] for ( int pass = 0; pass < MAX_FILTER_HITS + 1; ++pass )
 	{
-		float t; uint flags, prim; float3 nHit;
-		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, t, flags, prim, nHit ) )
+		float t; uint flags, prim; float3 nHit; float2 bary;
+		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, t, flags, prim, nHit, bary ) )
 			return false;
 		if ( flags & TRACE_ID_SKY )
 			return false;
@@ -1326,6 +1412,11 @@ bool SunBlockedT( float3 pos, float3 axis, int skipProp, out float tHit )
 				continue;
 			}
 			lastPrim = prim;
+			tmin = FilterAdvancePast( t );
+			continue;
+		}
+		if ( ShadowAlphaMode( prim ) >= 0.5f && !AlphaHitBlocks( prim, bary, seed, (uint)pass ) )
+		{
 			tmin = FilterAdvancePast( t );
 			continue;
 		}
@@ -1358,7 +1449,7 @@ R"HLSL(
 		if ( allowSoft && radius > 0.0f && SoftSamplesMax > 1 && distC > OccludeBias + 1.0f )
 		{
 			float tHit = distC;
-			bool blocked = OccludedT( pos, origin, skipProp, tHit );
+			bool blocked = OccludedT( pos, origin, skipProp, seed, tHit );
 			ns = EstimatePenumbraSamples( radius, distC, tHit, blocked );
 		}
 
@@ -1389,7 +1480,7 @@ R"HLSL(
 			float falloff = PointFalloff( i, dist );
 			if ( falloff <= 0 )
 				continue;
-			float3 vis = VisRGB( pos, lightPos, skipProp );
+			float3 vis = VisRGB( pos, lightPos, skipProp, seed + (uint)s * 53u );
 			if ( max( vis.x, max( vis.y, vis.z ) ) < 1e-5f )
 				continue;
 			float3 tint = float3( 1, 1, 1 );
@@ -1430,7 +1521,7 @@ R"HLSL(
 		if ( allowSoft && sinExt > 0.0f && SoftSamplesMax > 1 )
 		{
 			float tHit = MaxTrace;
-			bool blocked = SunBlockedT( pos, axis, skipProp, tHit );
+			bool blocked = SunBlockedT( pos, axis, skipProp, seed, tHit );
 			float refDist = max( tHit, 64.0f );
 			float lightSize = sinExt * refDist;
 			nSoft = EstimatePenumbraSamples( lightSize, refDist, tHit, blocked );
@@ -1458,7 +1549,7 @@ R"HLSL(
 			float ndlS = dot( normal, dir );
 			if ( ndlS <= 0 )
 				continue;
-			float3 visS = SunVisRGB( pos, dir, skipProp );
+			float3 visS = SunVisRGB( pos, dir, skipProp, seed + (uint)s * 53u );
 			if ( max( visS.x, max( visS.y, visS.z ) ) < 1e-5f )
 				continue;
 			float pdfBsdf = ndlS * INV_PI;
@@ -1501,7 +1592,7 @@ R"HLSL(		// emit_surface / $vrad_emit*: hard center NEE + area falloff.
 				{
 					toL /= distL;
 					float tHit = distL;
-					bool blocked = OccludedT( pos, origin, skipProp, tHit );
+					bool blocked = OccludedT( pos, origin, skipProp, seed, tHit );
 					ns = EstimatePenumbraSamples( softRadius, distL, tHit, blocked );
 				}
 			}
@@ -1531,7 +1622,7 @@ R"HLSL(		// emit_surface / $vrad_emit*: hard center NEE + area falloff.
 			float falloff = ApplyFade( emitterCos / denom, dist, c0.y, c0.z );
 			if ( falloff <= 0 )
 				continue;
-			float3 vis = VisRGB( pos, lightPos, skipProp );
+			float3 vis = VisRGB( pos, lightPos, skipProp, seed + (uint)s * 53u );
 			if ( max( vis.x, max( vis.y, vis.z ) ) < 1e-5f )
 				continue;
 			accum += LightContrib( intensity, ndl * falloff, vis, lambda );
@@ -1673,7 +1764,7 @@ float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, int skip
 			float pdfA = 1.0f / area;
 			float pdf = sampleAll ? pdfA : ( pPick * pdfA );
 			if ( pdf <= 1e-20f ) continue;
-			float3 vis = VisRGB( pos, lp, skipProp );
+			float3 vis = VisRGB( pos, lp, skipProp, seed );
 			if ( max( vis.x, max( vis.y, vis.z ) ) < 1e-5f ) continue;
 			areaSum += LightContrib( Le, ndl * eCos / ( dist * dist * pdf ), vis, lambda );
 		}
@@ -1759,8 +1850,8 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 		float3 lastFilterN = float3( 0, 0, 0 );
 		[loop] for ( int fpass = 0; fpass < MAX_FILTER_HITS + 1; ++fpass )
 		{
-			float t0; uint f0, p0; float3 n0;
-			bool h0 = TraceClosest( pos, dir, tmin, maxDist, skipProp, t0, f0, p0, n0 );
+			float t0; uint f0, p0; float3 n0; float2 b0;
+			bool h0 = TraceClosest( pos, dir, tmin, maxDist, skipProp, t0, f0, p0, n0, b0 );
 			if ( !h0 || ( f0 & TRACE_ID_SKY ) )
 			{
 				hit = false;
@@ -1796,6 +1887,12 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 					lastFilterT = t0;
 					lastFilterN = faceN;
 				}
+				tmin = FilterAdvancePast( t0 );
+				continue;
+			}
+			// Alpha / translucent foliage: skip as bounce surface (shadow-only).
+			if ( ShadowAlphaMode( p0 ) >= 0.5f )
+			{
 				tmin = FilterAdvancePast( t0 );
 				continue;
 			}
@@ -2004,6 +2101,7 @@ struct PtBakeGpu
 {
 	ComPtr<ID3D12RootSignature>	rootSig;
 	ComPtr<ID3D12PipelineState>	pso;
+	int							psoVolumesMode = -1; // -1=none, 0=lean, 1=volumes (kept across End)
 	ComPtr<ID3D12DescriptorHeap> heap;
 	ComPtr<ID3D12Resource>		lightsA, lightsB, lightsC, lightsD;
 	ComPtr<ID3D12Resource>		localIdx, localCdf;
@@ -2014,6 +2112,8 @@ struct PtBakeGpu
 	ComPtr<ID3D12Resource>		albedo;
 	ComPtr<ID3D12Resource>		triFilter; // FilterMeta: 5 float4 / tri
 	ComPtr<ID3D12Resource>		filterAtlas; // Texture2DArray
+	ComPtr<ID3D12Resource>		triAlpha; // AlphaMeta: 3 float4 / tri
+	ComPtr<ID3D12Resource>		alphaAtlas; // Texture2DArray (leaf/prop masks)
 	ComPtr<ID3D12Resource>		iesAtlas; // StructuredBuffer<float> layers*IesResV*IesResH
 	ComPtr<ID3D12Resource>		lightsE; // StructuredBuffer<float4> 3 per light (projection)
 	ComPtr<ID3D12Resource>		projCookies; // Texture2DArray
@@ -2021,6 +2121,9 @@ struct PtBakeGpu
 	uint32						filterAtlasW = 1;
 	uint32						filterAtlasH = 1;
 	uint32						filterAtlasLayers = 1;
+	uint32						alphaAtlasW = 1;
+	uint32						alphaAtlasH = 1;
+	uint32						alphaAtlasLayers = 1;
 	uint32						iesAtlasLayers = 1;
 	uint32						iesAtlasResV = 64;
 	uint32						iesAtlasResH = 32;
@@ -2060,7 +2163,7 @@ static PtBakeGpu g_ptBake;
 // DXIL so GpuBakeBegin after world->props does not re-enter dxcompiler.
 static ComPtr<ID3DBlob> g_ptLuxelCsCache[2]; // [0]=no volumes, [1]=volumes
 // Bump when luxel CS root signature / WaterVols layout changes.
-static const uint32 kPtLuxelCsCacheGen = 2;
+static const uint32 kPtLuxelCsCacheGen = 4;
 static uint32 g_ptLuxelCsCacheGen = 0;
 
 static bool PtEnsureDxcLoaded()
@@ -2388,6 +2491,9 @@ static bool PtGetOrCompileLuxelCS( bool enableVolumes, ID3DBlob **ppBlob )
 		g_ptLuxelCsCache[0].Reset();
 		g_ptLuxelCsCache[1].Reset();
 		g_ptLuxelCsCacheGen = kPtLuxelCsCacheGen;
+		g_ptBake.rootSig.Reset();
+		g_ptBake.pso.Reset();
+		g_ptBake.psoVolumesMode = -1;
 	}
 	const int slot = enableVolumes ? 1 : 0;
 	if ( g_ptLuxelCsCache[slot] )
@@ -2477,6 +2583,13 @@ uint32_t PathTraceDXR_CapturedTriFlags( uint32_t triIndex )
 	return g_ptTris[triIndex].flags;
 }
 
+const int *PathTraceDXR_CapturedShadowMats()
+{
+	if ( g_ptShadowMats.size() != g_ptTris.size() )
+		return nullptr;
+	return g_ptShadowMats.empty() ? nullptr : g_ptShadowMats.data();
+}
+
 bool PathTraceDXR_GetCapturedTri( uint32_t triIndex, Vector &a, Vector &b, Vector &c, uint32_t *outFlags )
 {
 	if ( triIndex >= (uint32_t)g_ptTris.size() )
@@ -2495,14 +2608,21 @@ bool PathTraceDXR_GpuBakeIsActive()
 	return g_ptBake.active;
 }
 
+void PathTraceDXR_GpuBakeReleasePipeline()
+{
+	g_ptBake.rootSig.Reset();
+	g_ptBake.pso.Reset();
+	g_ptBake.psoVolumesMode = -1;
+}
+
 void PathTraceDXR_GpuBakeEnd()
 {
 	g_ptBake.active = false;
 	// GPU may still be using bake buffers from the last dispatch - wait before Release.
 	if ( g_ptDev.queue && g_ptDev.fence && g_ptDev.fenceEvent )
 		PtWaitGPU();
-	g_ptBake.rootSig.Reset();
-	g_ptBake.pso.Reset();
+	// Keep rootSig/pso across world→prop sessions. Recreating the luxel PSO under
+	// VRAM pressure (AS + OIDN + OpenCL still live) returns E_OUTOFMEMORY (0x8007000E).
 	g_ptBake.heap.Reset();
 	g_ptBake.lightsA.Reset(); g_ptBake.lightsB.Reset(); g_ptBake.lightsC.Reset(); g_ptBake.lightsD.Reset();
 	g_ptBake.lightsE.Reset();
@@ -2514,6 +2634,8 @@ void PathTraceDXR_GpuBakeEnd()
 	g_ptBake.albedo.Reset();
 	g_ptBake.triFilter.Reset();
 	g_ptBake.filterAtlas.Reset();
+	g_ptBake.triAlpha.Reset();
+	g_ptBake.alphaAtlas.Reset();
 	g_ptBake.iesAtlas.Reset();
 	g_ptBake.lightsE.Reset();
 	g_ptBake.projCookies.Reset();
@@ -2575,7 +2697,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 								uint32_t projCookieLayers,
 								const unsigned char *projCubeRGBA,
 								uint32_t projCubeW, uint32_t projCubeH,
-								uint32_t projCubeLayers )
+								uint32_t projCubeLayers,
+								const float *alphaMeta,
+								const unsigned char *alphaArrayRGBA,
+								uint32_t alphaArrayW, uint32_t alphaArrayH,
+								uint32_t alphaArrayLayers )
 {
 	PathTraceDXR_GpuBakeEnd();
 	if ( !g_ptDev.ready || !lights || !albedoRGB || nTris == 0 || nTris != (uint32)g_ptTris.size() )
@@ -2584,75 +2710,88 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	std::lock_guard<std::mutex> lock( g_ptDev.mutex );
 
 	const bool enableVolumes = ( LightEnv_VolumeCount() > 0 ) || ( BounceVol_VolumeCount() > 0 );
-	ID3DBlob *csBlob = nullptr;
-	if ( !PtGetOrCompileLuxelCS( enableVolumes, &csBlob ) )
-		return false;
+	const int volSlot = enableVolumes ? 1 : 0;
 	Msg( "[PathTrace-DXR] GPU luxel CS: %s\n", enableVolumes ? "volumes" : "lean (no volumes)" );
 
-	// Root: table t0..t25 + u0, then 32 constants + linear clamp sampler
-	D3D12_DESCRIPTOR_RANGE ranges[2] = {};
-	ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-	ranges[0].NumDescriptors = 26;
-	ranges[0].BaseShaderRegister = 0;
-	ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-	ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-	ranges[1].NumDescriptors = 1;
-	ranges[1].BaseShaderRegister = 0;
-	ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
-	D3D12_ROOT_PARAMETER paramsRS[2] = {};
-	paramsRS[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-	paramsRS[0].DescriptorTable.NumDescriptorRanges = 2;
-	paramsRS[0].DescriptorTable.pDescriptorRanges = ranges;
-	paramsRS[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-	paramsRS[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-	paramsRS[1].Constants.Num32BitValues = 32;
-	paramsRS[1].Constants.ShaderRegister = 0;
-	paramsRS[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-	D3D12_STATIC_SAMPLER_DESC samp = {};
-	samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-	samp.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-	samp.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-	samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-	samp.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-	samp.MaxLOD = D3D12_FLOAT32_MAX;
-	samp.ShaderRegister = 0;
-	samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-	D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
-	rsDesc.NumParameters = 2;
-	rsDesc.pParameters = paramsRS;
-	rsDesc.NumStaticSamplers = 1;
-	rsDesc.pStaticSamplers = &samp;
-	ComPtr<ID3DBlob> rsBlob, rsErr;
-	if ( FAILED( D3D12SerializeRootSignature( &rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &rsBlob, &rsErr ) ) )
+	if ( !g_ptBake.pso || g_ptBake.psoVolumesMode != volSlot )
 	{
+		PathTraceDXR_GpuBakeReleasePipeline();
+
+		ID3DBlob *csBlob = nullptr;
+		if ( !PtGetOrCompileLuxelCS( enableVolumes, &csBlob ) )
+			return false;
+
+		// Root: table t0..t27 + u0, then 32 constants + linear clamp sampler
+		D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[0].NumDescriptors = 28;
+		ranges[0].BaseShaderRegister = 0;
+		ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[1].NumDescriptors = 1;
+		ranges[1].BaseShaderRegister = 0;
+		ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+		D3D12_ROOT_PARAMETER paramsRS[2] = {};
+		paramsRS[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		paramsRS[0].DescriptorTable.NumDescriptorRanges = 2;
+		paramsRS[0].DescriptorTable.pDescriptorRanges = ranges;
+		paramsRS[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		paramsRS[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		paramsRS[1].Constants.Num32BitValues = 32;
+		paramsRS[1].Constants.ShaderRegister = 0;
+		paramsRS[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+		D3D12_STATIC_SAMPLER_DESC samp = {};
+		samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		samp.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		samp.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		samp.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+		samp.MaxLOD = D3D12_FLOAT32_MAX;
+		samp.ShaderRegister = 0;
+		samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+		D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
+		rsDesc.NumParameters = 2;
+		rsDesc.pParameters = paramsRS;
+		rsDesc.NumStaticSamplers = 1;
+		rsDesc.pStaticSamplers = &samp;
+		ComPtr<ID3DBlob> rsBlob, rsErr;
+		if ( FAILED( D3D12SerializeRootSignature( &rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &rsBlob, &rsErr ) ) )
+		{
+			csBlob->Release();
+			return false;
+		}
+		if ( FAILED( g_ptDev.device->CreateRootSignature( 0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+														  IID_PPV_ARGS( &g_ptBake.rootSig ) ) ) )
+		{
+			csBlob->Release();
+			return false;
+		}
+
+		D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+		psoDesc.pRootSignature = g_ptBake.rootSig.Get();
+		psoDesc.CS.pShaderBytecode = csBlob->GetBufferPointer();
+		psoDesc.CS.BytecodeLength = csBlob->GetBufferSize();
+		HRESULT hr = g_ptDev.device->CreateComputePipelineState( &psoDesc, IID_PPV_ARGS( &g_ptBake.pso ) );
 		csBlob->Release();
-		return false;
+		if ( FAILED( hr ) )
+		{
+			Warning( "[PathTrace-DXR] Bake PSO failed (0x%08X)\n", (unsigned)hr );
+			PathTraceDXR_GpuBakeReleasePipeline();
+			return false;
+		}
+		g_ptBake.psoVolumesMode = volSlot;
 	}
-	if ( FAILED( g_ptDev.device->CreateRootSignature( 0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
-													  IID_PPV_ARGS( &g_ptBake.rootSig ) ) ) )
+	else
 	{
-		csBlob->Release();
-		return false;
-	}
-
-	D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
-	psoDesc.pRootSignature = g_ptBake.rootSig.Get();
-	psoDesc.CS.pShaderBytecode = csBlob->GetBufferPointer();
-	psoDesc.CS.BytecodeLength = csBlob->GetBufferSize();
-	HRESULT hr = g_ptDev.device->CreateComputePipelineState( &psoDesc, IID_PPV_ARGS( &g_ptBake.pso ) );
-	csBlob->Release();
-	if ( FAILED( hr ) )
-	{
-		Warning( "[PathTrace-DXR] Bake PSO failed (0x%08X)\n", (unsigned)hr );
-		return false;
+		Msg( "[PathTrace-DXR] Reusing bake PSO (%s).\n", enableVolumes ? "volumes" : "lean" );
 	}
 
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
 	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	heapDesc.NumDescriptors = 40;
+	heapDesc.NumDescriptors = 48;
 	heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	if ( FAILED( g_ptDev.device->CreateDescriptorHeap( &heapDesc, IID_PPV_ARGS( &g_ptBake.heap ) ) ) )
 		return false;
@@ -2663,8 +2802,9 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	const UINT64 lightI4 = (UINT64)nLights * sizeof( int ) * 4;
 	const UINT64 albBytes = (UINT64)nTris * sizeof( float ) * 3;
 	const UINT64 filtMetaBytes = (UINT64)nTris * 5u * sizeof( float ) * 4;
+	const UINT64 alphaMetaBytes = (UINT64)nTris * 3u * sizeof( float ) * 4;
 
-	ComPtr<ID3D12Resource> upA, upB, upC, upD, upE, upAlb, upFilt;
+	ComPtr<ID3D12Resource> upA, upB, upC, upD, upE, upAlb, upFilt, upAlpha;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upA, L"upLA" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upB, L"upLB" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upC, L"upLC" ) ) return false;
@@ -2672,6 +2812,7 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !PtCreateBuffer( lightEF4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upE, L"upLE" ) ) return false;
 	if ( !PtCreateBuffer( albBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upAlb, L"upAlb" ) ) return false;
 	if ( !PtCreateBuffer( filtMetaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upFilt, L"upFiltMeta" ) ) return false;
+	if ( !PtCreateBuffer( alphaMetaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upAlpha, L"upAlphaMeta" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.lightsA, L"LA" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.lightsB, L"LB" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.lightsC, L"LC" ) ) return false;
@@ -2679,16 +2820,18 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !PtCreateBuffer( lightEF4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.lightsE, L"LE" ) ) return false;
 	if ( !PtCreateBuffer( albBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.albedo, L"Alb" ) ) return false;
 	if ( !PtCreateBuffer( filtMetaBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.triFilter, L"FiltMeta" ) ) return false;
+	if ( !PtCreateBuffer( alphaMetaBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.triAlpha, L"AlphaMeta" ) ) return false;
 
 	{
-		float *pa = nullptr, *pb = nullptr, *pc = nullptr, *pe = nullptr; int *pd = nullptr; float *pal = nullptr; float *pf = nullptr;
+		float *pa = nullptr, *pb = nullptr, *pc = nullptr, *pe = nullptr; int *pd = nullptr; float *pal = nullptr; float *pf = nullptr; float *pAlpha = nullptr;
 		if ( FAILED( upA->Map( 0, nullptr, (void **)&pa ) ) || !pa ||
 			 FAILED( upB->Map( 0, nullptr, (void **)&pb ) ) || !pb ||
 			 FAILED( upC->Map( 0, nullptr, (void **)&pc ) ) || !pc ||
 			 FAILED( upD->Map( 0, nullptr, (void **)&pd ) ) || !pd ||
 			 FAILED( upE->Map( 0, nullptr, (void **)&pe ) ) || !pe ||
 			 FAILED( upAlb->Map( 0, nullptr, (void **)&pal ) ) || !pal ||
-			 FAILED( upFilt->Map( 0, nullptr, (void **)&pf ) ) || !pf )
+			 FAILED( upFilt->Map( 0, nullptr, (void **)&pf ) ) || !pf ||
+			 FAILED( upAlpha->Map( 0, nullptr, (void **)&pAlpha ) ) || !pAlpha )
 		{
 			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading lights/albedo (host OOM?).\n" );
 			return false;
@@ -2712,8 +2855,13 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 			memcpy( pf, filterMeta, (size_t)filtMetaBytes );
 		else
 			memset( pf, 0, (size_t)filtMetaBytes );
+		if ( alphaMeta )
+			memcpy( pAlpha, alphaMeta, (size_t)alphaMetaBytes );
+		else
+			memset( pAlpha, 0, (size_t)alphaMetaBytes );
 		upA->Unmap( 0, nullptr ); upB->Unmap( 0, nullptr ); upC->Unmap( 0, nullptr );
-		upD->Unmap( 0, nullptr ); upE->Unmap( 0, nullptr ); upAlb->Unmap( 0, nullptr ); upFilt->Unmap( 0, nullptr );
+		upD->Unmap( 0, nullptr ); upE->Unmap( 0, nullptr ); upAlb->Unmap( 0, nullptr );
+		upFilt->Unmap( 0, nullptr ); upAlpha->Unmap( 0, nullptr );
 	}
 
 	// Filter Texture2DArray (1x1x1 white if unused) - upload kept until GPU copy below
@@ -2859,6 +3007,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !UploadTex2DArray( projCubeRGBA, projCubeW, projCubeH, projCubeLayers,
 							g_ptBake.projCubeW, g_ptBake.projCubeH, g_ptBake.projCubeLayers,
 							&g_ptBake.projCubes, &upProjCube, L"ProjCubes", L"upProjCube" ) )
+		return false;
+	ComPtr<ID3D12Resource> upAlphaArray;
+	if ( !UploadTex2DArray( alphaArrayRGBA, alphaArrayW, alphaArrayH, alphaArrayLayers,
+							g_ptBake.alphaAtlasW, g_ptBake.alphaAtlasH, g_ptBake.alphaAtlasLayers,
+							&g_ptBake.alphaAtlas, &upAlphaArray, L"AlphaAtlas", L"upAlphaArray" ) )
 		return false;
 
 	// Local light CDF for -pt_lights power sampling
@@ -3065,6 +3218,7 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	g_ptDev.list->CopyResource( g_ptBake.lightsE.Get(), upE.Get() );
 	g_ptDev.list->CopyResource( g_ptBake.albedo.Get(), upAlb.Get() );
 	g_ptDev.list->CopyResource( g_ptBake.triFilter.Get(), upFilt.Get() );
+	g_ptDev.list->CopyResource( g_ptBake.triAlpha.Get(), upAlpha.Get() );
 	{
 		const UINT64 rowPitch = ( (UINT64)g_ptBake.filterAtlasW * 4u + 255u ) & ~255ull;
 		const UINT64 slicePitch = rowPitch * g_ptBake.filterAtlasH;
@@ -3081,6 +3235,27 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 			src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 			src.PlacedFootprint.Footprint.Width = g_ptBake.filterAtlasW;
 			src.PlacedFootprint.Footprint.Height = g_ptBake.filterAtlasH;
+			src.PlacedFootprint.Footprint.Depth = 1;
+			src.PlacedFootprint.Footprint.RowPitch = (UINT)rowPitch;
+			g_ptDev.list->CopyTextureRegion( &dst, 0, 0, 0, &src, nullptr );
+		}
+	}
+	{
+		const UINT64 rowPitch = ( (UINT64)g_ptBake.alphaAtlasW * 4u + 255u ) & ~255ull;
+		const UINT64 slicePitch = rowPitch * g_ptBake.alphaAtlasH;
+		for ( uint32 layer = 0; layer < g_ptBake.alphaAtlasLayers; ++layer )
+		{
+			D3D12_TEXTURE_COPY_LOCATION dst = {};
+			dst.pResource = g_ptBake.alphaAtlas.Get();
+			dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dst.SubresourceIndex = layer;
+			D3D12_TEXTURE_COPY_LOCATION src = {};
+			src.pResource = upAlphaArray.Get();
+			src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			src.PlacedFootprint.Offset = slicePitch * layer;
+			src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			src.PlacedFootprint.Footprint.Width = g_ptBake.alphaAtlasW;
+			src.PlacedFootprint.Footprint.Height = g_ptBake.alphaAtlasH;
 			src.PlacedFootprint.Footprint.Depth = 1;
 			src.PlacedFootprint.Footprint.RowPitch = (UINT)rowPitch;
 			g_ptDev.list->CopyTextureRegion( &dst, 0, 0, 0, &src, nullptr );
@@ -3122,8 +3297,8 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	CopyTex2DArray( g_ptBake.projCubes.Get(), upProjCube.Get(),
 					g_ptBake.projCubeW, g_ptBake.projCubeH, g_ptBake.projCubeLayers );
 
-	D3D12_RESOURCE_BARRIER bars[19] = {};
-	for ( int i = 0; i < 19; ++i )
+	D3D12_RESOURCE_BARRIER bars[21] = {};
+	for ( int i = 0; i < 21; ++i )
 	{
 		bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		bars[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -3149,7 +3324,9 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	bars[16].Transition.pResource = g_ptBake.projCookies.Get();
 	bars[17].Transition.pResource = g_ptBake.projCubes.Get();
 	bars[18].Transition.pResource = g_ptBake.waterVols.Get();
-	g_ptDev.list->ResourceBarrier( 19, bars );
+	bars[19].Transition.pResource = g_ptBake.triAlpha.Get();
+	bars[20].Transition.pResource = g_ptBake.alphaAtlas.Get();
+	g_ptDev.list->ResourceBarrier( 21, bars );
 	g_ptDev.list->Close();
 	ID3D12CommandList *lists[] = { g_ptDev.list.Get() };
 	g_ptDev.queue->ExecuteCommandLists( 1, lists );
@@ -3175,7 +3352,7 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 		 nLights, g_ptBake.localCount, nEmit, nVol, nBVol, nTris, params.lightSamples );
 	Msg( "[PathTrace-DXR] Physical colored transport: light RGB x -texbounce albedo (no -bounce_chroma).\n" );
 	if ( g_ptBake.params.spectralMode )
-		Msg( "[PathTrace-DXR] Spectral mode ON (4-lambda stratified / path).\n" );
+		Msg( "[PathTrace-DXR] Spectral mode ON (4-lambda stratified / path, white-balanced CIE).\n" );
 	fflush( stdout );
 	return true;
 }
@@ -3411,14 +3588,27 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 		const uint32 nW = max( g_ptBake.waterVolCount, 1u );
 		makeF4( g_ptBake.waterVols.Get(), nW * 5, 25 );
 	}
+	// t26 AlphaMeta (texture shadows)
+	makeF4( g_ptBake.triAlpha.Get(), g_ptBake.triCount * 3, 26 );
+	// t27 AlphaArray
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+		srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+		srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srv.Texture2DArray.MipLevels = 1;
+		srv.Texture2DArray.FirstArraySlice = 0;
+		srv.Texture2DArray.ArraySize = g_ptBake.alphaAtlasLayers;
+		g_ptDev.device->CreateShaderResourceView( g_ptBake.alphaAtlas.Get(), &srv, at( 27 ) );
+	}
 	{
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
 		uav.Format = DXGI_FORMAT_UNKNOWN;
 		uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
 		uav.Buffer.NumElements = g_ptBake.luxelCap;
 		uav.Buffer.StructureByteStride = sizeof( float ) * 4;
-		// Heap: SRV t0..t25 (26), then UAV u0 at index 26
-		g_ptDev.device->CreateUnorderedAccessView( g_ptBake.outBuf.Get(), nullptr, &uav, at( 26 ) );
+		// Heap: SRV t0..t27 (28), then UAV u0 at index 28
+		g_ptDev.device->CreateUnorderedAccessView( g_ptBake.outBuf.Get(), nullptr, &uav, at( 28 ) );
 	}
 
 	ID3D12DescriptorHeap *heaps[] = { g_ptBake.heap.Get() };

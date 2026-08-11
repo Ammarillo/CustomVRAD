@@ -44,6 +44,10 @@ struct FogVolume_t
 	bool	bEnabled;		// bake this volume
 	bool	bStartEnabled;	// runtime cvf_en default
 	char	materialPath[160];	// materials/ relative, no extension
+	// Convex brush planes (Source: solid is Dot(n,p) <= dist). Empty → AABB fallback.
+	Vector	planeN[24];
+	float	planeD[24];
+	int		nPlanes;
 };
 
 struct FogBlocker_t
@@ -53,6 +57,9 @@ struct FogBlocker_t
 	Vector	maxs;
 	float	blendDistance;
 	bool	bEnabled;
+	Vector	planeN[24];
+	float	planeD[24];
+	int		nPlanes;
 };
 
 FogVolume_t s_Volumes[FOG_VOLUME_MAX];
@@ -125,6 +132,113 @@ static void ComputeGridDims( const Vector &mins, const Vector &maxs, float spaci
 		else if ( nz > 4 ) nz >>= 1;
 		else break;
 	}
+}
+
+// Encode brush signed distance into atlas alpha (0..1). Positive dist = inside.
+// Range must match kFogSdfRange in cvrad_fog_ps30.hlsl.
+static const float kFogSdfRange = 1024.0f;
+
+static void AddAABBPlanes( const Vector &mins, const Vector &maxs,
+						   Vector *planeN, float *planeD, int *nPlanes, int maxPlanes )
+{
+	*nPlanes = 0;
+	struct { float nx, ny, nz, d; } addList[6] = {
+		{ 1, 0, 0, maxs.x },
+		{ -1, 0, 0, -mins.x },
+		{ 0, 1, 0, maxs.y },
+		{ 0, -1, 0, -mins.y },
+		{ 0, 0, 1, maxs.z },
+		{ 0, 0, -1, -mins.z },
+	};
+	for ( int i = 0; i < 6 && *nPlanes < maxPlanes; ++i )
+	{
+		planeN[*nPlanes].Init( addList[i].nx, addList[i].ny, addList[i].nz );
+		planeD[*nPlanes] = addList[i].d;
+		++( *nPlanes );
+	}
+}
+
+// Collect unique outward planes from a brush submodel (supports vertex-edited shapes).
+static int ExtractBrushPlanes( int modelIndex, Vector *planeN, float *planeD, int maxPlanes,
+							   const Vector &mins, const Vector &maxs )
+{
+	int n = 0;
+	if ( modelIndex > 0 && modelIndex < nummodels && maxPlanes > 0 )
+	{
+		const dmodel_t &m = dmodels[modelIndex];
+		for ( int fi = 0; fi < m.numfaces && n < maxPlanes; ++fi )
+		{
+			const int faceIndex = m.firstface + fi;
+			if ( faceIndex < 0 || faceIndex >= numfaces )
+				continue;
+			const dface_t &f = dfaces[faceIndex];
+			const int pi = f.planenum & ~1; // canonical orientation
+			if ( pi < 0 || pi >= numplanes )
+				continue;
+			dplane_t pl = dplanes[f.planenum];
+			// Skip near-degenerate / tiny faces.
+			if ( pl.normal.LengthSqr() < 0.5f )
+				continue;
+
+			bool dup = false;
+			for ( int j = 0; j < n; ++j )
+			{
+				if ( DotProduct( pl.normal, planeN[j] ) > 0.999f &&
+					 fabsf( pl.dist - planeD[j] ) < 0.25f )
+				{
+					dup = true;
+					break;
+				}
+			}
+			if ( dup )
+				continue;
+			planeN[n] = pl.normal;
+			planeD[n] = pl.dist;
+			++n;
+		}
+	}
+
+	if ( n < 4 )
+	{
+		AddAABBPlanes( mins, maxs, planeN, planeD, &n, maxPlanes );
+		return n;
+	}
+	return n;
+}
+
+// Signed distance to convex brush: >0 inside, <0 outside (matches AABB helper).
+static float SignedInsidePlanes( const Vector &p, const Vector *planeN, const float *planeD, int nPlanes )
+{
+	if ( nPlanes <= 0 )
+		return -kFogSdfRange;
+
+	float minInside = 1e20f;
+	Vector outside( 0, 0, 0 );
+	bool anyOut = false;
+	for ( int i = 0; i < nPlanes; ++i )
+	{
+		// Positive when behind plane (inside halfspace).
+		const float s = planeD[i] - DotProduct( planeN[i], p );
+		if ( s >= 0.0f )
+			minInside = min( minInside, s );
+		else
+		{
+			anyOut = true;
+			outside -= planeN[i] * s; // s<0 → accumulate outward displacement
+		}
+	}
+	if ( !anyOut )
+		return minInside;
+	return -outside.Length();
+}
+
+static float EncodeFogSdfAlpha( float signedDist, float blockerAllow )
+{
+	// Pull toward deep-outside when blockers carve fog.
+	const float a = clamp( blockerAllow, 0.0f, 1.0f );
+	const float d = -kFogSdfRange + ( signedDist + kFogSdfRange ) * a;
+	const float enc = 0.5f + 0.5f * clamp( d / kFogSdfRange, -1.0f, 1.0f );
+	return enc;
 }
 
 static int LeafIndexFromPoint( const Vector &pos )
@@ -250,9 +364,14 @@ static Vector FogGridSamplePos( const FogVolume_t &v, int x, int y, int z, int n
 	return pos;
 }
 
-// Positive = distance inside blocker AABB (to nearest face). Negative = outside.
-static float SignedInsideBlocker( const Vector &p, const Vector &bmin, const Vector &bmax )
+// Positive = distance inside blocker (to nearest face). Negative = outside.
+static float SignedInsideBlocker( const Vector &p, const FogBlocker_t &b )
 {
+	if ( b.nPlanes > 0 )
+		return SignedInsidePlanes( p, b.planeN, b.planeD, b.nPlanes );
+
+	const Vector &bmin = b.mins;
+	const Vector &bmax = b.maxs;
 	const float dx = min( p.x - bmin.x, bmax.x - p.x );
 	const float dy = min( p.y - bmin.y, bmax.y - p.y );
 	const float dz = min( p.z - bmin.z, bmax.z - p.z );
@@ -278,7 +397,7 @@ static float FogAllowAtPoint( const Vector &pos )
 		const FogBlocker_t &b = s_Blockers[i];
 		if ( !b.bEnabled )
 			continue;
-		const float inside = SignedInsideBlocker( pos, b.mins, b.maxs );
+		const float inside = SignedInsideBlocker( pos, b );
 		if ( inside < 0.0f )
 			continue;
 		if ( b.blendDistance <= 1e-3f )
@@ -298,9 +417,12 @@ static float FogAllowAtPoint( const Vector &pos )
 	return allow;
 }
 
+// Atlas alpha = encoded brush SDF (convex planes) * blocker allow.
+// Shader decodes signed distance for Lengyel soft edges on non-box brushes.
 static void BuildFogAllowMask( const FogVolume_t &v, int nx, int ny, int nz, unsigned char *pAllow )
 {
-	int blocked = 0;
+	int carved = 0;
+	int outsideBrush = 0;
 	for ( int z = 0; z < nz; ++z )
 	{
 		for ( int y = 0; y < ny; ++y )
@@ -308,17 +430,43 @@ static void BuildFogAllowMask( const FogVolume_t &v, int nx, int ny, int nz, uns
 			for ( int x = 0; x < nx; ++x )
 			{
 				Vector pos = FogGridSamplePos( v, x, y, z, nx, ny, nz );
+				float brushDist;
+				if ( v.nPlanes > 0 )
+					brushDist = SignedInsidePlanes( pos, v.planeN, v.planeD, v.nPlanes );
+				else
+				{
+					// AABB fallback (same convention as shader SignedBlendDistance).
+					const float dx = min( pos.x - v.mins.x, v.maxs.x - pos.x );
+					const float dy = min( pos.y - v.mins.y, v.maxs.y - pos.y );
+					const float dz = min( pos.z - v.mins.z, v.maxs.z - pos.z );
+					if ( dx >= 0.0f && dy >= 0.0f && dz >= 0.0f )
+						brushDist = min( dx, min( dy, dz ) );
+					else
+					{
+						Vector o;
+						o.x = max( v.mins.x - pos.x, pos.x - v.maxs.x );
+						o.y = max( v.mins.y - pos.y, pos.y - v.maxs.y );
+						o.z = max( v.mins.z - pos.z, pos.z - v.maxs.z );
+						o.x = max( o.x, 0.0f );
+						o.y = max( o.y, 0.0f );
+						o.z = max( o.z, 0.0f );
+						brushDist = -o.Length();
+					}
+				}
 				const float allow = FogAllowAtPoint( pos );
+				const float enc = EncodeFogSdfAlpha( brushDist, allow );
 				const int index = x + y * nx + z * nx * ny;
-				pAllow[index] = (unsigned char)clamp( (int)( allow * 255.0f + 0.5f ), 0, 255 );
-				if ( pAllow[index] < 250 )
-					++blocked;
+				pAllow[index] = (unsigned char)clamp( (int)( enc * 255.0f + 0.5f ), 0, 255 );
+				if ( brushDist < 0.0f )
+					++outsideBrush;
+				if ( allow < 0.999f )
+					++carved;
 			}
 		}
 	}
-	if ( blocked > 0 )
-		Msg( "fog_volume %d: fog_volume_blocker affected %d/%d grid cell(s)\n",
-			 v.hammerId, blocked, nx * ny * nz );
+	if ( outsideBrush > 0 || carved > 0 )
+		Msg( "fog_volume %d: SDF alpha — %d/%d cells outside brush, %d affected by blockers (%d planes)\n",
+			 v.hammerId, outsideBrush, nx * ny * nz, carved, v.nPlanes );
 }
 
 static void SampleClassicDirectAtPoint( Vector pos, Vector &outDirect )
@@ -605,7 +753,7 @@ static bool WriteLightGridAtlasVTF( const char *pakPath, int nx, int ny, int nz,
 		return false;
 
 	// Source/GMod volume VTFs are unreliable here — pack Z slices into a 2D atlas.
-	// Alpha = fog allow (1 = fog, 0 = fog_volume_blocker).
+	// Alpha = encoded brush signed distance (and blocker carve). See EncodeFogSdfAlpha.
 	const int flags = TEXTUREFLAGS_NOMIP | TEXTUREFLAGS_NOLOD | TEXTUREFLAGS_TRILINEAR |
 					  TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT | TEXTUREFLAGS_EIGHTBITALPHA;
 	if ( !pTex->Init( atlasW, atlasH, 1, IMAGE_FORMAT_RGBA8888, flags, 1 ) )
@@ -1297,15 +1445,16 @@ void FogVolume_ParseBlockerEntity( entity_t *e )
 	b.pEntity = e;
 	b.mins = dmodels[modelIndex].mins;
 	b.maxs = dmodels[modelIndex].maxs;
+	b.nPlanes = ExtractBrushPlanes( modelIndex, b.planeN, b.planeD, 24, b.mins, b.maxs );
 	b.bEnabled = IntForKeyWithDefault( e, "Enabled", 1 ) != 0;
 	b.blendDistance = FloatForKeyWithDefault( e, "BlendDistance", 16.0f );
 	if ( b.blendDistance < 0.0f )
 		b.blendDistance = 0.0f;
 
-	Msg( "fog_volume_blocker  mins(%.0f %.0f %.0f) maxs(%.0f %.0f %.0f) blend=%.0f enabled=%s\n",
+	Msg( "fog_volume_blocker  mins(%.0f %.0f %.0f) maxs(%.0f %.0f %.0f) blend=%.0f planes=%d enabled=%s\n",
 		 b.mins.x, b.mins.y, b.mins.z,
 		 b.maxs.x, b.maxs.y, b.maxs.z,
-		 b.blendDistance,
+		 b.blendDistance, b.nPlanes,
 		 b.bEnabled ? "yes" : "no" );
 	++s_nBlockers;
 }
@@ -1338,6 +1487,7 @@ void FogVolume_ParseEntity( entity_t *e )
 	v.pEntity = e;
 	v.mins = dmodels[modelIndex].mins;
 	v.maxs = dmodels[modelIndex].maxs;
+	v.nPlanes = ExtractBrushPlanes( modelIndex, v.planeN, v.planeD, 24, v.mins, v.maxs );
 	v.bEnabled = IntForKeyWithDefault( e, "Enabled", 1 ) != 0;
 	v.bStartEnabled = IntForKeyWithDefault( e, "StartEnabled", 1 ) != 0;
 	ParseColor255( e, "FogColor", v.fogColor, 200.0f / 255.0f, 220.0f / 255.0f, 1.0f );
@@ -1371,10 +1521,11 @@ void FogVolume_ParseEntity( entity_t *e )
 	GetMapBaseName( mapName, sizeof( mapName ) );
 	Q_snprintf( v.materialPath, sizeof( v.materialPath ), "maps/%s/fog_volume_%d", mapName, v.hammerId );
 
-	Msg( "fog_volume %d  mins(%.0f %.0f %.0f) maxs(%.0f %.0f %.0f) density=%.4f spacing=%.1f color=(%.2f %.2f %.2f) boost=%.2f blend=%.0f mode=%d noise=%.4f cov=%.2f wind=%.1f@%.0f enabled=%s\n",
+	Msg( "fog_volume %d  mins(%.0f %.0f %.0f) maxs(%.0f %.0f %.0f) planes=%d density=%.4f spacing=%.1f color=(%.2f %.2f %.2f) boost=%.2f blend=%.0f mode=%d noise=%.4f cov=%.2f wind=%.1f@%.0f enabled=%s\n",
 		 v.hammerId,
 		 v.mins.x, v.mins.y, v.mins.z,
 		 v.maxs.x, v.maxs.y, v.maxs.z,
+		 v.nPlanes,
 		 v.density, v.gridSpacing,
 		 v.fogColor.x, v.fogColor.y, v.fogColor.z,
 		 v.lightBoost,

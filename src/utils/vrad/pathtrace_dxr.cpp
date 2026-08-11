@@ -57,7 +57,7 @@ int		g_nPathTraceLightSamples = 0;	// 0 = evaluate all local lights (legacy)
 int		g_nPathTraceEmitSamples = 64;	// $vrad_emit area NEE samples (0 = all tris)
 int		g_nPathTracePropSamples = 0;	// 0 = auto (max(8, world_spp/4))
 int		g_nPathTracePropBounces = -1;	// -1 = auto (match world); 0 = direct+sky
-int		g_nPathTracePropVertGrid = 4;	// barycentric edge subdiv; OIDN can't denoise sparse verts
+int		g_nPathTracePropVertGrid = 4;	// 0=per-vert; >0=8x8 tri atlas + closest gather
 bool	g_bPathTraceSpectral = true;	// hero-wavelength Smits+CIE (default on)
 float	g_flPtLightRadius = 0.0f;	// soft disk for light/light_spot (0 = hard)
 float	g_flPtLightPenumbra = 1.0f;	// CHSS growth scale
@@ -2640,6 +2640,23 @@ static void PtBuildTriFilterGpu( std::vector<float> &metaFloat4s, VRadFilterGpuA
 	VRadFilter_BuildGpuUpload( ids.data(), n, arr, metaFloat4s );
 }
 
+// -textureshadows alpha atlas for stochastic GPU any-hit (dappled foliage).
+static void PtBuildTriAlphaGpu( std::vector<float> &metaFloat4s, ShadowAlphaGpuArray_t &arr )
+{
+	const uint32_t n = PathTraceDXR_CapturedTriCount();
+	metaFloat4s.assign( (size_t)n * (size_t)kShadowAlphaMetaFloat4s * 4u, 0.0f );
+	arr.width = 1;
+	arr.height = 1;
+	arr.layers = 1;
+	arr.rgba.assign( 4, 255 );
+	if ( n == 0 || !g_bTextureShadows )
+		return;
+	const int *mats = PathTraceDXR_CapturedShadowMats();
+	if ( !mats )
+		return;
+	ShadowTexture_BuildGpuUpload( mats, n, arr, metaFloat4s );
+}
+
 struct PtGpuFaceJob
 {
 	int facenum;
@@ -2669,6 +2686,9 @@ static bool PathTraceBakeWorldFacesGPU()
 	std::vector<float> filterMeta;
 	VRadFilterGpuArray_t filterArray;
 	PtBuildTriFilterGpu( filterMeta, filterArray );
+	std::vector<float> alphaMeta;
+	ShadowAlphaGpuArray_t alphaArray;
+	PtBuildTriAlphaGpu( alphaMeta, alphaArray );
 
 	PtGpuBakeParams params = {};
 	params.spp = 1; // real spp set per pass via GpuBakeConfigurePass
@@ -2772,7 +2792,12 @@ static bool PathTraceBakeWorldFacesGPU()
 									 projCubes.rgba.data(),
 									 (uint32_t)projCubes.width,
 									 (uint32_t)projCubes.height,
-									 (uint32_t)projCubes.layers ) )
+									 (uint32_t)projCubes.layers,
+									 alphaMeta.data(),
+									 alphaArray.rgba.data(),
+									 (uint32_t)alphaArray.width,
+									 (uint32_t)alphaArray.height,
+									 (uint32_t)alphaArray.layers ) )
 	{
 		Warning( "[PathTrace-DXR] GPU baker init failed - falling back to CPU.\n" );
 		return false;
@@ -3193,6 +3218,9 @@ static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int sof
 	std::vector<float> filterMeta;
 	VRadFilterGpuArray_t filterArray;
 	PtBuildTriFilterGpu( filterMeta, filterArray );
+	std::vector<float> alphaMeta;
+	ShadowAlphaGpuArray_t alphaArray;
+	PtBuildTriAlphaGpu( alphaMeta, alphaArray );
 
 	PtGpuBakeParams params = {};
 	params.spp = 1;
@@ -3280,7 +3308,12 @@ static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int sof
 									  projCubes.rgba.data(),
 									  (uint32_t)projCubes.width,
 									  (uint32_t)projCubes.height,
-									  (uint32_t)projCubes.layers );
+									  (uint32_t)projCubes.layers,
+									  alphaMeta.data(),
+									  alphaArray.rgba.data(),
+									  (uint32_t)alphaArray.width,
+									  (uint32_t)alphaArray.height,
+									  (uint32_t)alphaArray.layers );
 }
 
 bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamples,

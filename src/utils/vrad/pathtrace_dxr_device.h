@@ -142,6 +142,7 @@ struct PtGpuEmitTri
 
 // Upload lights + per-triangle albedo once per bake. albedoRGB = nTris*3 floats.
 // filterMeta = nTris*5 float4s; filterArrayRGBA = Texture2DArray layers (W*H*4*layers).
+// alphaMeta = nTris*3 float4s; alphaArrayRGBA = Texture2DArray of leaf/prop alpha masks.
 // emitTris/cdf optional ($vrad_emit area mesh); pass nullptr/0 if unused.
 // projCookies / projCubes: ProjectedTexture Texture2DArrays (cubes store 6 faces per cube).
 bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
@@ -160,7 +161,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 								uint32_t projCookieLayers = 0,
 								const unsigned char *projCubeRGBA = nullptr,
 								uint32_t projCubeW = 0, uint32_t projCubeH = 0,
-								uint32_t projCubeLayers = 0 );
+								uint32_t projCubeLayers = 0,
+								const float *alphaMeta = nullptr,
+								const unsigned char *alphaArrayRGBA = nullptr,
+								uint32_t alphaArrayW = 0, uint32_t alphaArrayH = 0,
+								uint32_t alphaArrayLayers = 0 );
 
 // spp / sampleOffset for multi-pass high-spp bakes (chunked for GPU occupancy).
 void PathTraceDXR_GpuBakeConfigurePass( uint32_t spp, uint32_t sampleOffset );
@@ -170,6 +175,7 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 								 PtGpuBakeResult *outResults );
 
 void PathTraceDXR_GpuBakeEnd();
+void PathTraceDXR_GpuBakeReleasePipeline();
 bool PathTraceDXR_GpuBakeIsActive();
 
 // Emit one summary for all-dark GPU batches accumulated since last Begin (then clear).
@@ -179,6 +185,9 @@ uint32_t PathTraceDXR_CapturedTriCount();
 
 // Triangle TRACE_ID_* captured before KD convert (safe after SetupAccelerationStructure).
 uint32_t PathTraceDXR_CapturedTriFlags( uint32_t triIndex );
+
+// Per-captured-tri shadow material index (-1 = no alpha). Size = CapturedTriCount.
+const int *PathTraceDXR_CapturedShadowMats();
 
 // World-space (or local for prop-model) verts for albedo / debug.
 bool PathTraceDXR_GetCapturedTri( uint32_t triIndex, Vector &a, Vector &b, Vector &c, uint32_t *outFlags );

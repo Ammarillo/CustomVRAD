@@ -30,6 +30,8 @@
 #include "utlvector.h"
 #include "iincremental.h"
 #include "raytrace.h"
+#include <vector>
+#include <stdint.h>
 
 
 #ifdef _WIN32
@@ -682,5 +684,22 @@ extern DispTested_t s_DispTested[MAX_TOOL_THREADS+1];
 IVradStaticPropMgr* StaticPropMgr();
 
 extern float ComputeCoverageFromTexture( float b0, float b1, float b2, int32 hitID );
+
+// GPU alpha atlas for -textureshadows / -pathtrace (Texture2DArray + per-tri meta).
+// Meta (3 float4 / tri):
+//   [0] mode (0=off, 1=$alphatest cutout, 2=$translucent soft), layer, texW, texH
+//   [1] uv0.xy, uv1.xy
+//   [2] uv2.xy, pad, pad
+struct ShadowAlphaGpuArray_t
+{
+	int width;
+	int height;
+	int layers;
+	std::vector<unsigned char> rgba; // R8G8B8A8, alpha in .r/.a
+};
+static const int kShadowAlphaMetaFloat4s = 3;
+bool ShadowTexture_BuildGpuUpload( const int *matIndexPerTri, uint32_t nTris,
+								   ShadowAlphaGpuArray_t &outArray,
+								   std::vector<float> &outMetaFloat4s );
 
 #endif // VRAD_H

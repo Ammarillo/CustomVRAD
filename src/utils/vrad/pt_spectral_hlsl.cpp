@@ -65,11 +65,15 @@ float3 XyzToLinearSrgb( float3 xyz )
 	return max( rgb, 0.0f );
 }
 
+// Equal-energy / SpecIllum(1,1,1) through CIE->sRGB is pink (R/G~1.5).
+// Divide so white lights round-trip to neutral RGB.
+static const float3 SPEC_WHITE_BALANCE = float3( 0.607021f, 0.925574f, 0.977565f );
+
 float3 SpectralToRgb( float L, float lambda, float pdfLam )
 {
 	float3 cmf = CieXyzCmf( lambda );
 	float w = L / max( pdfLam * SPEC_CIE_Y_INT, 1e-20f );
-	return XyzToLinearSrgb( cmf * w );
+	return XyzToLinearSrgb( cmf * w ) * SPEC_WHITE_BALANCE;
 }
 
 float3 LightContrib( float3 intensity, float geo, float3 vis, float lambda )

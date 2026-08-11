@@ -258,13 +258,19 @@ inline Vector PtXyzToLinearSrgb( float X, float Y, float Z )
 }
 
 // Monochromatic radiance L(lambda) -> linear RGB contribution.
+// Equal-energy spectrum is pink in Rec.709 (R/G~1.5); white-balance so
+// SpecIllum(1,1,1) / flat SPD round-trips to neutral RGB.
 inline Vector PtSpectralToRgb( float L, float lambda, float pdfLambda )
 {
 	float x, y, z;
 	PtCieXyzCmf( lambda, x, y, z );
 	const float denom = pdfLambda * kPtCieYIntegral;
 	const float w = ( denom > 1e-20f ) ? ( L / denom ) : 0.0f;
-	return PtXyzToLinearSrgb( x * w, y * w, z * w );
+	Vector rgb = PtXyzToLinearSrgb( x * w, y * w, z * w );
+	rgb.x *= 0.607021f;
+	rgb.y *= 0.925574f;
+	rgb.z *= 0.977565f;
+	return rgb;
 }
 
 #endif // VRAD_PT_SPECTRAL_H

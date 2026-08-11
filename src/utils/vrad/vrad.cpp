@@ -2851,7 +2851,7 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 				g_nPathTracePropVertGrid = atoi( argv[i] );
 				if ( g_nPathTracePropVertGrid < 0 ) g_nPathTracePropVertGrid = 0;
 				if ( g_nPathTracePropVertGrid > 16 ) g_nPathTracePropVertGrid = 16;
-				Msg( "PathTrace prop vert grid (-pt_prop_vertgrid): %d (0=per-vert, N=virtual tri lightmap).\n",
+				Msg( "PathTrace prop vert grid (-pt_prop_vertgrid): %d (0=per-vert, >0=8x8 tri atlas + closest gather).\n",
 					 g_nPathTracePropVertGrid );
 			}
 		}
@@ -3829,7 +3829,7 @@ void PrintUsage( int argc, char **argv )
         "  -StaticPropPolys   : Perform shadow tests of static props at polygon precision\n"
         "  -OnlyStaticProps   : Only perform direct static prop lighting (vrad debug option)\n"
 		"  -StaticPropNormals : when lighting static props, just show their normal vector\n"
-		"  -textureshadows : Allows texture alpha channels to block light - rays intersecting alpha surfaces will sample the texture\n"
+		"  -textureshadows : Alpha ($alphatest/$translucent) props cast cutout shadows - no MDL CAST_TEXTURE_SHADOWS required\n"
 		"  -noskyboxrecurse : Turn off recursion into 3d skybox (skybox shadows on world)\n"
 		"  -nossprops      : Globally disable self-shadowing on static props\n"
 		"  -gpu            : OpenCL bounce gather. Sky/ambient occlusion uses stock CPU when -TextureShadows is set.\n"
@@ -3842,7 +3842,7 @@ void PrintUsage( int argc, char **argv )
 		"  -pt_bounces N   : Indirect hops after luxel (0=direct+sky only; default 3; 1 with -fast; max 16).\n"
 		"  -pt_prop_samples N : Prop spp (default max(8, pt_samples/4); props are cheaper than world).\n"
 		"  -pt_prop_bounces N : Prop indirect hops (0=direct+sky; default = -pt_bounces).\n"
-		"  -pt_prop_vertgrid N: Virtual per-triangle lightmap edge subdiv for vertex lighting (default 4; 0=old per-vert).\n"
+		"  -pt_prop_vertgrid N: Prop vert lighting: 0=per-vert; >0=8x8 tri charts in 64x64 atlas, closest gather (+denoise if -pt_denoise; default 4).\n"
 		"  -pt_aa N        : Luxel footprint AA grid 1..5 (1=off, 2=2x2 .. 5=5x5; default 3).\n"
 		"  -pt_lights N    : Local NEE light samples (0=all; N=power-sample N locals/sky always all).\n"
 		"  -pt_emit_samples N : $vrad_emit area NEE samples (0=all tris; default 64; higher=less noise).\n"

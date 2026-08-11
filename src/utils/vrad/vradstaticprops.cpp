@@ -707,7 +707,11 @@ public:
 			if ( pVMT->LoadFromBuffer( pMaterialName, buf ) )
 			{
 				bFound = true;
-				if ( pVMT->FindKey("$translucent") || pVMT->FindKey("$alphatest") )
+				KeyValues *pTrans = pVMT->FindKey( "$translucent" );
+				KeyValues *pAlphaTest = pVMT->FindKey( "$alphatest" );
+				const bool bTranslucent = pTrans && ( pTrans->GetInt() != 0 || pTrans->GetFloat() > 0.0f );
+				const bool bAlphaTest = pAlphaTest && ( pAlphaTest->GetInt() != 0 || pAlphaTest->GetFloat() > 0.0f );
+				if ( bTranslucent || bAlphaTest )
 				{
 					KeyValues *pBaseTexture = pVMT->FindKey("$basetexture");
 					if ( pBaseTexture )
@@ -723,6 +727,7 @@ public:
 							{
 								int index = m_Textures.Insert( pMaterialName );
 								m_Textures[index].InitFromRGB8888( w, h, pImageBits );
+								m_Textures[index].isAlphaTest = bAlphaTest; // cutout; else soft $translucent
 								*pIndex = index;
 								if ( pVMT->FindKey("$nocull") )
 								{
@@ -851,6 +856,98 @@ public:
 		return tex.pAlphaTexels[v * tex.width + u];
 	}
 
+	bool BuildGpuUpload( const int *matIndexPerTri, uint32_t nTris,
+						 ShadowAlphaGpuArray_t &outArray,
+						 std::vector<float> &outMetaFloat4s )
+	{
+		outArray.width = 1;
+		outArray.height = 1;
+		outArray.layers = 1;
+		outArray.rgba.assign( 4, 255 );
+		outMetaFloat4s.assign( (size_t)nTris * (size_t)kShadowAlphaMetaFloat4s * 4u, 0.0f );
+		if ( !matIndexPerTri || nTris == 0 )
+			return true;
+
+		const int kMaxLayers = 256;
+		const int kMaxDim = 2048;
+		CUtlDict<int, int> layerOf;
+		CUtlVector<int> layerTexIdx;
+
+		auto GetLayer = [&]( int textureIndex ) -> int
+		{
+			if ( !m_Textures.IsValidIndex( textureIndex ) )
+				return -1;
+			const alphatexture_t &tex = m_Textures[textureIndex];
+			if ( !tex.pAlphaTexels || tex.width <= 0 || tex.height <= 0 )
+				return -1;
+			if ( tex.width > kMaxDim || tex.height > kMaxDim )
+				return -1;
+			char key[32];
+			Q_snprintf( key, sizeof( key ), "%d", textureIndex );
+			unsigned short idx = layerOf.Find( key );
+			if ( layerOf.IsValidIndex( idx ) )
+				return layerOf[idx];
+			if ( layerTexIdx.Count() >= kMaxLayers )
+				return -1;
+			const int layer = layerTexIdx.Count();
+			layerTexIdx.AddToTail( textureIndex );
+			layerOf.Insert( key, layer );
+			return layer;
+		};
+
+		int nAlpha = 0;
+		int maxW = 1, maxH = 1;
+		for ( uint32_t i = 0; i < nTris; ++i )
+		{
+			float *m = &outMetaFloat4s[(size_t)i * (size_t)kShadowAlphaMetaFloat4s * 4u];
+			const int matIdx = matIndexPerTri[i];
+			if ( matIdx < 0 || matIdx >= m_MaterialEntries.Count() )
+				continue;
+			const materialentry_t &mat = m_MaterialEntries[matIdx];
+			const int layer = GetLayer( mat.textureIndex );
+			if ( layer < 0 )
+				continue;
+			const alphatexture_t &tex = m_Textures[mat.textureIndex];
+			// 1 = $alphatest stochastic cutout, 2 = $translucent fractional T*=(1-a)
+			m[0] = tex.isAlphaTest ? 1.0f : 2.0f;
+			m[1] = (float)layer;
+			m[2] = (float)tex.width;
+			m[3] = (float)tex.height;
+			m[4] = mat.uv[0].x; m[5] = mat.uv[0].y;
+			m[6] = mat.uv[1].x; m[7] = mat.uv[1].y;
+			m[8] = mat.uv[2].x; m[9] = mat.uv[2].y;
+			m[10] = 0.0f; m[11] = 0.0f;
+			maxW = max( maxW, (int)tex.width );
+			maxH = max( maxH, (int)tex.height );
+			++nAlpha;
+		}
+
+		if ( layerTexIdx.Count() == 0 || nAlpha == 0 )
+			return true;
+
+		outArray.width = maxW;
+		outArray.height = maxH;
+		outArray.layers = layerTexIdx.Count();
+		outArray.rgba.assign( (size_t)maxW * (size_t)maxH * 4u * (size_t)outArray.layers, 0 );
+		for ( int layer = 0; layer < layerTexIdx.Count(); ++layer )
+		{
+			const alphatexture_t &tex = m_Textures[layerTexIdx[layer]];
+			unsigned char *dstBase = &outArray.rgba[(size_t)layer * (size_t)maxW * (size_t)maxH * 4u];
+			for ( int v = 0; v < tex.height; ++v )
+			{
+				for ( int u = 0; u < tex.width; ++u )
+				{
+					const unsigned char a = tex.pAlphaTexels[v * tex.width + u];
+					unsigned char *p = dstBase + ( (size_t)v * (size_t)maxW + (size_t)u ) * 4u;
+					p[0] = a; p[1] = a; p[2] = a; p[3] = a;
+				}
+			}
+		}
+		Msg( "[PathTrace-DXR] Texture shadows GPU: %d alpha tris, %d atlas layer(s) %dx%d.\n",
+			 nAlpha, outArray.layers, outArray.width, outArray.height );
+		return true;
+	}
+
 	struct alphatexture_t 
 	{
 		short width;
@@ -858,12 +955,17 @@ public:
 		bool allowBackface;
 		bool clampU;
 		bool clampV;
+		bool isAlphaTest;	// true=$alphatest cutout; false=$translucent soft alpha
 		unsigned char *pAlphaTexels;
 
 		void InitFromRGB8888( int w, int h, unsigned char *pTexels )
 		{
 			width = w;
 			height = h;
+			allowBackface = false;
+			clampU = false;
+			clampV = false;
+			isAlphaTest = false;
 			pAlphaTexels = new unsigned char[w*h];
 			for ( int i = 0; i < h; i++ )
 			{
@@ -897,6 +999,13 @@ float ComputeCoverageFromTexture( float b0, float b1, float b2, int32 hitID )
 	//bool bBackface = DotProduct(delta, tri.N) > 0 ? true : false;
 	Vector coords(b0,b1,b2);
 	return alphaScale * g_ShadowTextureList.SampleMaterial( g_RtEnv.GetTriangleMaterial(hitID), coords, false );
+}
+
+bool ShadowTexture_BuildGpuUpload( const int *matIndexPerTri, uint32_t nTris,
+								   ShadowAlphaGpuArray_t &outArray,
+								   std::vector<float> &outMetaFloat4s )
+{
+	return g_ShadowTextureList.BuildGpuUpload( matIndexPerTri, nTris, outArray, outMetaFloat4s );
 }
 
 // this is here to strip models/ or .mdl or whatnot
@@ -1003,13 +1112,14 @@ void CVradStaticPropMgr::CreateCollisionModel( char const* pModelName )
 
 	if ( g_bTextureShadows )
 	{
-		if ( (pHdr->flags & STUDIOHDR_FLAGS_CAST_TEXTURE_SHADOWS) || IsModelTextureShadowsForced(pModelName) )
-		{
-			m_StaticPropDict[i].m_textureShadowIndex.RemoveAll();
-			m_StaticPropDict[i].m_triangleMaterialIndex.RemoveAll();
-			m_StaticPropDict[i].m_textureShadowIndex.AddMultipleToTail( pHdr->numtextures );
-			g_ShadowTextureList.LoadAllTexturesForModel( pHdr, m_StaticPropDict[i].m_textureShadowIndex.Base() );
-		}
+		// Always probe materials when -textureshadows is set. FindOrLoadIfValid only
+		// keeps $alphatest / $translucent maps, so opaque props stay opaque. Do not
+		// require STUDIOHDR_FLAGS_CAST_TEXTURE_SHADOWS or lights.rad forcetextureshadow
+		// (those remain as optional optimizers / explicit overrides).
+		m_StaticPropDict[i].m_textureShadowIndex.RemoveAll();
+		m_StaticPropDict[i].m_triangleMaterialIndex.RemoveAll();
+		m_StaticPropDict[i].m_textureShadowIndex.AddMultipleToTail( pHdr->numtextures );
+		g_ShadowTextureList.LoadAllTexturesForModel( pHdr, m_StaticPropDict[i].m_textureShadowIndex.Base() );
 	}
 }
 
@@ -2052,6 +2162,260 @@ static void PtDilatePropTexels( CUtlVector<colorTexel_t> &texels, int resX, int 
 	}
 }
 
+// Prop vertex atlas: 8x8 cell per triangle, 64x64 cells/page, 1-texel inset (6x6 content).
+static const int kPtVertCell = 8;
+static const int kPtVertAtlasGrid = 64;
+static const int kPtVertPage = kPtVertCell * kPtVertAtlasGrid; // 512
+static const int kPtVertInset = 1;
+static const int kPtVertContent = kPtVertCell - 2 * kPtVertInset; // 6
+static const int kPtVertCellsPerPage = kPtVertAtlasGrid * kPtVertAtlasGrid; // 4096
+// Right-triangle lattice inside content: G = content-1 => (G+1)(G+2)/2 samples.
+static const int kPtVertContentG = kPtVertContent - 1; // 5
+static const int kPtVertSamplesPerTri = ( kPtVertContentG + 1 ) * ( kPtVertContentG + 2 ) / 2; // 21
+
+struct PtVertAtlasCell_t
+{
+	int		prop;
+	int		section;
+	int		v0, v1, v2;
+	bool	used;
+};
+
+static void PtVertAtlasHoleFill( Vector *rgb, const unsigned char *bakeMask, int pageW, int pageH )
+{
+	const int n = pageW * pageH;
+	CUtlVector<Vector> tmp;
+	CUtlVector<unsigned char> wgt;
+	tmp.SetCount( n );
+	wgt.SetCount( n );
+	for ( int i = 0; i < n; ++i )
+	{
+		tmp[i] = rgb[i];
+		wgt[i] = bakeMask[i] ? 1 : 0;
+	}
+
+	CUtlVector<Vector> next;
+	CUtlVector<unsigned char> nextW;
+	next.SetCount( n );
+	nextW.SetCount( n );
+
+	for ( int pass = 0; pass < 8; ++pass )
+	{
+		bool any = false;
+		for ( int i = 0; i < n; ++i )
+		{
+			next[i] = tmp[i];
+			nextW[i] = wgt[i];
+		}
+		for ( int y = 0; y < pageH; ++y )
+		{
+			for ( int x = 0; x < pageW; ++x )
+			{
+				const int idx = x + y * pageW;
+				if ( wgt[idx] )
+					continue;
+				Vector sum( 0, 0, 0 );
+				int sw = 0;
+				for ( int dy = -1; dy <= 1; ++dy )
+				{
+					const int ny = y + dy;
+					if ( ny < 0 || ny >= pageH )
+						continue;
+					for ( int dx = -1; dx <= 1; ++dx )
+					{
+						const int nx = x + dx;
+						if ( nx < 0 || nx >= pageW )
+							continue;
+						const int nidx = nx + ny * pageW;
+						if ( !wgt[nidx] )
+							continue;
+						sum += tmp[nidx];
+						++sw;
+					}
+				}
+				if ( sw > 0 )
+				{
+					next[idx] = sum * ( 1.0f / (float)sw );
+					nextW[idx] = 1;
+					any = true;
+				}
+			}
+		}
+		for ( int i = 0; i < n; ++i )
+		{
+			tmp[i] = next[i];
+			wgt[i] = nextW[i];
+		}
+		if ( !any )
+			break;
+	}
+	for ( int i = 0; i < n; ++i )
+		rgb[i] = tmp[i];
+}
+
+static void PtVertAtlasDenoisePage( Vector *rgb, int pageW, int pageH )
+{
+	if ( !g_bPathTraceDenoise || !PathTraceDenoise_IsReady() )
+		return;
+	if ( pageW * pageH < 32 )
+		return;
+
+	const int n = pageW * pageH;
+	const float blend = min( 1.0f, max( 0.0f, g_flPathTraceDenoiseStrength ) );
+	CUtlVector<float> flat;
+	flat.SetCount( n * 3 );
+	for ( int i = 0; i < n; ++i )
+	{
+		flat[i * 3 + 0] = rgb[i].x;
+		flat[i * 3 + 1] = rgb[i].y;
+		flat[i * 3 + 2] = rgb[i].z;
+	}
+	if ( !PathTraceDenoise_DenoiseRGB( flat.Base(), pageW, pageH ) )
+		return;
+	for ( int i = 0; i < n; ++i )
+	{
+		Vector d( flat[i * 3 + 0], flat[i * 3 + 1], flat[i * 3 + 2] );
+		if ( !_finite( d.x ) || !_finite( d.y ) || !_finite( d.z ) )
+			continue;
+		if ( blend >= 0.999f )
+			rgb[i] = d;
+		else
+			rgb[i] = rgb[i] * ( 1.0f - blend ) + d * blend;
+	}
+}
+
+static void PtVertAtlasSmoothCell( Vector *rgb, const unsigned char *bakeMask, int cellIndex )
+{
+	// Box-filter bake texels inside one cell only (no cross-triangle bleed).
+	const int cellCol = cellIndex % kPtVertAtlasGrid;
+	const int cellRow = cellIndex / kPtVertAtlasGrid;
+	const int ox = cellCol * kPtVertCell;
+	const int oy = cellRow * kPtVertCell;
+
+	Vector staged[kPtVertCell * kPtVertCell];
+	unsigned char has[kPtVertCell * kPtVertCell];
+	memset( has, 0, sizeof( has ) );
+
+	for ( int ly = 0; ly < kPtVertCell; ++ly )
+	{
+		for ( int lx = 0; lx < kPtVertCell; ++lx )
+		{
+			const int idx = ( ox + lx ) + ( oy + ly ) * kPtVertPage;
+			if ( !bakeMask[idx] )
+				continue;
+			Vector sum( 0, 0, 0 );
+			int n = 0;
+			for ( int dy = -1; dy <= 1; ++dy )
+			{
+				const int yy = ly + dy;
+				if ( yy < 0 || yy >= kPtVertCell )
+					continue;
+				for ( int dx = -1; dx <= 1; ++dx )
+				{
+					const int xx = lx + dx;
+					if ( xx < 0 || xx >= kPtVertCell )
+						continue;
+					const int nidx = ( ox + xx ) + ( oy + yy ) * kPtVertPage;
+					if ( !bakeMask[nidx] )
+						continue;
+					sum += rgb[nidx];
+					++n;
+				}
+			}
+			if ( n > 0 )
+			{
+				staged[ly * kPtVertCell + lx] = sum * ( 1.0f / (float)n );
+				has[ly * kPtVertCell + lx] = 1;
+			}
+		}
+	}
+	for ( int ly = 0; ly < kPtVertCell; ++ly )
+	{
+		for ( int lx = 0; lx < kPtVertCell; ++lx )
+		{
+			if ( !has[ly * kPtVertCell + lx] )
+				continue;
+			rgb[( ox + lx ) + ( oy + ly ) * kPtVertPage] = staged[ly * kPtVertCell + lx];
+		}
+	}
+}
+
+static void PtVertAtlasGatherCell( const PtVertAtlasCell_t &cell, int cellIndex,
+								   const Vector *rgb, const Vector *worldPos, const unsigned char *bakeMask,
+								   CUtlVector<CUtlVector<CUtlVector<Vector>> *> &vertColorSum,
+								   CUtlVector<CUtlVector<CUtlVector<float>> *> &vertWeightSum,
+								   CUtlVector<CComputeStaticPropLightingResults *> &allResults )
+{
+	if ( !cell.used )
+		return;
+	if ( !vertColorSum[cell.prop] || cell.section >= vertColorSum[cell.prop]->Count() )
+		return;
+	if ( cell.section >= allResults[cell.prop]->m_ColorVertsArrays.Count() )
+		return;
+
+	CUtlVector<Vector> &sum = ( *vertColorSum[cell.prop] )[cell.section];
+	CUtlVector<float> &w = ( *vertWeightSum[cell.prop] )[cell.section];
+	const CUtlVector<colorVertex_t> &verts = *allResults[cell.prop]->m_ColorVertsArrays[cell.section];
+
+	const int cellCol = cellIndex % kPtVertAtlasGrid;
+	const int cellRow = cellIndex / kPtVertAtlasGrid;
+	const int ox = cellCol * kPtVertCell;
+	const int oy = cellRow * kPtVertCell;
+
+	// Inverse-distance weights favor the closest sample but blend nearby chart
+	// texels so single-sample fireflies don't dominate (old bary scatter averaged many).
+	const float kEps = 1.0f; // hammer units^2 floor
+	const int corners[3] = { cell.v0, cell.v1, cell.v2 };
+	for ( int c = 0; c < 3; ++c )
+	{
+		const int vi = corners[c];
+		if ( vi < 0 || vi >= sum.Count() || vi >= verts.Count() )
+			continue;
+
+		const Vector &vp = verts[vi].m_Position;
+		Vector colSum( 0, 0, 0 );
+		float wSum = 0.0f;
+		float dMin = FLT_MAX;
+		for ( int ly = 0; ly < kPtVertCell; ++ly )
+		{
+			for ( int lx = 0; lx < kPtVertCell; ++lx )
+			{
+				const int idx = ( ox + lx ) + ( oy + ly ) * kPtVertPage;
+				if ( !bakeMask[idx] )
+					continue;
+				const float d2 = ( worldPos[idx] - vp ).LengthSqr();
+				if ( d2 < dMin )
+					dMin = d2;
+			}
+		}
+		if ( dMin >= FLT_MAX * 0.5f )
+			continue;
+
+		// Ignore samples much farther than the closest (keeps "closest" intent).
+		const float dCut = dMin * 9.0f + kEps; // ~3x distance
+		for ( int ly = 0; ly < kPtVertCell; ++ly )
+		{
+			for ( int lx = 0; lx < kPtVertCell; ++lx )
+			{
+				const int idx = ( ox + lx ) + ( oy + ly ) * kPtVertPage;
+				if ( !bakeMask[idx] )
+					continue;
+				const float d2 = ( worldPos[idx] - vp ).LengthSqr();
+				if ( d2 > dCut )
+					continue;
+				const float bw = 1.0f / ( d2 + kEps );
+				colSum += rgb[idx] * bw;
+				wSum += bw;
+			}
+		}
+		if ( wSum > 1e-8f )
+		{
+			sum[vi] += colSum * ( 1.0f / wSum );
+			w[vi] += 1.0f;
+		}
+	}
+}
+
 bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 {
 	if ( !PathTraceDXR_CanBakeProps() )
@@ -2078,16 +2442,19 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 	CUtlVector<PtGpuBakeLuxel> vertJobs;
 	struct SampleMap_t { int prop; int section; int index; bool texel; };
 	struct VertScatter_t { int prop; int section; int v0, v1, v2; float b0, b1, b2; };
+	struct VertAtlasJobMap_t { int pixel; Vector worldPos; };
 	CUtlVector<SampleMap_t> texelMaps;
 	CUtlVector<VertScatter_t> vertScatters;
+	CUtlVector<VertAtlasJobMap_t> atlasJobMaps;
 	// Cap resident jobs - 17M verts * ~72B ~= 1.2GB and was OOMing into Map() AVs.
 	const int kJobChunk = 262144;
 	texelJobs.EnsureCapacity( kJobChunk );
 	vertJobs.EnsureCapacity( kJobChunk );
 	texelMaps.EnsureCapacity( kJobChunk );
 	vertScatters.EnsureCapacity( kJobChunk );
+	atlasJobMaps.EnsureCapacity( kJobChunk );
 
-	// Weighted radiance sums for vertex lighting (barycentric scatter from tri grids).
+	// Vertex color accumulators: legacy bary scatter weights, or atlas closest-sample counts.
 	CUtlVector<CUtlVector<CUtlVector<Vector>> *> vertColorSum;
 	CUtlVector<CUtlVector<CUtlVector<float>> *> vertWeightSum;
 	vertColorSum.SetSize( count );
@@ -2180,6 +2547,45 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 		}
 	};
 
+	// Active vertex atlas page (only used when vertGrid > 0).
+	CUtlVector<Vector> pageRgb;
+	CUtlVector<Vector> pageWorldPos;
+	CUtlVector<unsigned char> pageBakeMask;
+	CUtlVector<PtVertAtlasCell_t> pageCells;
+	int pageCellCount = 0;
+	bool bAtlasMode = false;
+
+	auto resetAtlasPage = [&]()
+	{
+		const int nPix = kPtVertPage * kPtVertPage;
+		pageRgb.SetCount( nPix );
+		pageWorldPos.SetCount( nPix );
+		pageBakeMask.SetCount( nPix );
+		pageCells.SetCount( kPtVertCellsPerPage );
+		memset( pageRgb.Base(), 0, nPix * sizeof( Vector ) );
+		memset( pageWorldPos.Base(), 0, nPix * sizeof( Vector ) );
+		memset( pageBakeMask.Base(), 0, nPix * sizeof( unsigned char ) );
+		memset( pageCells.Base(), 0, kPtVertCellsPerPage * sizeof( PtVertAtlasCell_t ) );
+		pageCellCount = 0;
+	};
+
+	auto writeBackAtlasJobs = [&]( const CUtlVector<VertAtlasJobMap_t> &maps, const CUtlVector<PtGpuBakeResult> &results )
+	{
+		for ( int i = 0; i < maps.Count(); ++i )
+		{
+			const VertAtlasJobMap_t &m = maps[i];
+			const PtGpuBakeResult &r = results[i];
+			if ( m.pixel < 0 || m.pixel >= pageRgb.Count() )
+				continue;
+			Vector col( r.radiance[0], r.radiance[1], r.radiance[2] );
+			if ( !_finite( col.x ) || !_finite( col.y ) || !_finite( col.z ) )
+				col.Init();
+			pageRgb[m.pixel] = col;
+			pageWorldPos[m.pixel] = m.worldPos;
+			pageBakeMask[m.pixel] = 1;
+		}
+	};
+
 	auto flushTexelJobs = [&]( bool bEndSession, unsigned &doneOut, unsigned progressTotal ) -> bool
 	{
 		const char *tag = "prop lightmaps";
@@ -2244,7 +2650,10 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 														 base, progressTotal );
 		if ( baked )
 		{
-			writeBackVertScatters( vertScatters, results );
+			if ( bAtlasMode )
+				writeBackAtlasJobs( atlasJobMaps, results );
+			else
+				writeBackVertScatters( vertScatters, results );
 			doneOut += (unsigned)vertJobs.Count();
 		}
 		if ( !baked || bEndSession )
@@ -2253,7 +2662,37 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 			sessionKind = kind;
 		vertJobs.RemoveAll();
 		vertScatters.RemoveAll();
+		atlasJobMaps.RemoveAll();
 		return baked;
+	};
+
+	auto finalizeAtlasPage = [&]( unsigned &doneOut, unsigned progressTotal ) -> bool
+	{
+		if ( pageCellCount <= 0 )
+			return true;
+		if ( !flushVertJobs( false, doneOut, progressTotal ) )
+			return false;
+
+		PtVertAtlasHoleFill( pageRgb.Base(), pageBakeMask.Base(), kPtVertPage, kPtVertPage );
+		PtVertAtlasDenoisePage( pageRgb.Base(), kPtVertPage, kPtVertPage );
+
+		// Per-cell blur after denoise: kills residual fireflies and limits atlas OIDN bleed.
+		for ( int pass = 0; pass < 2; ++pass )
+		{
+			for ( int ci = 0; ci < pageCellCount; ++ci )
+			{
+				if ( pageCells[ci].used )
+					PtVertAtlasSmoothCell( pageRgb.Base(), pageBakeMask.Base(), ci );
+			}
+		}
+
+		for ( int ci = 0; ci < pageCellCount; ++ci )
+		{
+			PtVertAtlasGatherCell( pageCells[ci], ci, pageRgb.Base(), pageWorldPos.Base(),
+								   pageBakeMask.Base(), vertColorSum, vertWeightSum, allResults );
+		}
+		resetAtlasPage();
+		return true;
 	};
 
 	// Rough totals for one progress line (solid-culled samples may be slightly lower).
@@ -2282,12 +2721,11 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 	}
 	if ( g_nPathTracePropVertGrid > 0 )
 	{
-		// Rough: ~2 tris/vert x lattice samples/tri.
-		const unsigned spTri = (unsigned)( ( g_nPathTracePropVertGrid + 1 ) * ( g_nPathTracePropVertGrid + 2 ) / 2 );
-		estVerts = estVerts * 2u * spTri / 3u;
+		// Rough: ~2 tris/vert x atlas samples/tri.
+		estVerts = estVerts * 2u * (unsigned)kPtVertSamplesPerTri / 3u;
 	}
 
-	Msg( "[PathTrace-DXR] Prop lighting: ~%u texel samples, ~%u vert-grid samples (chunks of %d)...\n",
+	Msg( "[PathTrace-DXR] Prop lighting: ~%u texel samples, ~%u vert samples (chunks of %d)...\n",
 		 estTexels, estVerts, kJobChunk );
 	fflush( stdout );
 
@@ -2438,11 +2876,14 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 		ok = flushTexelJobs( true, doneTexels, estTexels );
 
 	const int vertGrid = g_nPathTracePropVertGrid;
-	if ( vertGrid > 0 )
+	bAtlasMode = ( vertGrid > 0 );
+	if ( bAtlasMode )
 	{
-		Msg( "[PathTrace-DXR] Prop vertex lighting: virtual tri lightmap edge subdiv=%d (~%d samples/tri, barycentric -> verts).\n",
-			 vertGrid, ( vertGrid + 1 ) * ( vertGrid + 2 ) / 2 );
+		Msg( "[PathTrace-DXR] Prop vertex lighting: %dx%d tri charts in %dx%d atlas (inset %d, ~%d samples/tri, near-vert IDW gather%s).\n",
+			 kPtVertCell, kPtVertCell, kPtVertAtlasGrid, kPtVertAtlasGrid, kPtVertInset, kPtVertSamplesPerTri,
+			 ( g_bPathTraceDenoise && PathTraceDenoise_IsReady() ) ? ", denoise on" : "" );
 		fflush( stdout );
+		resetAtlasPage();
 	}
 
 	// ----- Phase 2: allocate + bake vertex samples (chunked) -----
@@ -2495,7 +2936,7 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 					cv.m_Color.Init();
 				}
 
-				if ( vertGrid <= 0 )
+				if ( !bAtlasMode )
 				{
 					// Legacy: one PathLi sample per unique vertex.
 					for ( int i = 0; i < vt.localPos.Count() && ok; ++i )
@@ -2518,9 +2959,7 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 					continue;
 				}
 
-				// Virtual lightmap on LOD0 triangles (shared studio vertex pool).
-				// ApplyLightingToStaticProp maps every LOD strip via origMeshVertID so
-				// LOD1+ inherit the same colors; unlit holes get nearest-lit fill below.
+				// 8x8 charts packed into atlas pages; closest denoised sample -> verts.
 				OptimizedModel::ModelLODHeader_t *pVtxLOD = pVtxModel->pLOD( 0 );
 				const int nMeshes = min( pStudioModel->nummeshes, pVtxLOD->numMeshes );
 				int meshVertBase = 0;
@@ -2567,13 +3006,34 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 								VectorRotate( ln1, matNormal, wn1 );
 								VectorRotate( ln2, matNormal, wn2 );
 
-								const float invN = 1.0f / (float)vertGrid;
-								for ( int bi = 0; bi <= vertGrid && ok; ++bi )
+								if ( pageCellCount >= kPtVertCellsPerPage )
 								{
-									for ( int bj = 0; bj <= vertGrid - bi && ok; ++bj )
+									ok = finalizeAtlasPage( doneVerts, estVerts );
+									if ( !ok )
+										break;
+								}
+
+								const int cellIndex = pageCellCount++;
+								PtVertAtlasCell_t &cell = pageCells[cellIndex];
+								cell.prop = propIndex;
+								cell.section = section;
+								cell.v0 = v0;
+								cell.v1 = v1;
+								cell.v2 = v2;
+								cell.used = true;
+
+								const int cellCol = cellIndex % kPtVertAtlasGrid;
+								const int cellRow = cellIndex / kPtVertAtlasGrid;
+								const int ox = cellCol * kPtVertCell;
+								const int oy = cellRow * kPtVertCell;
+								const float invG = 1.0f / (float)kPtVertContentG;
+
+								for ( int bi = 0; bi <= kPtVertContentG && ok; ++bi )
+								{
+									for ( int bj = 0; bj <= kPtVertContentG - bi && ok; ++bj )
 									{
-										const float b0 = (float)bi * invN;
-										const float b1 = (float)bj * invN;
+										const float b0 = (float)bi * invG;
+										const float b1 = (float)bj * invG;
 										const float b2 = 1.0f - b0 - b1;
 										Vector pos = wp0 * b0 + wp1 * b1 + wp2 * b2;
 										Vector nrm = wn0 * b0 + wn1 * b1 + wn2 * b2;
@@ -2584,8 +3044,15 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 										if ( PositionInSolid( pos ) )
 											continue;
 
-										VertScatter_t sc = { propIndex, section, v0, v1, v2, b0, b1, b2 };
-										vertScatters.AddToTail( sc );
+										// Place lattice into centered inset: content (bi,bj) -> cell (inset+bi, inset+bj).
+										const int lx = kPtVertInset + bi;
+										const int ly = kPtVertInset + bj;
+										const int pixel = ( ox + lx ) + ( oy + ly ) * kPtVertPage;
+
+										VertAtlasJobMap_t jm;
+										jm.pixel = pixel;
+										jm.worldPos = pos;
+										atlasJobMaps.AddToTail( jm );
 										PtGpuBakeLuxel job;
 										PtPackBakeLuxel( job, pos, nrm, skip_prop, propIndex );
 										vertJobs.AddToTail( job );
@@ -2603,6 +3070,9 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 		}
 	}
 
+	if ( ok && bAtlasMode && pageCellCount > 0 )
+		ok = finalizeAtlasPage( doneVerts, estVerts );
+
 	if ( totalVertJobs > 0 )
 		estVerts = (unsigned)totalVertJobs;
 	if ( ok )
@@ -2614,7 +3084,7 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 		sessionKind = -1;
 	}
 
-	// Normalize barycentric-weighted vertex colors; unlit verts inherit nearest lit
+	// Normalize vertex colors; unlit verts inherit nearest lit
 	// (covers verts only referenced by lower LODs / missed by the LOD0 sample grid).
 	if ( ok )
 	{
@@ -2641,7 +3111,7 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 	}
 
 	if ( ok )
-		Msg( "[PathTrace-DXR] Prop lighting baked: %d lightmap texels, %d vertex-grid samples.\n",
+		Msg( "[PathTrace-DXR] Prop lighting baked: %d lightmap texels, %d vertex samples.\n",
 			 totalTexelJobs, totalVertJobs );
 
 	if ( ok && totalTexelJobs == 0 && totalVertJobs == 0 )
@@ -2872,7 +3342,9 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 		int triangleIndex = 0;
 
 		CUtlVector<Vector> *pLocalDxr = nullptr;
+		CUtlVector<int> *pLocalDxrMats = nullptr;
 		CUtlVector<Vector> localDxrVerts;
+		CUtlVector<int> localDxrMats;
 		if ( bRegisterDxr )
 		{
 			bool already = false;
@@ -2883,6 +3355,7 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 			if ( !already )
 			{
 				pLocalDxr = &localDxrVerts;
+				pLocalDxrMats = &localDxrMats;
 				s_registeredStudio.AddToTail( prop.m_ModelIdx );
 			}
 		}
@@ -2958,13 +3431,6 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 									int vertex2 = pStripGroup->pVertex( i2 )->origMeshVertID;
 									int vertex3 = pStripGroup->pVertex( i3 )->origMeshVertID;
 
-									if ( pLocalDxr )
-									{
-										pLocalDxr->AddToTail( *vertData->Position( vertex1 ) );
-										pLocalDxr->AddToTail( *vertData->Position( vertex2 ) );
-										pLocalDxr->AddToTail( *vertData->Position( vertex3 ) );
-									}
-
 									// transform position into world coordinate system
 									matrix3x4_t	matrix;
 									AngleMatrix( prop.m_Angles, prop.m_Origin, matrix );
@@ -2982,18 +3448,11 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 									{
 										if ( bInitTriangles )
 										{
-											// add texture space and texture index to material database
-											// now
+											// Always register alpha/translucent tris for per-texel sampling.
+											// (Old coverage==1 skip treated translucent leaf cards as opaque.)
 											float coverage = g_ShadowTextureList.ComputeCoverageForTriangle(shadowTextureIndex, *vertData->Texcoord(vertex1), *vertData->Texcoord(vertex2), *vertData->Texcoord(vertex3) );
-											if ( coverage < 1.0f )
-											{
-												materialIndex = g_ShadowTextureList.AddMaterialEntry( shadowTextureIndex, *vertData->Texcoord(vertex1), *vertData->Texcoord(vertex2), *vertData->Texcoord(vertex3) );
-												color.x = coverage;
-											}
-											else
-											{
-												materialIndex = -1;
-											}
+											materialIndex = g_ShadowTextureList.AddMaterialEntry( shadowTextureIndex, *vertData->Texcoord(vertex1), *vertData->Texcoord(vertex2), *vertData->Texcoord(vertex3) );
+											color.x = coverage;
 											dict.m_triangleMaterialIndex.AddToTail(materialIndex);
 										}
 										else
@@ -3005,6 +3464,16 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 										{
 											flags = FCACHETRI_TRANSPARENT;
 										}
+									}
+									// Include alpha-tested cards in DXR AS; GPU VisRGB samples
+									// coverage (stochastic alpha). Keep material index for atlas.
+									if ( pLocalDxr )
+									{
+										pLocalDxr->AddToTail( *vertData->Position( vertex1 ) );
+										pLocalDxr->AddToTail( *vertData->Position( vertex2 ) );
+										pLocalDxr->AddToTail( *vertData->Position( vertex3 ) );
+										if ( pLocalDxrMats )
+											pLocalDxrMats->AddToTail( materialIndex );
 									}
 // 		printf( "\ngl 3\n" );
 // 		printf( "gl %6.3f %6.3f %6.3f 1 0 0\n", XYZ(position1));
@@ -3029,7 +3498,11 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 			}
 		}
 		if ( pLocalDxr && localDxrVerts.Count() >= 3 )
-			PathTraceDXR_RegisterPropModel( prop.m_ModelIdx, localDxrVerts.Base(), localDxrVerts.Count() / 3 );
+		{
+			const int nLocalTris = localDxrVerts.Count() / 3;
+			PathTraceDXR_RegisterPropModel( prop.m_ModelIdx, localDxrVerts.Base(), nLocalTris,
+											( localDxrMats.Count() == nLocalTris ) ? localDxrMats.Base() : nullptr );
+		}
 	}
 }
 

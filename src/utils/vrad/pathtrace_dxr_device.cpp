@@ -59,6 +59,7 @@ struct PtPropModelMesh
 	uint32 triBase = 0;
 	uint32 nTris = 0;
 	std::vector<Vector> verts; // nTris * 3, local space
+	std::vector<int> shadowMats; // nTris, -1 = opaque
 };
 struct PtPropInstanceRec
 {
@@ -69,6 +70,7 @@ struct PtPropInstanceRec
 static std::vector<PtPropModelMesh>		g_ptPropModels;
 static std::vector<PtPropInstanceRec>	g_ptPropInstances;
 static std::vector<ComPtr<ID3D12Resource>> g_ptPropBlas;
+static std::vector<int>					g_ptShadowMats; // parallel to g_ptTris
 
 void PathTraceDXR_ClearPropInstances()
 {
@@ -76,7 +78,8 @@ void PathTraceDXR_ClearPropInstances()
 	g_ptPropInstances.clear();
 }
 
-void PathTraceDXR_RegisterPropModel( int modelIdx, const Vector *verts, int nTris )
+void PathTraceDXR_RegisterPropModel( int modelIdx, const Vector *verts, int nTris,
+									 const int *shadowMatIndices )
 {
 	if ( !verts || nTris <= 0 )
 		return;
@@ -89,6 +92,12 @@ void PathTraceDXR_RegisterPropModel( int modelIdx, const Vector *verts, int nTri
 	m.modelIdx = modelIdx;
 	m.nTris = (uint32)nTris;
 	m.verts.assign( verts, verts + nTris * 3 );
+	m.shadowMats.assign( (size_t)nTris, -1 );
+	if ( shadowMatIndices )
+	{
+		for ( int i = 0; i < nTris; ++i )
+			m.shadowMats[i] = shadowMatIndices[i];
+	}
 	g_ptPropModels.push_back( std::move( m ) );
 }
 
@@ -126,6 +135,7 @@ static bool PathTraceDXR_PropInstancingReady()
 void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv )
 {
 	g_ptTris.clear();
+	g_ptShadowMats.clear();
 	g_bPtCaptureDone = false;
 	const int n = rtEnv.OptimizedTriangleList.Count();
 	const bool bInstanced = PathTraceDXR_PropInstancingReady();
@@ -141,6 +151,10 @@ void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv )
 		if ( bInstanced && ( h.flags & TRACE_ID_STATICPROP ) )
 			continue; // unique-model BLASes + TLAS instances
 		g_ptTris.push_back( h );
+		// Flat AS: material index from CPU RT env (alpha-tested props).
+		const int mat = ( tri.m_Data.m_GeometryData.m_nFlags & FCACHETRI_TRANSPARENT )
+			? rtEnv.GetTriangleMaterial( i ) : -1;
+		g_ptShadowMats.push_back( mat );
 	}
 	if ( bInstanced )
 	{
@@ -154,9 +168,9 @@ void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv )
 				h.a = m.verts[t * 3 + 0];
 				h.b = m.verts[t * 3 + 1];
 				h.c = m.verts[t * 3 + 2];
-				// Prop id comes from TLAS InstanceID at hit time.
 				h.flags = TRACE_ID_STATICPROP;
 				g_ptTris.push_back( h );
+				g_ptShadowMats.push_back( ( t < m.shadowMats.size() ) ? m.shadowMats[t] : -1 );
 			}
 		}
 		Msg( "[PathTrace-DXR] Captured %u world tris + %d unique prop models (%d instances) for instanced AS\n",
@@ -895,6 +909,7 @@ bool PathTraceDXR_DeviceInit( int adapterIndex )
 void PathTraceDXR_DeviceShutdown()
 {
 	PathTraceDXR_GpuBakeEnd();
+	PathTraceDXR_GpuBakeReleasePipeline();
 
 	if ( g_ptDev.queue && g_ptDev.fence && g_ptDev.fenceEvent )
 		PtWaitGPU();

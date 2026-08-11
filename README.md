@@ -61,7 +61,7 @@ Operators fall into two classes:
 | `light_absorb`                   | Brush         | Soft damp of bounce (optional direct)                                       |
 | `light_bounce_vol`               | Brush         | Local `-bounce_boost` / `-bounce_chroma` / energy mode                      |
 | `light_volume`                   | Point         | Soft-sphere origin sampling; exported as hard point light                   |
-| `fog_volume` (+ blocker)         | Brush         | 3D light grid + screenspace fog packed into BSP (`lua_run`)                 |
+| `fog_volume` (+ blocker)         | Brush         | Convex-brush SDF light grid + screenspace fog packed into BSP (`lua_run`) |
 | `water_light_vol`                | Brush         | Optional underwater IOP override (`-underwater` / `-uw_volume`)             |
 | `light_spot` IES / projected VTF | Entity keys   | Bake-only photometry / gobo; engine cone keys unchanged for dynamics        |
 | Soft sun                         | Bake          | Low-discrepancy cone + adaptive CHSS-style count                            |
@@ -99,7 +99,7 @@ Operators fall into two classes:
 | `water_light_vol`                   | Brush        |
 
 
-Legacy classname `light_environment_volume` is accepted for env volumes. Stock **VBSP** is sufficient: lighting volumes are compile-time. `fog_volume` is rewritten by VRAD into map-embedded `lua_run` (no addon).
+Legacy classname `light_environment_volume` is accepted for env volumes. Stock **VBSP** is sufficient: lighting volumes are compile-time. `fog_volume` is rewritten by VRAD into map-embedded `lua_run` (no addon needed).
 
 ---
 
@@ -163,9 +163,9 @@ Same keys as stock `light`, plus `Radius` (default **16**). Bake samples origins
 
 ### 4.5 `fog_volume` -- BSP-shipped volumetric fog
 
-Bakes a 3D irradiance grid into the BSP pak and packs a GMod screenspace fog draw (**no addon**).
+Bakes a 3D irradiance grid into the BSP pak and packs a GMod screenspace fog draw (**no addon needed / lua_run must be allowed to work on a server**).
 
-1. Brush → Tie to Entity → `fog_volume` (`tools/toolstrigger`).
+1. Brush → Tie to Entity → `fog_volume` (`tools/toolstrigger`). Vertex-edited / clipped brushes work (convex plane SDF); they are not limited to axis-aligned boxes.
 2. Compile fog shaders once ([§4.5.1](#451-shaders)).
 3. VRAD writes `materials/maps/<map>/fog_volume_<hammerid>.vtf/.vmt`, shared `fog_noise.vtf`, packs `shaders/fxc/cvrad_fog_*.vcs`, and rewrites the entity to `lua_run`.
 
@@ -208,16 +208,16 @@ Auto-detects BSP water via `leafWaterData` / `CONTENTS_WATER`. Optical propertie
 | Flag               | Mode  | Estimator                                                              |
 | ------------------ | ----- | ---------------------------------------------------------------------- |
 | `-underwater`      | **A** | Beer-Lambert segment transmittance + Kd downwelling for sun/sky        |
-| `-uw_volume`       | **C** | Homogeneous free-flight volume path tracing (implies underwater media) |
+| `-uw_volume`       | **B** | Homogeneous free-flight volume path tracing (implies underwater media) |
 | `-uw_off`          | --    | Force disable                                                          |
-| `-uw_maxscatter N` | C     | Cap medium scatter events (default **8**, max **64**)                  |
+| `-uw_maxscatter N` | B     | Cap medium scatter events (default **8**, max **64**)                  |
 
 
 **Authoring notes (important):**
 
 - Source `$fogend` is screenspace fog, not lightmap optical depth. The bake applies an extinction scale s_{\mathrm{bake}}=0.28, scatter fraction 0.45, and \mathbf{k}_d = 0.35\boldsymbol{\sigma}_t, with a per-channel Kd floor of 0.04.
 - Mode A applies **either** segment T (local lights / path segments) **or** Kd (sky/sun irradiance)--not both stacked.
-- Mode C accepts free-flight scatters only **inside** the water AABB (no fake boundary albedo); soft sky veiling reinjects ambient fill.
+- Mode B accepts free-flight scatters only **inside** the water AABB (no fake boundary albedo); soft sky veiling reinjects ambient fill.
 - Optional VMT: `$vrad_uw_jerlov`, `$vrad_uw_sigma_a`, `$vrad_uw_sigma_s`, `$vrad_uw_g`.
 
 CPU + GPU pathtrace implement both modes; Mode A also scales classic direct gathering when pathtrace is off. See algorithms report § Underwater media.
@@ -377,7 +377,7 @@ vrad.exe -config full -game "<gmod>\garrysmod" "<map>"
 
 ### 11.1 Static props under pathtrace
 
-With `-StaticPropLighting`, GPU PathLi bakes prop lightmap texels and a virtual per-triangle vertex lattice (`-pt_prop_vertgrid`, default **4**; `0` = one sample/vert). Override spp/bounces with `-pt_prop_samples` / `-pt_prop_bounces`. Classic prop path: 4-wide SSE direct + optional GPU bounce cull.
+With `-StaticPropLighting`, GPU PathLi bakes prop lightmap texels and prop vertex lighting via **8×8** per-triangle charts packed into a **64×64**-cell atlas (`-pt_prop_vertgrid`, default **4** enables atlas; `0` = one sample/vert). Charts are hole-filled and optionally denoised (`-pt_denoise`); each vertex takes the closest sample from every adjacent triangle and averages them. Override spp/bounces with `-pt_prop_samples` / `-pt_prop_bounces`. Classic prop path: 4-wide SSE direct + optional GPU bounce cull.
 
 ---
 
@@ -450,8 +450,10 @@ Complete flag list (Valve + CustomVRAD). Bold = typical defaults. Pass `-game` /
 | ----------------------------------------------------------------- | --------------------------- |
 | `-StaticPropLighting` / `-StaticPropPolys` / `-StaticPropNormals` | Prop bake / debug           |
 | `-OnlyStaticProps` / `-nossprops`                                 | Prop-only / no self-shadow  |
-| `-textureshadows`                                                 | Alpha textures cast shadows |
+| `-textureshadows`                                                 | Alpha textures cast shadows on any `$alphatest`/`$translucent` prop (no MDL flag needed). PathTrace: `$alphatest` stochastic cutout, `$translucent` soft `T*=(1-a)` |
 | `-nodetaillight` / `-onlydetail` / `-noskyboxrecurse`             | Detail / skybox             |
+
+Dense HDR lightmaps can overflow the engine hunk at map load; clients/servers should use `r_hunkalloclightmaps 0` (cfg / launch option).
 
 
 
@@ -476,7 +478,7 @@ Complete flag list (Valve + CustomVRAD). Bold = typical defaults. Pass `-game` /
 | `-pt_gpu` / `-pt_cpu`                                                                             | GPU (default) / CPU SSE                                                                  |
 | `-pt_samples N`                                                                                   | spp (CLI default **4** / **2** fast / **8** final; max **4096**; configs often 256-1024) |
 | `-pt_bounces N`                                                                                   | Indirect hops (**3**; **1** fast; **0** = direct+sky; max **16**)                        |
-| `-pt_prop_samples` / `-pt_prop_bounces` / `-pt_prop_vertgrid`                                     | Prop spp / hops / vert lattice (**4**)                                                   |
+| `-pt_prop_samples` / `-pt_prop_bounces` / `-pt_prop_vertgrid`                                     | Prop spp / hops / vert atlas on (**4**; `0`=per-vert)                                    |
 | `-pt_aa N`                                                                                        | Luxel footprint grid **1-5** (default **3**)                                             |
 | `-pt_lights N`                                                                                    | Local NEE samples (`0` = all)                                                            |
 | `-pt_emit_samples N`                                                                              | Area-emit NEE (**64**; `0` = all tris)                                                   |
@@ -494,7 +496,7 @@ Complete flag list (Valve + CustomVRAD). Bold = typical defaults. Pass `-game` /
 | Parameter          | Description                   |
 | ------------------ | ----------------------------- |
 | `-underwater`      | Mode A: Beer-Lambert + Kd     |
-| `-uw_volume`       | Mode C: free-flight volume PT |
+| `-uw_volume`       | Mode B: free-flight volume PT |
 | `-uw_off`          | Force disable                 |
 | `-uw_maxscatter N` | Medium scatter cap (**8**)    |
 

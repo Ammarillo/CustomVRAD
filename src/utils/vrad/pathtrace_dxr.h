@@ -25,7 +25,7 @@ extern int		g_nPathTraceLightSamples;	// local NEE samples (0=all lights)
 extern int		g_nPathTraceEmitSamples;	// $vrad_emit area NEE samples (0=all tris)
 extern int		g_nPathTracePropSamples;	// prop spp (0 = auto: max(8, world/4))
 extern int		g_nPathTracePropBounces;	// prop bounces (-1 = auto: world; 0 = direct+sky)
-extern int		g_nPathTracePropVertGrid;	// virtual tri lightmap edge subdiv for vert lighting (0=per-vert)
+extern int		g_nPathTracePropVertGrid;	// 0=per-vert; >0=8x8 tri atlas + closest gather (+denoise)
 extern bool		g_bPathTraceSpectral;		// hero-wavelength Smits+CIE (default true)
 extern float	g_flPtLightRadius;		// -pt_lightradius: soft disk for light/light_spot (0=hard)
 extern float	g_flPtLightPenumbra;	// -pt_lightpenumbra: CHSS growth scale
@@ -71,7 +71,9 @@ bool PathTraceDXR_CanBakeProps();
 
 // Phase 2: register unique-model local shadow meshes + instances (before DeviceInit).
 void PathTraceDXR_ClearPropInstances();
-void PathTraceDXR_RegisterPropModel( int modelIdx, const class Vector *verts, int nTris );
+// shadowMatIndices: per-triangle index into shadow material DB (-1 = opaque). Optional.
+void PathTraceDXR_RegisterPropModel( int modelIdx, const class Vector *verts, int nTris,
+									 const int *shadowMatIndices = nullptr );
 void PathTraceDXR_RegisterPropInstance( int propIndex, int modelIdx, const float xform[3][4] );
 
 void PathTraceDXR_Shutdown();

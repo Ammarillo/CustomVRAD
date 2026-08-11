@@ -114,8 +114,9 @@ soft shadows, textured emissive and filter materials, spatial volume overrides,
 multi-scale ambient occlusion, IESNA photometric spot evaluation, directional
 projected-texture modulation on \ent{light\_spot}, physically based underwater
 media (Beer--Lambert / Kd and homogeneous volume path tracing), BSP-shipped
-volumetric fog grids with a screenspace shader, and lightmap post-processes
-(denoising, seam stitching, edge pull).
+volumetric fog grids with convex brush SDFs and a screenspace shader,
+GPU texture shadows for \vmt{alphatest}/\vmt{translucent} props, and lightmap
+post-processes (denoising, seam stitching, edge pull).
 This document states the algorithms as implemented: estimators, coordinate
 conventions, parameter semantics, and the relationship between classic and
 path-traced bake modes.
@@ -550,6 +551,26 @@ Energy transport stays linear; stacking is perceptual:
   b'=b_0+b_1.
 \end{equation}
 
+\subsection{Texture shadows (\flag{-textureshadows})}
+\label{sec:texshadow}
+
+Alpha-masked static props cast coverage-aware shadows without requiring the
+MDL \code{STUDIOHDR\_FLAGS\_CAST\_TEXTURE\_SHADOWS} bit when
+\flag{-textureshadows} is set. Materials with \vmt{alphatest} or
+\vmt{translucent} (non-zero) contribute basetexture alpha into a GPU atlas
+and per-triangle UV meta.
+
+Under \flag{-pathtrace} / DXR RayQuery:
+\begin{itemize}[leftmargin=1.4em]
+  \item \vmt{alphatest} --- stochastic any-hit cutout (Enderton-style): a
+        uniform $U\sim\mathcal{U}[0,1]$ rejects the hit when $U\ge\alpha$.
+  \item \vmt{translucent} --- expected coverage transmittance
+        $T\leftarrow T(1-\alpha)$ along VisRGB / SunVisRGB (soft dappled
+        shadows). Binary occlusion queries still use stochastic testing.
+\end{itemize}
+Foliage triangles remain shadow casters only (skipped as GI bounce surfaces).
+Classic SSE pathtrace-off continues to use stock CPU coverage accumulation.
+
 %═══════════════════════════════════════════════════════════════════════════════
 \section{Oklab perceptual ops}
 \label{sec:oklab}
@@ -617,13 +638,17 @@ at the centre (softness is bake-only).
 Bake-time construction of a 3D irradiance grid and packing of a screenspace
 fog draw into the BSP (no addon). Let $\sigma$ be optical density per world
 unit, $g$ Henyey--Greenstein anisotropy, and $\vect{c}$ fog tint.
-Raymarching uses \code{StepCount} steps through an AABB expanded by
-\code{BlendDistance} under Outside/Center blend modes. Grid resolution is
+Raymarching uses an AABB expanded by \code{BlendDistance} under Outside/Center
+blend modes for the light grid / early-out; density membership uses a
+\textbf{convex brush SDF} baked into atlas alpha from the entity's planes
+(vertex-edited / clipped brushes, not only axis-aligned boxes).
+Grid resolution is
 \code{GridSpacing} clamped so that each axis has at most $64$ samples
 ($64^{3}$ cap). Optional FBM noise (\code{NoiseScale}, \code{NoiseCoverage})
 modulates density; wind scrolls the atlas in world space.
 
-\ent{fog\_volume\_blocker} carves fog (soft blend) into atlas alpha and is
+\ent{fog\_volume\_blocker} carves fog (soft blend, also plane-aware) into atlas
+alpha and is
 rewritten to \code{info\_null}. Enabled volumes are rewritten to
 \code{lua\_run\_on\_client} stubs that hook \code{RenderScreenspaceEffects}.
 Clients that block map client Lua will not draw fog.
@@ -939,15 +964,14 @@ Under \flag{-pathtrace} $+$ \flag{-StaticPropLighting}:
 
 \begin{itemize}[leftmargin=1.4em]
   \item \textbf{Prop lightmap texels} --- same spp / bounces / NEE as world.
-  \item \textbf{Vertex lighting} --- virtual per-triangle lightmap with edge
-        subdivision \flag{-pt\_prop\_vertgrid}~$G$ (default~$4$):
-        \begin{equation}
-          \#\text{samples/triangle}
-          =
-          \frac{(G+1)(G+2)}{2}.
-        \end{equation}
-        Lattice samples scatter to the three vertices by barycentric weights;
-        each vertex normalises by accumulated weight. Unlit verts inherit from
+  \item \textbf{Vertex lighting} --- with \flag{-pt\_prop\_vertgrid}~$G>0$
+        (default~$4$): each LOD0 triangle gets an $8\times8$ chart packed into a
+        $64\times64$-cell atlas page ($512\times512$), inset by $1$ texel
+        (right-triangle lattice in the $6\times6$ content region,
+        $\approx21$ samples/tri). Pages are hole-filled and, when
+        \flag{-pt\_denoise} is on, denoised with the world-face backends.
+        Each vertex takes the closest valid sample from every adjacent
+        triangle chart and averages those colours. Unlit verts inherit from
         nearest lit. $G=0$ $=$ old one-sample-per-vertex.
 \end{itemize}
 Override quality with \flag{-pt\_prop\_samples} /
@@ -1030,7 +1054,7 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \flag{-pt\_softmode} & direct & Soft at luxel / all vertices \\
   \flag{-pt\_denoise} & off & Enable denoise \\
   \flag{-pt\_denoiser} & oidn & oidn $\mid$ optix $\mid$ sakai \\
-  \flag{-pt\_prop\_vertgrid} & $4$ & Prop vertex lattice \\
+  \flag{-pt\_prop\_vertgrid} & $4$ & Prop vert atlas on ($0$=per-vert) \\
   \flag{-underwater} & off & Mode~A Beer--Lambert $+$ Kd \\
   \flag{-uw\_volume} & off & Mode~C free-flight volume PT \\
   \flag{-uw\_maxscatter}~$N$ & $8$ & Cap medium scatters (Mode~C) \\
@@ -1041,6 +1065,7 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \flag{-bounce\_chroma} & $0$ & Early-bounce Oklab sat \\
   \flag{-bounce\_weld} & off & Coplanar edge GI weld \\
   \flag{-gpu} & off & OpenCL classic gather \\
+  \flag{-textureshadows} & off & Prop $\alpha$ shadows (\vmt{alphatest} / \vmt{translucent}) \\
   \flag{-ao} & off & Hemisphere AO pass \\
   \flag{-ao\_force} & off & AO even under pathtrace GI \\
   \flag{-edgepull} & $0.5$ & Luxel edge inset \\
@@ -1083,7 +1108,7 @@ bump layer; displacements skipped. Disable with \flag{-nostitch}.
   \code{ies\_profile.*} & IESNA LM-63 load + angular eval \\
   \code{light\_projection.*} & Projected VTF load, CPU sample, GPU arrays \\
   \code{pathtrace\_*denoise*} & OIDN / OptiX / Sakai \\
-  \code{vradstaticprops.cpp} & Prop SSE + pathtrace vertgrid \\
+  \code{vradstaticprops.cpp} & Prop SSE + pathtrace vert atlas \\
   \code{lightmap.cpp} & Edge pull, final face lighting, spot parse \\
   \code{loadcmdline.cpp} & \flag{-config} preset tokenization \\
   \bottomrule
