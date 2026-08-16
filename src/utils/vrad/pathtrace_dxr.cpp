@@ -1648,7 +1648,7 @@ static void PtAntialiasHighContrast( Vector *grid, const float *wgt, int width, 
 
 // Path-trace luxel denoise. varSamples: optional [ni*numsamples+i] Var(mean) for Sakai.
 static void PtDenoiseFaceSamples( facelight_t *fl, dface_t *f, int normalCount, bool bIndirect,
-								  const float *varSamples )
+								  const float *varSamples, bool bNetworkDenoise = true )
 {
 	(void)bIndirect;
 	if ( !fl || !f || fl->numsamples <= 0 )
@@ -1661,8 +1661,6 @@ static void PtDenoiseFaceSamples( facelight_t *fl, dface_t *f, int normalCount, 
 	int height = f->m_LightmapTextureSizeInLuxels[1] + 1;
 	if ( width < 1 || height < 1 )
 		return;
-	if ( bDenoise && width * height < 32 )
-		return; // tiny charts: skip denoise, still allow dilate below for any size
 
 	if ( width * height < 4 )
 		return;
@@ -1871,7 +1869,7 @@ static void PtDenoiseFaceSamples( facelight_t *fl, dface_t *f, int normalCount, 
 		}
 
 		const float *varPtr = varSamples ? varGrid.data() : nullptr;
-		if ( bDenoise && width * height >= 32 )
+		if ( bNetworkDenoise && bDenoise && width * height >= 32 )
 		{
 			if ( PathTraceDenoise_DenoiseRGB( rgb.data(), width, height, varPtr ) )
 			{
@@ -1885,7 +1883,8 @@ static void PtDenoiseFaceSamples( facelight_t *fl, dface_t *f, int normalCount, 
 		}
 
 		// Soften remaining luxel stair-steps on hard shadow edges.
-		PtAntialiasHighContrast( grid.data(), wgt.data(), width, height );
+		if ( bNetworkDenoise )
+			PtAntialiasHighContrast( grid.data(), wgt.data(), width, height );
 
 		for ( int i = 0; i < fl->numsamples; ++i )
 		{
@@ -1909,6 +1908,383 @@ static void PtDenoiseFaceSamples( facelight_t *fl, dface_t *f, int normalCount, 
 				dst = dst + ( den - dst ) * blend;
 		}
 	}
+}
+
+static bool PtFaceIsBakeable( int facenum );
+
+static int PtDenoiseUfFind( std::vector<int> &p, int i )
+{
+	while ( p[i] != i )
+	{
+		p[i] = p[p[i]];
+		i = p[i];
+	}
+	return i;
+}
+
+static void PtWorldToSharedLuxel( const lightinfo_t &l, const Vector &world, float &s, float &t )
+{
+	Vector pos;
+	VectorSubtract( world, l.luxelOrigin, pos );
+	s = DotProduct( pos, l.worldToLuxelSpace[0] );
+	t = DotProduct( pos, l.worldToLuxelSpace[1] );
+}
+
+static bool PtDenoiseSameLuxelFrame( int a, int b )
+{
+	const dface_t *fa = &g_pFaces[a];
+	const dface_t *fb = &g_pFaces[b];
+	const texinfo_t *ta = &texinfo[fa->texinfo];
+	const texinfo_t *tb = &texinfo[fb->texinfo];
+	for ( int i = 0; i < 2; ++i )
+	{
+		Vector va( ta->lightmapVecsLuxelsPerWorldUnits[i][0],
+				   ta->lightmapVecsLuxelsPerWorldUnits[i][1],
+				   ta->lightmapVecsLuxelsPerWorldUnits[i][2] );
+		Vector vb( tb->lightmapVecsLuxelsPerWorldUnits[i][0],
+				   tb->lightmapVecsLuxelsPerWorldUnits[i][1],
+				   tb->lightmapVecsLuxelsPerWorldUnits[i][2] );
+		const float na = va.Length();
+		const float nb = vb.Length();
+		if ( na < 1e-8f || nb < 1e-8f )
+			return false;
+		if ( fabsf( na - nb ) / max( na, nb ) > 0.02f )
+			return false;
+		if ( DotProduct( va, vb ) / ( na * nb ) < 0.999f )
+			return false;
+	}
+	if ( ( face_offset[a] - face_offset[b] ).LengthSqr() > 0.01f )
+		return false;
+	const bool bumpA = ( ta->flags & SURF_BUMPLIGHT ) != 0;
+	const bool bumpB = ( tb->flags & SURF_BUMPLIGHT ) != 0;
+	return bumpA == bumpB;
+}
+
+static bool PtDenoiseCoplanarNeighbors( int a, int b )
+{
+	if ( DotProduct( faceneighbor[a].facenormal, faceneighbor[b].facenormal ) < 0.999f )
+		return false;
+	const dplane_t &pa = dplanes[g_pFaces[a].planenum];
+	const dface_t *fb = &g_pFaces[b];
+	if ( fb->numedges <= 0 )
+		return false;
+	const int e = dsurfedges[fb->firstedge];
+	const int v = ( e >= 0 ) ? dedges[e].v[0] : dedges[-e].v[1];
+	const float dist = fabsf( DotProduct( pa.normal, dvertexes[v].point ) - pa.dist );
+	return dist < 0.75f;
+}
+
+static bool PtDenoiseIslandEligible( int facenum )
+{
+	if ( facenum < 0 || facenum >= numfaces )
+		return false;
+	if ( !PtFaceIsBakeable( facenum ) )
+		return false;
+	const dface_t *f = &g_pFaces[facenum];
+	if ( f->dispinfo != -1 )
+		return false;
+	const facelight_t *fl = &facelight[facenum];
+	return fl->numsamples > 0 && fl->sample && fl->light[0][0];
+}
+
+static void PtFormatDuration( int totalSec, char *buf, int bufSize );
+static void PtProgressLine( bool bFinish, const char *text );
+
+// Pack coplanar connected faces into one luxel image and denoise it (OIDN/OptiX).
+static void PtDenoiseCoplanarIslands()
+{
+	if ( !g_bPathTraceDenoise || !PathTraceDenoise_IsReady() )
+		return;
+	if ( g_PathTraceDenoiser == PT_DENOISER_SAKAI )
+		return;
+
+	std::vector<int> parent( (size_t)numfaces );
+	for ( int i = 0; i < numfaces; ++i )
+		parent[i] = i;
+
+	int nEligible = 0;
+	for ( int facenum = 0; facenum < numfaces; ++facenum )
+	{
+		if ( !PtDenoiseIslandEligible( facenum ) )
+			continue;
+		++nEligible;
+		const faceneighbor_t *fn = &faceneighbor[facenum];
+		for ( int j = 0; j < fn->numneighbors; ++j )
+		{
+			const int nb = fn->neighbor[j];
+			if ( nb <= facenum || !PtDenoiseIslandEligible( nb ) )
+				continue;
+			if ( !PtDenoiseCoplanarNeighbors( facenum, nb ) )
+				continue;
+			if ( !PtDenoiseSameLuxelFrame( facenum, nb ) )
+				continue;
+			const int ra = PtDenoiseUfFind( parent, facenum );
+			const int rb = PtDenoiseUfFind( parent, nb );
+			if ( ra != rb )
+				parent[ra] = rb;
+		}
+	}
+
+	std::vector<std::vector<int>> islands( (size_t)numfaces );
+	for ( int facenum = 0; facenum < numfaces; ++facenum )
+	{
+		if ( !PtDenoiseIslandEligible( facenum ) )
+			continue;
+		islands[PtDenoiseUfFind( parent, facenum )].push_back( facenum );
+	}
+
+	int nIslandTotal = 0;
+	int nFaceTotal = 0;
+	for ( int root = 0; root < numfaces; ++root )
+	{
+		if ( islands[root].empty() )
+			continue;
+		++nIslandTotal;
+		nFaceTotal += (int)islands[root].size();
+	}
+	if ( nIslandTotal <= 0 )
+		return;
+
+	Msg( "[PathTrace-DXR] Denoising %d coplanar island(s) (%d faces, %s)...\n",
+		 nIslandTotal, nFaceTotal, PathTraceDenoise_Name() );
+	fflush( stdout );
+
+	const float blend = min( 1.0f, max( 0.0f, g_flPathTraceDenoiseStrength ) );
+	const int kMaxSide = 2048;
+	int nIslands = 0, nGroupedFaces = 0, nFallback = 0;
+	const double t0 = Plat_FloatTime();
+	double lastReport = 0.0;
+
+	auto reportDenoise = [&]( bool bFinish )
+	{
+		char elapsedStr[32], etaStr[48];
+		const double elapsed = Plat_FloatTime() - t0;
+		PtFormatDuration( (int)elapsed, elapsedStr, sizeof( elapsedStr ) );
+		const float pct = ( nIslandTotal > 0 )
+			? ( 100.0f * (float)nIslands / (float)nIslandTotal ) : 100.0f;
+		etaStr[0] = '\0';
+		if ( !bFinish && nIslands > 0 && nIslands < nIslandTotal && elapsed > 0.4 )
+		{
+			const double rate = (double)nIslands / elapsed;
+			const double eta = (double)( nIslandTotal - nIslands ) / max( rate, 1e-6 );
+			char etaBuf[32];
+			PtFormatDuration( (int)( eta + 0.5 ), etaBuf, sizeof( etaBuf ) );
+			Q_snprintf( etaStr, sizeof( etaStr ), "  ETA %s", etaBuf );
+		}
+		char line[256];
+		Q_snprintf( line, sizeof( line ),
+					"[PathTrace-DXR] Denoise  %5.1f%%  %d / %d islands  (%d faces)  %s elapsed%s",
+					pct, nIslands, nIslandTotal, nGroupedFaces, elapsedStr, etaStr );
+		PtProgressLine( bFinish, line );
+	};
+
+	reportDenoise( false );
+
+	for ( int root = 0; root < numfaces; ++root )
+	{
+		std::vector<int> &members = islands[root];
+		if ( members.empty() )
+			continue;
+		++nIslands;
+		nGroupedFaces += (int)members.size();
+
+		int bumpCount = 1;
+		{
+			const dface_t *f0 = &g_pFaces[members[0]];
+			if ( texinfo[f0->texinfo].flags & SURF_BUMPLIGHT )
+				bumpCount = NUM_BUMP_VECTS + 1;
+		}
+
+		lightinfo_t lRoot;
+		InitLightinfo( &lRoot, members[0] );
+
+		float minS = 1e30f, minT = 1e30f, maxS = -1e30f, maxT = -1e30f;
+		for ( int facenum : members )
+		{
+			const facelight_t *fl = &facelight[facenum];
+			for ( int i = 0; i < fl->numsamples; ++i )
+			{
+				float s, t;
+				PtWorldToSharedLuxel( lRoot, fl->sample[i].pos, s, t );
+				minS = min( minS, s );
+				minT = min( minT, t );
+				maxS = max( maxS, s );
+				maxT = max( maxT, t );
+			}
+		}
+
+		int width = (int)ceilf( maxS - minS ) + 3;
+		int height = (int)ceilf( maxT - minT ) + 3;
+		if ( width < 2 )
+			width = 2;
+		if ( height < 2 )
+			height = 2;
+
+		if ( width > kMaxSide || height > kMaxSide )
+		{
+			for ( int facenum : members )
+			{
+				dface_t *f = &g_pFaces[facenum];
+				facelight_t *fl = &facelight[facenum];
+				int nc = 1;
+				if ( texinfo[f->texinfo].flags & SURF_BUMPLIGHT )
+					nc = NUM_BUMP_VECTS + 1;
+				PtDenoiseFaceSamples( fl, f, nc, false, nullptr, true );
+			}
+			++nFallback;
+			continue;
+		}
+
+		const int nPix = width * height;
+		std::vector<Vector> grid( (size_t)nPix );
+		std::vector<float> wgt( (size_t)nPix, 0.0f );
+		std::vector<float> rgb( (size_t)nPix * 3u );
+
+		for ( int ni = 0; ni < bumpCount; ++ni )
+		{
+			for ( int i = 0; i < nPix; ++i )
+			{
+				grid[i].Init();
+				wgt[i] = 0.0f;
+			}
+
+			for ( int facenum : members )
+			{
+				const facelight_t *fl = &facelight[facenum];
+				if ( !fl->light[0][ni] )
+					continue;
+				for ( int i = 0; i < fl->numsamples; ++i )
+				{
+					float fs, ft;
+					PtWorldToSharedLuxel( lRoot, fl->sample[i].pos, fs, ft );
+					const int s = clamp( (int)floorf( fs - minS + 1.0f + 0.5f ), 0, width - 1 );
+					const int t = clamp( (int)floorf( ft - minT + 1.0f + 0.5f ), 0, height - 1 );
+					const int idx = s + t * width;
+					grid[idx] += fl->light[0][ni][i].m_vecLighting;
+					wgt[idx] += 1.0f;
+				}
+			}
+			for ( int i = 0; i < nPix; ++i )
+			{
+				if ( wgt[i] > 0.0f )
+					grid[i] *= ( 1.0f / wgt[i] );
+			}
+
+			std::vector<Vector> tmp = grid;
+			std::vector<float> wtmp = wgt;
+			for ( int pass = 0; pass < 6; ++pass )
+			{
+				bool any = false;
+				tmp = grid;
+				wtmp = wgt;
+				for ( int t = 0; t < height; ++t )
+				{
+					for ( int s = 0; s < width; ++s )
+					{
+						const int idx = s + t * width;
+						if ( wgt[idx] > 0.0f )
+							continue;
+						Vector sum( 0, 0, 0 );
+						float sw = 0.0f;
+						for ( int dt = -1; dt <= 1; ++dt )
+						{
+							const int nt = t + dt;
+							if ( nt < 0 || nt >= height )
+								continue;
+							for ( int ds = -1; ds <= 1; ++ds )
+							{
+								const int ns = s + ds;
+								if ( ns < 0 || ns >= width )
+									continue;
+								const int nidx = ns + nt * width;
+								if ( wgt[nidx] <= 0.0f )
+									continue;
+								sum += grid[nidx];
+								sw += 1.0f;
+							}
+						}
+						if ( sw > 0.0f )
+						{
+							tmp[idx] = sum * ( 1.0f / sw );
+							wtmp[idx] = 0.001f;
+							any = true;
+						}
+					}
+				}
+				grid.swap( tmp );
+				wgt.swap( wtmp );
+				if ( !any )
+					break;
+			}
+
+			for ( int i = 0; i < nPix; ++i )
+			{
+				rgb[(size_t)i * 3u + 0] = grid[i].x;
+				rgb[(size_t)i * 3u + 1] = grid[i].y;
+				rgb[(size_t)i * 3u + 2] = grid[i].z;
+			}
+
+			if ( nPix >= 32 )
+				PathTraceDenoise_DenoiseRGB( rgb.data(), width, height, nullptr );
+
+			for ( int i = 0; i < nPix; ++i )
+			{
+				grid[i].x = rgb[(size_t)i * 3u + 0];
+				grid[i].y = rgb[(size_t)i * 3u + 1];
+				grid[i].z = rgb[(size_t)i * 3u + 2];
+			}
+			PtAntialiasHighContrast( grid.data(), wgt.data(), width, height );
+
+			auto sampleBilinear = [&]( float fs, float ft ) -> Vector
+			{
+				const float x = clamp( fs - minS + 1.0f, 0.0f, (float)( width - 1 ) );
+				const float y = clamp( ft - minT + 1.0f, 0.0f, (float)( height - 1 ) );
+				const int s0 = (int)floorf( x );
+				const int t0 = (int)floorf( y );
+				const int s1 = min( s0 + 1, width - 1 );
+				const int t1 = min( t0 + 1, height - 1 );
+				const float fx = x - (float)s0;
+				const float fy = y - (float)t0;
+				const Vector &c00 = grid[s0 + t0 * width];
+				const Vector &c10 = grid[s1 + t0 * width];
+				const Vector &c01 = grid[s0 + t1 * width];
+				const Vector &c11 = grid[s1 + t1 * width];
+				return c00 * ( ( 1.0f - fx ) * ( 1.0f - fy ) ) + c10 * ( fx * ( 1.0f - fy ) ) +
+					   c01 * ( ( 1.0f - fx ) * fy ) + c11 * ( fx * fy );
+			};
+
+			for ( int facenum : members )
+			{
+				facelight_t *fl = &facelight[facenum];
+				if ( !fl->light[0][ni] )
+					continue;
+				for ( int i = 0; i < fl->numsamples; ++i )
+				{
+					float fs, ft;
+					PtWorldToSharedLuxel( lRoot, fl->sample[i].pos, fs, ft );
+					const Vector den = sampleBilinear( fs, ft );
+					Vector &dst = fl->light[0][ni][i].m_vecLighting;
+					if ( blend >= 0.999f )
+						dst = den;
+					else
+						dst = dst + ( den - dst ) * blend;
+				}
+			}
+		}
+
+		const double now = Plat_FloatTime();
+		if ( nIslands == nIslandTotal || ( now - lastReport ) >= 0.25 )
+		{
+			reportDenoise( false );
+			lastReport = now;
+		}
+	}
+
+	reportDenoise( true );
+	Msg( "[PathTrace-DXR] Coplanar denoise: %d island(s), %d faces%s\n",
+		 nIslands, nGroupedFaces,
+		 nFallback ? " (some islands too large; per-face fallback)" : "" );
+	(void)nEligible;
 }
 
 static void PtFormatDuration( int totalSec, char *buf, int bufSize )
@@ -2191,7 +2567,9 @@ static void PtFinishFaceLighting( int facenum, int normalCount, LightingValue_t 
 		varPtr = luxelVar.data();
 	}
 
-	PtDenoiseFaceSamples( fl, f, normalCount, false, varPtr );
+	const bool bDeferIsland = g_bPathTraceDenoise && PathTraceDenoise_IsReady()
+		&& g_PathTraceDenoiser != PT_DENOISER_SAKAI && f->dispinfo == -1;
+	PtDenoiseFaceSamples( fl, f, normalCount, false, varPtr, !bDeferIsland );
 	for ( int n = 0; n < normalCount; ++n )
 	{
 		for ( int i = 0; i < fl->numsamples; ++i )
@@ -3192,6 +3570,7 @@ bool PathTraceDXR_BakeWorldFaces()
 	// GPU path already finished progress + dark stats; CPU path needs a final 100% line.
 	if ( !bGpuOk )
 		PtReportProgress( true );
+	PtDenoiseCoplanarIslands();
 	PathTraceDenoise_Shutdown();
 	g_bPathTraceActive = true;
 	Msg( "[PathTrace-DXR] World-face path trace complete in %s - %d lit faces, %d luxels.\n",

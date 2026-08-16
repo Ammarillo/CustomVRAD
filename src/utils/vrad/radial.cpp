@@ -1013,11 +1013,17 @@ void FinalLightFace( int iThread, int facenum )
 // VRAD). After FinalLightFace, blend luxels near each shared edge toward the
 // value the neighbor face has at the same world position; at the edge itself
 // both sides converge to the same average, removing the seam.
+//
+// Shared edges are matched geometrically (collinear overlap), so T-junctions
+// and duplicated verts stitch the same as identical dvertex indices.
 //-----------------------------------------------------------------------------
 
 static const float STITCH_COPLANAR_DOT = 0.999f;	// ~2.5 degrees
 static const float STITCH_LUXEL_RANGE = 1.75f;		// stitch band, in luxels from the shared edge
 static const int   STITCH_MAX_EDGES = 32;			// shared segments per face pair
+static const float STITCH_EDGE_DIST_EPS = 0.5f;	// world-unit tolerance for collinear overlap
+static const float STITCH_EDGE_PARALLEL = 0.99f;	// |dot| of unit edge dirs
+static const float STITCH_EDGE_MIN_OVERLAP = 0.5f;	// ignore tiny accidental overlaps (WU)
 
 static float DistPointToSegment2D( float px, float py, const Vector2D &a, const Vector2D &b )
 {
@@ -1032,6 +1038,55 @@ static float DistPointToSegment2D( float px, float py, const Vector2D &a, const 
 	float dx = px - ( a.x + abx * t );
 	float dy = py - ( a.y + aby * t );
 	return sqrtf( dx * dx + dy * dy );
+}
+
+static float StitchDistPointToLine( const Vector &p, const Vector &o, const Vector &dir )
+{
+	Vector d = p - o;
+	Vector perp = d - dir * DotProduct( d, dir );
+	return perp.Length();
+}
+
+// True if A and B are nearly collinear and overlap; writes the overlapping
+// segment in world space. Matches T-junctions / duplicated verts, not just
+// identical dvertex indices.
+static bool StitchEdgesOverlap( const Vector &a0, const Vector &a1,
+								const Vector &b0, const Vector &b1,
+								Vector &outStart, Vector &outEnd )
+{
+	Vector da = a1 - a0;
+	float lenA = da.Length();
+	if ( lenA < STITCH_EDGE_MIN_OVERLAP )
+		return false;
+
+	Vector db = b1 - b0;
+	float lenB = db.Length();
+	if ( lenB < STITCH_EDGE_MIN_OVERLAP )
+		return false;
+
+	Vector dira = da * ( 1.0f / lenA );
+	Vector dirb = db * ( 1.0f / lenB );
+	if ( fabsf( DotProduct( dira, dirb ) ) < STITCH_EDGE_PARALLEL )
+		return false;
+
+	if ( StitchDistPointToLine( b0, a0, dira ) > STITCH_EDGE_DIST_EPS ||
+		 StitchDistPointToLine( b1, a0, dira ) > STITCH_EDGE_DIST_EPS ||
+		 StitchDistPointToLine( a0, b0, dirb ) > STITCH_EDGE_DIST_EPS ||
+		 StitchDistPointToLine( a1, b0, dirb ) > STITCH_EDGE_DIST_EPS )
+		return false;
+
+	float t0 = DotProduct( b0 - a0, dira );
+	float t1 = DotProduct( b1 - a0, dira );
+	float tMin = min( t0, t1 );
+	float tMax = max( t0, t1 );
+	float overlapStart = max( 0.0f, tMin );
+	float overlapEnd = min( lenA, tMax );
+	if ( overlapEnd - overlapStart < STITCH_EDGE_MIN_OVERLAP )
+		return false;
+
+	outStart = a0 + dira * overlapStart;
+	outEnd = a0 + dira * overlapEnd;
+	return true;
 }
 
 // Bilinear sample of a face's lightmap (decoded to linear) from the snapshot buffer.
@@ -1104,24 +1159,28 @@ void StitchLightmapSeams()
 			if ( DotProduct( fn->facenormal, faceneighbor[neighborFace].facenormal ) < STITCH_COPLANAR_DOT )
 				continue;
 
-			// collect shared edges, converted to A's luxel space
+			// Collect geometrically overlapping coplanar edges (identical vert
+			// indices OR T-junction / duplicated-vert seams), in A's luxel space.
 			Vector2D edgeStart[STITCH_MAX_EDGES], edgeEnd[STITCH_MAX_EDGES];
 			int nEdges = 0;
 			for ( int ea = 0; ea < f->numedges && nEdges < STITCH_MAX_EDGES; ++ea )
 			{
 				int va0 = RadialEdgeVertex( f, ea );
 				int va1 = RadialEdgeVertex( f, ea + 1 );
-				for ( int eb = 0; eb < fB->numedges; ++eb )
+				const Vector &a0 = dvertexes[va0].point;
+				const Vector &a1 = dvertexes[va1].point;
+				for ( int eb = 0; eb < fB->numedges && nEdges < STITCH_MAX_EDGES; ++eb )
 				{
 					int vb0 = RadialEdgeVertex( fB, eb );
 					int vb1 = RadialEdgeVertex( fB, eb + 1 );
-					if ( ( va0 == vb0 && va1 == vb1 ) || ( va0 == vb1 && va1 == vb0 ) )
-					{
-						WorldToLuxelSpace( &lA, dvertexes[va0].point, edgeStart[nEdges] );
-						WorldToLuxelSpace( &lA, dvertexes[va1].point, edgeEnd[nEdges] );
-						++nEdges;
-						break;
-					}
+					Vector overlap0, overlap1;
+					if ( !StitchEdgesOverlap( a0, a1, dvertexes[vb0].point, dvertexes[vb1].point,
+											  overlap0, overlap1 ) )
+						continue;
+
+					WorldToLuxelSpace( &lA, overlap0, edgeStart[nEdges] );
+					WorldToLuxelSpace( &lA, overlap1, edgeEnd[nEdges] );
+					++nEdges;
 				}
 			}
 			if ( !nEdges )

@@ -922,9 +922,13 @@ Opt-in via \flag{-pt\_denoise}; select backend with \flag{-pt\_denoiser}.
 
 \subsection{OIDN (default)}
 
-Intel Open Image Denoise \code{RTLightmap} model on CPU. One thread-local
-filter per bake worker (pinned to avoid oversubscription). Charts smaller than
-$16^{2}$ are edge-clamp padded.
+Intel Open Image Denoise \code{RTLightmap} model on CPU (\texttt{hdr} on).
+One thread-local filter per bake worker (pinned to avoid oversubscription).
+Charts smaller than $16^{2}$ are edge-clamp padded.
+After world faces finish, coplanar connected faces that share a lightmap
+frame are packed into one island image and denoised together so OIDN sees
+neighbour context across VBSP splits. Displacements and oversized islands
+($>2048$ on a side) stay per-face. Sakai remains per-face (needs variance).
 
 \subsection{OptiX}
 
@@ -992,10 +996,11 @@ floor/wall scallops. \flag{-noedgepull} restores stock positions.
 
 \subsection{Seam stitching}
 
-On by default after \code{FinalLightFace}. Coplanar faces that share an edge
-(VBSP splits) blend near-edge luxels toward the neighbour value at the same
-world position so both sides converge to a common average. Per lightstyle and
-bump layer; displacements skipped. Disable with \flag{-nostitch}.
+On by default after \code{FinalLightFace}. Coplanar faces whose edges
+geometrically overlap (identical verts, T-junctions, or duplicated verts)
+blend near-edge luxels toward the neighbour value at the same world position
+so both sides converge to a common average. Per lightstyle and bump layer;
+displacements skipped. Disable with \flag{-nostitch}.
 
 %═══════════════════════════════════════════════════════════════════════════════
 \section{Reference integrator (pseudocode)}

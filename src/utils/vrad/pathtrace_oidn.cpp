@@ -148,6 +148,7 @@ bool PathTraceOIDN_DenoiseRGB( float *rgb, int width, int height )
 							  (size_t)padW, (size_t)padH, 0, 0, 0 );
 	oidnSetSharedFilterImage( filter, "output", work, OIDN_FORMAT_FLOAT3,
 							  (size_t)padW, (size_t)padH, 0, 0, 0 );
+	oidnSetFilterBool( filter, "hdr", true );
 	oidnCommitFilter( filter );
 
 	const char *msg = nullptr;

@@ -310,7 +310,7 @@ Coplanar neighbours sharing an edge contribute with edge-distance falloff when b
 
 ### 9.2 Seam stitching (on by default; `-nostitch` disables)
 
-After `FinalLightFace`, luxels near shared edges of coplanar faces blend toward the neighbour value at the same world position. Per lightstyle and bump layer; displacements skipped.
+After `FinalLightFace`, luxels near geometrically overlapping edges of coplanar faces (including T-junctions / duplicated verts) blend toward the neighbour value at the same world position. Per lightstyle and bump layer; displacements skipped.
 
 ### 9.3 Edge pull (on by default; `-noedgepull` disables)
 
@@ -365,7 +365,7 @@ Unidirectional Lambertian integrator with NEE at every vertex. Default backend: 
 
 **Spectral (GPU default):** `-pt_spectral` -- four hero wavelengths, Smits RGB↔SPD, CIE 1931 → linear sRGB. `-pt_nospectral` for linear RGB. Firefly clamp is luminance-preserving.
 
-**Common flags:** `-pt_samples`, `-pt_bounces` (N = indirect hops after luxel; depth =N+1; N=0 ⇒ direct+sky), `-pt_aa`, `-pt_emit_samples`, `-pt_denoise` / `-pt_denoiser` (`oidn`  `optix`  `sakai`), soft-shadow CHSS (`-pt_lightradius`, `-pt_lightpenumbra`, `-pt_softsamples`, `-pt_softmode`). Full table: [§13](#13-vrad-cli-reference).
+**Common flags:** `-pt_samples`, `-pt_bounces` (N = indirect hops after luxel; depth =N+1; N=0 ⇒ direct+sky), `-pt_aa`, `-pt_emit_samples`, `-pt_denoise` / `-pt_denoiser` (`oidn`  `optix`  `sakai`). OIDN/OptiX denoise **coplanar connected faces as one image** (not per-chart). Soft-shadow CHSS (`-pt_lightradius`, `-pt_lightpenumbra`, `-pt_softsamples`, `-pt_softmode`). Full table: [§13](#13-vrad-cli-reference).
 
 Needs a DXR-capable GPU. Prefer `-config full` with pathtrace flags uncommented.
 
@@ -485,7 +485,7 @@ Dense HDR lightmaps can overflow the engine hunk at map load; clients/servers sh
 | `-pt_lightradius` / `-pt_lightpenumbra` / `-pt_softsamples` / `-pt_softmode`                      | Soft shadows / CHSS                                                                      |
 | `-pt_spectral` / `-pt_nospectral`                                                                 | Hero-λ (default on GPU) / RGB                                                            |
 | `-pt_device N`                                                                                    | DXGI adapter index                                                                       |
-| `-pt_denoise` / `-pt_nodennoise` / `-pt_denoiser` / `-pt_denoise_radius` / `-pt_denoise_strength` | Denoise                                                                                  |
+| `-pt_denoise` / `-pt_nodennoise` / `-pt_denoiser` / `-pt_denoise_radius` / `-pt_denoise_strength` | Denoise (OIDN/OptiX: coplanar face islands) |
 
 
 
