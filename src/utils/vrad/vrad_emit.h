@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// VMT-driven textured emissive surfaces for VRAD.
+//========= Copyright PathRAD contributors. ============//
+// Textured emission from VMT ($vrad_emit*).
 //=============================================================================//
 #ifndef VRAD_EMIT_H
 #define VRAD_EMIT_H
@@ -7,7 +7,7 @@
 
 #include "mathlib/vector.h"
 
-// VMT keys (CustomVRAD):
+// VMT keys (PathRAD):
 //   $vrad_emit            "1"              - enable emission (optional if strength > 0)
 //   $vrad_emitstrength    "200"            - intensity scaler (same idea as lights.rad 4th number)
 //   $vrad_emitdensity     "1"              - optional finer patch chop only (contact is area-softened; no light grid)

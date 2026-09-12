@@ -358,6 +358,13 @@ extern float g_flCavityScale;		// fully-enclosed gather scale (default 0.70)
 extern bool g_bEdgePull;			// pull edge sample positions toward face center
 extern float g_flEdgePullInset;		// luxel-space edge inset (default 0.5)
 
+// CustomVBSP GAMELUMP_LIGHTMAP_CHARTS — multi-face charts share luxel space.
+void LoadLightmapCharts();
+bool FaceInMergedLightmapChart( int facenum );
+bool FacesShareMergedLightmapChart( int faceA, int faceB );
+int GetLightmapChartId( int facenum ); // -1 if singleton / absent
+int LightmapChartCount();
+
 extern CUtlVector<char const *> g_NonShadowCastingMaterialStrings;
 extern void ForceTextureShadowsOnModel( const char *pModelName );
 extern bool IsModelTextureShadowsForced( const char *pModelName );

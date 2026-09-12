@@ -1,8 +1,8 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
-// OpenCL acceleration for VRAD (-gpu): BVH occlusion/closest + bounce gather.
-// Stability: small ray batches (TDR-safe), scene size / max-alloc guards,
-// chunked uploads, auto-disable on OpenCL errors.
+// OpenCL for classic bounce (-gpu): occlusion / closest hit + gather.
+// Small ray batches (avoids TDR), size checks, chunked uploads, fall back to
+// CPU if OpenCL errors.
 //
 //=============================================================================//
 

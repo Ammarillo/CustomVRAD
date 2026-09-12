@@ -1,6 +1,6 @@
-//========= Copyright CustomVRAD contributors. ============//
+//========= Copyright PathRAD contributors. ============//
 //
-// D3D12 + DXR device / BLAS / TLAS / batched closest-hit queries.
+// D3D12 + DXR device, BLAS/TLAS, and batched closest-hit queries.
 //
 //=============================================================================//
 

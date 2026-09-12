@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// light_spot ProjectedTexture loader + CPU sampling.
+//========= Copyright PathRAD contributors. ============//
+// Load ProjectedTexture VTFs and sample them on the CPU.
 //=============================================================================//
 
 #include "light_projection.h"

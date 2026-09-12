@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// Textured mesh area lights - PBRT DiffuseAreaLight-style sampling.
+//========= Copyright PathRAD contributors. ============//
+// Area lights from $vrad_emit* faces (triangle mesh sampling).
 //=============================================================================//
 
 #include "vrad_emit_area.h"

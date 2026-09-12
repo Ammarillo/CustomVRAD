@@ -1,9 +1,9 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
-// Optional baked ambient occlusion (-ao / light_ao / light_ao_vol).
-// Cosine-hemisphere ambient obscurance (distance falloff to occluders).
-// Under -pathtrace with GI, post-multiply is skipped (PT already occludes)
-// unless -ao_force.
+// Ambient occlusion (-ao / light_ao / light_ao_vol).
+// Cosine-hemisphere rays with distance falloff.
+// Under -pathtrace with GI this multiply is skipped (the path tracer already
+// sees occlusion) unless -ao_force.
 //
 //=============================================================================//
 

@@ -1,17 +1,17 @@
-# Builds vrad_dll.dll (Release x64) safely.
+# Build vrad.exe + vrad_dll.dll (Release x64).
 #
-# Why this script exists: an interrupted/partial MSBuild once linked stale object
-# files against new headers (struct layout mismatch) and produced a vrad_dll.dll
-# that corrupted memory and crashed mid-bake. This script prevents that class of
-# failure by:
-#   1. Defaulting to a FULL rebuild (/t:Rebuild) so no stale .obj can be linked.
-#   2. Picking an MSBuild whose VS instance actually has the v143 C++ toolset.
-#   3. Verifying afterwards that bin\vrad_dll.dll (and the game copy) really got
-#      written by this build - a "successful" build with a missing/old DLL fails.
+# A half-finished MSBuild once linked old .obj files against new headers and the
+# DLL crashed mid-bake. This script avoids that by:
+#   1. Doing a full rebuild by default (/t:Rebuild) so leftover .obj files cannot
+#      be linked.
+#   2. Picking an MSBuild whose Visual Studio install actually has the v143 C++
+#      toolset.
+#   3. Checking that bin\vrad.exe and bin\vrad_dll.dll were written by this run.
+#      A "successful" build that left an old DLL behind still fails here.
 #
 # Usage:
-#   .\build.ps1                 full rebuild (recommended)
-#   .\build.ps1 -Incremental    fast incremental build (only for quick iteration)
+#   .\build.ps1                 full rebuild (use this)
+#   .\build.ps1 -Incremental    faster; only for local iteration
 
 param(
     [switch]$Incremental
@@ -19,8 +19,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$proj = Join-Path $root 'src\utils\vrad\vrad_dll_win64.vcxproj'
-if ( -not ( Test-Path $proj ) ) { throw "Project not found: $proj" }
+$projDll = Join-Path $root 'src\utils\vrad\vrad_dll_win64.vcxproj'
+$projExe = Join-Path $root 'src\utils\vrad_launcher\vrad_launcher_win64.vcxproj'
+if ( -not ( Test-Path $projDll ) ) { throw "Project not found: $projDll" }
+if ( -not ( Test-Path $projExe ) ) { throw "Project not found: $projExe" }
 
 # --- Locate an MSBuild backed by a real v143 C++ toolset -----------------------
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -51,11 +53,18 @@ if ( $Incremental ) { $target = 'Build' }
 Write-Host "Target:  $target (Release x64)"
 $buildStart = Get-Date
 
-& $msbuild $proj /t:$target /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
-if ( $LASTEXITCODE -ne 0 )
+function Invoke-VradMsBuild( [string]$project )
 {
-    throw "MSBuild failed with exit code $LASTEXITCODE - vrad_dll.dll was NOT updated. Do not run vrad until this is fixed."
+    Write-Host "Building $project"
+    & $msbuild $project /t:$target /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
+    if ( $LASTEXITCODE -ne 0 )
+    {
+        throw "MSBuild failed with exit code $LASTEXITCODE for $project. Do not run vrad until this is fixed."
+    }
 }
+
+Invoke-VradMsBuild $projDll
+Invoke-VradMsBuild $projExe
 
 # --- Verify outputs are present and fresh ---------------------------------------
 function Assert-FreshFile( [string]$path, [datetime]$notBefore, [bool]$required )
@@ -79,9 +88,10 @@ function Assert-FreshFile( [string]$path, [datetime]$notBefore, [bool]$required 
 $checkTime = $buildStart
 if ( $Incremental ) { $checkTime = [datetime]::MinValue }
 
+Assert-FreshFile ( Join-Path $root 'bin\vrad.exe' )                $checkTime $true
 Assert-FreshFile ( Join-Path $root 'bin\vrad_dll.dll' )            $checkTime $true
 Assert-FreshFile ( Join-Path $root 'game\bin\x64\vrad_dll.dll' )   $checkTime $false
 Assert-FreshFile ( Join-Path $root 'src\utils\vrad\Release\x64\vrad_dll.pdb' ) $checkTime $false
 
 Write-Host ''
-Write-Host 'Build OK - vrad_dll.dll is consistent and up to date.' -ForegroundColor Green
+Write-Host 'Build OK - vrad.exe and vrad_dll.dll are up to date.' -ForegroundColor Green

@@ -1,6 +1,6 @@
-//========= Copyright CustomVRAD contributors. ============//
-// IESNA LM-63 photometric profiles for light_spot (bake-only).
-// When set, replaces _inner_cone / _cone / _exponent angular falloff.
+//========= Copyright PathRAD contributors. ============//
+// IESNA LM-63 profiles for light_spot (bake only).
+// When set, replaces _inner_cone / _cone / _exponent.
 //=============================================================================//
 #ifndef VRAD_IES_PROFILE_H
 #define VRAD_IES_PROFILE_H

@@ -1,6 +1,6 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
-// Optional OpenCL acceleration for VRAD (-gpu).
+// OpenCL acceleration for classic VRAD bounce (-gpu).
 //
 //=============================================================================//
 

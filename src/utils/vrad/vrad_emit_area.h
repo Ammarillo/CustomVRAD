@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// Textured mesh area lights for $vrad_emit* (PBRT-style NEE).
+//========= Copyright PathRAD contributors. ============//
+// Area lights from $vrad_emit* faces (triangle mesh, PBRT-style sampling).
 //=============================================================================//
 #ifndef VRAD_EMIT_AREA_H
 #define VRAD_EMIT_AREA_H

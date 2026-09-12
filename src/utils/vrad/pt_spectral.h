@@ -1,13 +1,13 @@
-//========= Copyright CustomVRAD contributors. ============//
-// Hero-wavelength spectral transport helpers for pathtrace.
+//========= Copyright PathRAD contributors. ============//
+// Hero-wavelength helpers for path tracing.
 //
 // RGB->spectrum: Smits 1999 via PBRT-v3 tabulated basis (BSD).
 //   Matt Pharr, Greg Humphreys, Wenzel Jakob - pbrt-v3 spectrum.cpp
 // CIE XYZ CMFs: Wyman et al. analytic fit to CIE 1931 2 deg.
 // XYZ->linear sRGB: IEC 61966-2-1 / Rec.709 matrix (PBRT).
 //
-// Light addition and albedo multiply happen in lambda-space; result is
-// projected back through CIE XYZ -> linear RGB for lightmap storage.
+// Lights add and albedo multiplies in wavelength space; the result is
+// converted through CIE XYZ to linear RGB for the lightmap.
 //=============================================================================//
 #ifndef VRAD_PT_SPECTRAL_H
 #define VRAD_PT_SPECTRAL_H

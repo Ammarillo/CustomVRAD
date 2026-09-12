@@ -22,7 +22,7 @@
 #define RADIALDIST2	2 // (1.25*1.25+1.25*1.25)
 #define RADIALDIST	1.42 // 1.77 // sqrt( RADIALDIST2 )
 
-// CustomVRAD: scales bounce-only splat radius (softens patch GI seams). 1 = stock.
+// PathRAD: bounce splat radius (1 = stock). Larger = softer patch GI seams.
 extern float g_flBounceRadialScale;
 // Opt-in coplanar neighbor weld (-bounce_weld). Default off = stock bleed.
 extern bool g_bBounceWeld;
@@ -75,9 +75,10 @@ void FreeRadial( radial_t *rad );
 bool SampleRadial( radial_t *rad, Vector& pnt, Vector light[NUM_BUMP_VECTS + 1], int bumpSampleCount );
 radial_t *BuildPatchRadial( int facenum );
 
-// CustomVRAD: post-FinalLightFace pass that blends luxels along shared edges
-// of coplanar faces so VBSP face splits don't show a brightness step.
-void StitchLightmapSeams();
+// PathRAD: after FinalLightFace, blend luxels along shared edges of
+// coplanar faces so VBSP splits don't show a brightness step.
+// bPathTraceNarrow: tighter blend (path-trace soft shadows without blotching).
+void StitchLightmapSeams( bool bPathTraceNarrow = false );
 
 // utilities
 bool FloatLess( float const& src1, float const& src2 );

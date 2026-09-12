@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// IESNA LM-63-1995 / 2002 photometric profile loader + sampler.
+//========= Copyright PathRAD contributors. ============//
+// Load and sample IESNA LM-63 / 2002 photometric files.
 //=============================================================================//
 
 #include "ies_profile.h"

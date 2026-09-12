@@ -1,0 +1,4 @@
+-- Old helper. Fog ConVars now live in the BSP on two lua_run entities.
+-- After a rebake, use the console:
+--   cvf_de / cvf_ns / cvf_cov / cvf_wspd / cvf_wyaw / cvf_bd
+-- Do not install this file.

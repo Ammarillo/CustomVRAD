@@ -1,4 +1,4 @@
-//========= Copyright CustomVRAD contributors. ============//
+//========= Copyright PathRAD contributors. ============//
 // Intel Open Image Denoise (OIDN) RTLightmap for path-traced luxels.
 //=============================================================================//
 #ifndef PATHTRACE_OIDN_H

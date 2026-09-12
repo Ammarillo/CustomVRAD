@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// Per-texel $basetexture sampling for textured radiosity bounce (-texbounce).
+//========= Copyright PathRAD contributors. ============//
+// Sample $basetexture albedo per texel for -texbounce.
 //=============================================================================//
 #ifndef BOUNCE_ALBEDO_H
 #define BOUNCE_ALBEDO_H

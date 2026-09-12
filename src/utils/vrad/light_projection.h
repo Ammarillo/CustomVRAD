@@ -1,6 +1,6 @@
-//========= Copyright CustomVRAD contributors. ============//
-// light_spot ProjectedTexture - 2D planar (fit to outer cone) or cubemap envmap.
-// Auto-detect from VTF; bake-only. IES (if set) is an angular mask on top.
+//========= Copyright PathRAD contributors. ============//
+// light_spot ProjectedTexture: 2D cookie (fit to outer cone) or cubemap.
+// Detected from the VTF. Bake only. IES, if set, is an angular mask on top.
 //=============================================================================//
 #ifndef VRAD_LIGHT_PROJECTION_H
 #define VRAD_LIGHT_PROJECTION_H

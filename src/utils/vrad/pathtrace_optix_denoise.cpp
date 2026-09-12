@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// NVIDIA OptiX AI HDR denoise for path-traced luxels.
+//========= Copyright PathRAD contributors. ============//
+// NVIDIA OptiX HDR denoise for path-traced luxels.
 //=============================================================================//
 
 #include "pathtrace_optix_denoise.h"

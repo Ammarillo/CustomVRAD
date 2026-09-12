@@ -394,6 +394,7 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClCompile Include="vrad_emit_area.cpp" />
     <ClCompile Include="vrad_filter.cpp" />
     <ClCompile Include="absorb.cpp" />
+    <ClCompile Include="bake_volume.cpp" />
     <ClCompile Include="water_medium.cpp" />
     <ClCompile Include="fog_volume.cpp" />
     <ClCompile Include="pt_spectral_hlsl.cpp" />

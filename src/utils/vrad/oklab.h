@@ -1,9 +1,7 @@
-//========= Copyright CustomVRAD contributors. ============//
-// Oklab - Bjoern Ottosson (2020), public domain / MIT.
-// https://bottosson.github.io/posts/oklab/
-//
-// Perceptual color ops for CustomVRAD (filters, bounce chroma, env tint).
-// Energy transport (albedoxlight, NEE) stays linear RGB.
+//========= Copyright PathRAD contributors. ============//
+// Oklab (Björn Ottosson, 2020). https://bottosson.github.io/posts/oklab/
+// Used for filters, bounce chroma, and env tint.
+// Light energy (albedo * light) stays linear RGB.
 //=============================================================================//
 #ifndef VRAD_OKLAB_H
 #define VRAD_OKLAB_H

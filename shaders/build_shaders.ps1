@@ -1,11 +1,11 @@
-# CustomVRAD shaders (fog_volume)
+# PathRAD fog_volume shaders
 #
 # Compile HLSL to GMod .vcs via SCell555 ShaderCompile:
 #   https://github.com/SCell555/ShaderCompile
 #
 # Output in shaders/fxc/:
-#   cvrad_fog_ps30.vcs / cvrad_fog_vs30.vcs
-# VRAD packs these into the BSP when fog_volume entities are present.
+#   pathrad_fog_ps30.vcs
+#   pathrad_fog_vs30.vcs
 
 param(
     [string]$ShaderCompile = "",
@@ -51,8 +51,8 @@ Write-Host "Using: $compiler"
 Write-Host "Output: $OutDir"
 
 $shaders = @(
-    "cvrad_fog_vs30.hlsl",
-    "cvrad_fog_ps30.hlsl"
+    "pathrad_fog_vs30.hlsl",
+    "pathrad_fog_ps30.hlsl"
 )
 
 Push-Location $Root
@@ -76,7 +76,8 @@ if (Test-Path $nested) {
 }
 
 foreach ($name in @(
-    "cvrad_fog_vs30.vcs", "cvrad_fog_ps30.vcs"
+    "pathrad_fog_vs30.vcs",
+    "pathrad_fog_ps30.vcs"
 )) {
     $path = Join-Path $OutDir $name
     if (-not (Test-Path $path)) { throw "Missing output: $path" }

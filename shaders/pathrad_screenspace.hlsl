@@ -1,53 +1,26 @@
-// CustomVRAD volumetric fog — pixel shader (ps_3_0)
-// s0 = $basetexture (light-grid atlas), s1 = $texture1 (depth)
-// s2 = $texture2 (baked tileable 3D noise atlas, 32^3 Z-sliced)
-//
-// Soft edges follow Lengyel, "Unified Distance Formulas for Halfspace Fog"
-// (JGT 2007 §4): density is 0 on the volume face and rises with distance into
-// the fog. Constant density at the boundary produces a hard silhouette even
-// with a wide BlendDistance, because Beer-Lambert saturates through the shell
-// (τ ≈ density * BlendDistance / 2 >> 1). We use a quadratic Lengyel profile
-// and keep the shell optically soft for any Density.
-//
-// Brush shape: VRAD bakes convex plane SDF into light-grid alpha (supports
-// vertex-edited / clipped brushes, not only AABB cubes). Decode range must
-// match kFogSdfRange in fog_volume.cpp.
-//
-// c1 = mins.xyz, maxs.z
-// c2 = maxs.xy, NoiseScale (full float), CurTime()*WindSpeed (full float)
-// c3 = forward * tan(horizFov/2), packFloat
-// c3.w pack (integer, float-safe < 2^24):
-//   bits  0..2  log2(nz)-2
-//   bits  3..4  blendMode (0 Inside, 1 Outside, 2 Center)
-//   bits  5..8  NoiseCoverage (0..15 → /15)
-//   bits  9..11 WindYaw/45° (0..7)
-//   bits 12..22 BlendDistance (0..2047 world units)
-// nx/ny from TexBaseSize (c4); nz from pack; aspect from Tex1Size (c5)
-// Wind is world-space: np = (p + windDir * c2.w) * c2.z
-// Noise UVW = frac(np / 32) into baked FBM atlas ($texture2)
-// Outer fade (Outside/Center): raymarch + light-grid UV use brush±BlendDistance
-// (VRAD bakes the grid over that expanded AABB so the shell has real samples).
+// PathRAD volumetric fog pixel shader (ps_3_0)
+// s0 = light-grid atlas, s1 = depth, s2 = noise atlas
 
 sampler LightGridSampler    : register( s0 );
-sampler DepthTextureSampler : register( s1 );
 sampler NoiseAtlasSampler   : register( s2 );
+sampler DepthTextureSampler : register( s1 );
 
 float4 c0 : register( c0 ); // xyz = EyePos, w = density
 float4 c1 : register( c1 ); // xyz = mins,   w = maxs.z
 float4 c2 : register( c2 ); // xy = maxs.xy, z = NoiseScale, w = CurTime()*WindSpeed
 float4 c3 : register( c3 ); // xyz = forward * thx, w = pack
 
-// screenspace_general: 1/width, 1/height of s0 / s1
 float2 TexBaseSize : register( c4 );
 float2 Tex1Size    : register( c5 );
-
-static const float kNoiseRes = 32.0;
-static const float kFogSdfRange = 1024.0;
 
 struct PS_INPUT
 {
 	float2 uv : TEXCOORD0;
 };
+
+
+static const float kNoiseRes = 32.0;
+static const float kFogSdfRange = 1024.0;
 
 float2 RayBox( float3 ro, float3 rd, float3 bmin, float3 bmax )
 {
@@ -61,22 +34,15 @@ float2 RayBox( float3 ro, float3 rd, float3 bmin, float3 bmax )
 	return float2( tEnter, tExit );
 }
 
-// Map 0..1 ramp parameter to a Lengyel-style density scale.
-// u=0 at the unfogged side of the blend, u=1 at full density.
-// Quadratic (u^2) → zero derivative at the face (IQ soft boundary) and
-// optical depth through the shell is density*BlendDistance/3 instead of /2.
-// edgeKeep caps shell optical depth so high Density cannot hard-clip the fade.
 float LengyelDensityScale( float u, float density, float blendDist )
 {
 	u = saturate( u );
 	float shape = u * u;
 	float shellTau = density * max( blendDist, 1.0 ) * ( 1.0 / 3.0 );
 	float edgeKeep = min( 1.0, 1.25 / max( shellTau, 1e-3 ) );
-	// Rise from soft edge toward full Density; continuous at u=1.
 	return shape * lerp( edgeKeep, 1.0, u );
 }
 
-// dist: signed distance from atlas (>0 inside brush, <0 outside).
 float FogDensityAtDist( float dist, float density, float blendDist, float blendMode )
 {
 	if ( blendDist <= 1e-3 )
@@ -85,21 +51,18 @@ float FogDensityAtDist( float dist, float density, float blendDist, float blendM
 	float u;
 	if ( blendMode < 0.5 )
 	{
-		// Inside: 0 on face, 1 at BlendDistance inward (Lengyel halfspace).
 		if ( dist <= 0.0 )
 			return 0.0;
 		u = dist / blendDist;
 	}
 	else if ( blendMode < 1.5 )
 	{
-		// Outside: full inside, 0 at BlendDistance outward.
 		if ( dist >= 0.0 )
 			return 1.0;
 		u = 1.0 + dist / blendDist;
 	}
 	else
 	{
-		// Center: fade straddles face (BlendDistance each side).
 		u = ( dist + blendDist ) / ( 2.0 * blendDist );
 	}
 
@@ -111,13 +74,11 @@ float Lum3( float3 c )
 	return dot( c, float3( 0.2126, 0.7152, 0.0722 ) );
 }
 
-// Wrap index into [0, n).
 float WrapIndex( float i, float n )
 {
 	return i - n * floor( i / n );
 }
 
-// Point-sample baked noise cell (32^3 atlas, Z-sliced like the light grid).
 float FetchNoiseCell( float ix, float iy, float iz )
 {
 	ix = WrapIndex( ix, kNoiseRes );
@@ -130,7 +91,6 @@ float FetchNoiseCell( float ix, float iy, float iz )
 	return tex2Dlod( NoiseAtlasSampler, float4( uv, 0, 0 ) ).r;
 }
 
-// Trilinear sample of tileable noise. uvw in [0,1) over one 32^3 period.
 float SampleNoiseAtlas( float3 uvw )
 {
 	uvw = frac( uvw );
@@ -159,7 +119,6 @@ float SampleNoiseAtlas( float3 uvw )
 	return lerp( nxy0, nxy1, tz );
 }
 
-// Point-sample one grid cell (integer indices). rgb = lighting, a = encoded SDF.
 float4 FetchLightCell( float ix, float iy, float iz, float nx, float ny, float nz )
 {
 	ix = clamp( ix, 0.0, max( nx - 1.0, 0.0 ) );
@@ -172,9 +131,6 @@ float4 FetchLightCell( float ix, float iy, float iz, float nx, float ny, float n
 	return tex2Dlod( LightGridSampler, float4( uv, 0, 0 ) );
 }
 
-// Trilinear light-grid sample that down-weights near-black cells (wall /
-// solid holes) so fog does not go black when interpolating near geometry.
-// .a = encoded brush SDF (+ blockers); decode with kFogSdfRange.
 float4 SampleLightGrid( float3 p, float3 bmin, float3 bmax, float nx, float ny, float nz )
 {
 	float3 ext = max( bmax - bmin, float3( 1e-3, 1e-3, 1e-3 ) );
@@ -210,7 +166,6 @@ float4 SampleLightGrid( float3 p, float3 bmin, float3 bmax, float nx, float ny, 
 	float w011 = ( 1.0 - tx ) * ty * tz;
 	float w111 = tx * ty * tz;
 
-	// Fog allow / SDF is always trilinear (blockers + brush shape).
 	float allow = c000.a * w000 + c100.a * w100 + c010.a * w010 + c110.a * w110
 				+ c001.a * w001 + c101.a * w101 + c011.a * w011 + c111.a * w111;
 
@@ -246,7 +201,7 @@ float4 SampleLightGrid( float3 p, float3 bmin, float3 bmax, float nx, float ny, 
 	return float4( lighting, allow );
 }
 
-float4 main( PS_INPUT i ) : COLOR
+float4 FogOutput( PS_INPUT i )
 {
 	float density = max( c0.w, 0.0 );
 	if ( density <= 1e-6 )
@@ -256,7 +211,7 @@ float4 main( PS_INPUT i ) : COLOR
 	float3 bmin = c1.xyz;
 	float3 bmax = float3( c2.xy, c1.w );
 	float noiseScale = max( c2.z, 0.0 );
-	float windPhase = c2.w; // CurTime() * WindSpeed
+	float windPhase = c2.w;
 
 	float thx = max( length( c3.xyz ), 1e-4 );
 	float3 forward = c3.xyz / thx;
@@ -272,7 +227,7 @@ float4 main( PS_INPUT i ) : COLOR
 	float coverage = fmod( floor( pack / 32.0 ), 16.0 ) / 15.0;
 	float windYawQ = fmod( floor( pack / 512.0 ), 8.0 );
 	float blendDist = fmod( floor( pack / 4096.0 ), 2048.0 );
-	float windYaw = windYawQ * 0.78539816; // 45 deg
+	float windYaw = windYawQ * 0.78539816;
 
 	float nz = exp2( lognz + 2.0 );
 	float atlasW = ( TexBaseSize.x > 1e-8 ) ? ( 1.0 / TexBaseSize.x ) : 4.0;
@@ -322,7 +277,6 @@ float4 main( PS_INPUT i ) : COLOR
 		float3 p = eye + rd * t;
 
 		float4 grid = SampleLightGrid( p, bminR, bmaxR, nx, ny, nz );
-		// Atlas alpha = encoded convex-brush SDF (VRAD); supports cut/vertex-edited volumes.
 		float brushDist = ( grid.a * 2.0 - 1.0 ) * kFogSdfRange;
 		float densScale = FogDensityAtDist( brushDist, density, blendDist, blendMode );
 		float contact = saturate( ( sceneDist - t ) / 24.0 );
@@ -330,7 +284,6 @@ float4 main( PS_INPUT i ) : COLOR
 
 		if ( noiseScale > 1e-8 && densScale > 1e-5 )
 		{
-			// World-space wind; baked 32^3 FBM tiles via frac(np/32).
 			float3 np = ( p + windDir * windPhase ) * noiseScale;
 			float n = SampleNoiseAtlas( np / kNoiseRes );
 			float cover = saturate( ( n - ( 1.0 - coverage ) ) / max( coverage, 1e-3 ) );
@@ -342,7 +295,6 @@ float4 main( PS_INPUT i ) : COLOR
 
 		float3 lighting = grid.rgb * 1.5;
 
-		// Beer-Lambert with local Lengyel density.
 		float optical = density * densScale * dt;
 		float absorb = 1.0 - exp( -optical );
 		scatter += transmittance * absorb * lighting;
@@ -353,4 +305,9 @@ float4 main( PS_INPUT i ) : COLOR
 
 	float alpha = saturate( 1.0 - transmittance );
 	return float4( scatter, alpha );
+}
+
+float4 main( PS_INPUT i ) : COLOR
+{
+	return FogOutput( i );
 }

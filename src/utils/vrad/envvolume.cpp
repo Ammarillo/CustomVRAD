@@ -1,6 +1,6 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
-// light_environment_volume: AABB volumes with blended sky/ambient weights.
+// light_env_vol: box volumes with faded sky/ambient weights.
 //
 //=============================================================================//
 

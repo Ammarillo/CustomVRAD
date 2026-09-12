@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// Per-texel $basetexture sampling for textured radiosity bounce (-texbounce).
+//========= Copyright PathRAD contributors. ============//
+// Sample $basetexture albedo per texel for -texbounce.
 //=============================================================================//
 
 #include "bounce_albedo.h"
@@ -498,8 +498,8 @@ bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLi
 		return false;
 
 	const unsigned char *p = &pTex->rgba[nOff];
-	// IEC 61966-2-1 sRGB -> linear (PBRT ColorEncoding::sRGB). Albedo must be linear
-	// reflectance for physically based bounce; using encoded bytes as-is over-brightens GI.
+	// sRGB bytes -> linear (IEC 61966-2-1 / PBRT). Bounce albedo has to be linear
+	// or GI comes out too bright.
 	outLinearRGB.x = SrgbByteToLinear( p[0] );
 	outLinearRGB.y = SrgbByteToLinear( p[1] );
 	outLinearRGB.z = SrgbByteToLinear( p[2] );

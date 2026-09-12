@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// VMT-driven colored light transmission through thin-sheet glass.
+//========= Copyright PathRAD contributors. ============//
+// Colored light through thin glass ($vrad_filter*). Path tracing only.
 //=============================================================================//
 #ifndef VRAD_FILTER_H
 #define VRAD_FILTER_H
@@ -9,7 +9,7 @@
 #include <vector>
 #include <stdint.h>
 
-// VMT keys (CustomVRAD):
+// VMT keys (PathRAD):
 //   $vrad_filter            "1"            - enable colored transmission
 //   $vrad_filtermap         "path/to/tex"  - optional RGB filter map (else $basetexture)
 //   $vrad_filterstrength    "1"            - 0 = no tint, 1 = full texture tint

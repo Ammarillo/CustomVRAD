@@ -1,6 +1,6 @@
-//========= Copyright CustomVRAD, All rights reserved. ============//
+//========= Copyright PathRAD, All rights reserved. ============//
 //
-// fog_volume - bake 3D light grids + rewrite to lua_run_on_client.
+// fog_volume - bake a 3D light grid and rewrite the entity to lua_run.
 //
 //=============================================================================//
 

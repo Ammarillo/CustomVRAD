@@ -1,7 +1,6 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
-// Optional baked ambient occlusion for CustomVRAD.
-// CLI (-ao*) and/or map entities: light_ao (global) + light_ao_vol (volumes).
+// Baked ambient occlusion (-ao / light_ao / light_ao_vol).
 //
 //=============================================================================//
 

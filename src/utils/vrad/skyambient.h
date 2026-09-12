@@ -1,7 +1,7 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
-// Shared sky ambient evaluation for lightmaps, props, and leaf cubes.
-// Flat _ambient with light_env_vol blend.
+// Shared sky ambient for lightmaps, props, and leaf cubes.
+// Flat _ambient, blended with light_env_vol.
 //
 //=============================================================================//
 

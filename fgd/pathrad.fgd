@@ -1,20 +1,31 @@
 // =============================================================================
-// CustomVRAD - all compile-time entities in one FGD
+// PathRAD Hammer entities (volumes, IES, fog, extra light keys).
 // =============================================================================
-// Hammer: Tools -> Options -> Game Configurations -> Game Data Files
-// Add this file AFTER your main game FGD (e.g. garrysmod.fgd), then restart Hammer.
-// Path: G:\dev\RND\CustomVRAD\fgd\customvrad.fgd
+// Tools -> Options -> Game Configurations -> Game Data Files
+// Add this AFTER garrysmod.fgd (or your game FGD), then restart Hammer.
 // =============================================================================
 
 // -----------------------------------------------------------------------------
 // light_env_vol - sky/sun override volume (brush)
 // Place like a trigger (tools/toolstrigger or nodraw).
-// Legacy classname "light_environment_volume" is still accepted by VRAD.
+// Old classname light_environment_volume still works.
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname, Angles) color(255 255 0) = light_env_vol :
-	"Compile-time sky/sun override volume for CustomVRAD. " +
-	"Uses the same lighting keys as light_environment. " +
-	"Outside the volume (and in the blend shell) lighting mixes with the map light_environment."
+	"Bake-only sky/sun override volume. " +
+	"Same lighting keys as light_environment. " +
+	"Outside the brush (and in the fade) lighting mixes with the map light_environment.\n" +
+	"\n" +
+	"LightTemperature / AmbientTemperature (K), 0 = use RGB.\n" +
+	"Typical sun:\n" +
+	"- 3500  golden hour\n" +
+	"- 5600  noon\n" +
+	"- 6500  overcast\n" +
+	"Typical ambient (usually cooler):\n" +
+	"- 7500  shade\n" +
+	"- 10000  blue sky\n" +
+	"Examples:\n" +
+	"- indoor volume  3000 sun / 4000 ambient\n" +
+	"- outdoor        5600 sun / 8000 ambient"
 [
 	_light(color255) : "Brightness and Color" : "255 255 255 200" : "The sunlight color. Last number is the brightness."
 	_ambient(color255) : "Ambient Color and Brightness" : "255 255 255 20" : "Ambient color in shadows. Last number is the brightness."
@@ -52,6 +63,33 @@
 		0 : "No"
 		1 : "Yes"
 	]
+	LightTemperature(float) : "Color Temperature (K)" : "0" : "Optional blackbody CCT for sun Brightness (_light). 0 = keep RGB. When set, RGB is replaced; brightness (4th number) is kept.\n" +
+		"\n" +
+		"Typical values:\n" +
+		"- 3500  golden hour\n" +
+		"- 4500  late afternoon\n" +
+		"- 5600  noon daylight\n" +
+		"- 6500  overcast\n" +
+		"- 8000  high / blue sky\n" +
+		"\n" +
+		"Examples:\n" +
+		"- 5600  outdoor noon\n" +
+		"- 3500  sunset\n" +
+		"- 3000  indoor volume (warm skylight)\n" +
+		"- 6500  overcast day"
+	AmbientTemperature(float) : "Ambient Temperature (K)" : "0" : "Optional blackbody CCT for Ambient (_ambient). 0 = keep RGB. Same Kelvin scale as Color Temperature. Sky fill is usually cooler than the sun.\n" +
+		"\n" +
+		"Typical values:\n" +
+		"- 4000   indoor bounce\n" +
+		"- 6500   overcast fill\n" +
+		"- 7500   open shade\n" +
+		"- 10000  clear blue sky\n" +
+		"- 20000  twilight\n" +
+		"\n" +
+		"Examples:\n" +
+		"- 5600 sun + 8000 ambient   noon\n" +
+		"- 6500 sun + 7500 ambient   overcast\n" +
+		"- 3000 sun + 4000 ambient   interior volume"
 ]
 
 // -----------------------------------------------------------------------------
@@ -59,9 +97,9 @@
 // Optional. Without this, use CLI -ao / -ao_* or only light_ao_vol volumes.
 // -----------------------------------------------------------------------------
 @PointClass base(Targetname) color(180 200 255) size(-8 -8 -8, 8 8 8) = light_ao :
-	"Compile-time ambient occlusion defaults for CustomVRAD. " +
-	"POINT entity: place with the Entity Tool (not Tie to Entity on a brush). " +
-	"Toggle and set Samples / Distance / Strength / Bias for the whole map. " +
+	"Map-wide ambient occlusion defaults for PathRAD. " +
+	"Place with the Entity Tool (not Tie to Entity on a brush). " +
+	"Sets Samples / Distance / Strength / Bias for the whole map. " +
 	"Override locally with light_ao_vol brushes."
 [
 	Enabled(choices) : "Enabled" : 1 : "Master switch for map-wide AO. Volumes can still enable AO inside their bounds when this is No." =
@@ -87,9 +125,9 @@
 // Place like a trigger (tools/toolstrigger or nodraw).
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname) color(180 200 255) = light_ao_vol :
-	"Compile-time ambient occlusion override volume for CustomVRAD. " +
-	"Uses the same AO keys as light_ao. " +
-	"Outside the volume (and in the blend shell) settings mix with light_ao / CLI defaults."
+	"Ambient occlusion override volume. " +
+	"Same AO keys as light_ao. " +
+	"Outside the brush (and in the fade) settings mix with light_ao / command-line defaults."
 [
 	Enabled(choices) : "Enabled" : 1 : "AO inside this volume. Set No to carve out a region with no AO when the map default is on." =
 	[
@@ -115,8 +153,8 @@
 // Place like a trigger (tools/toolstrigger or nodraw).
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname) color(120 80 160) = light_absorb :
-	"Compile-time light absorber volume for CustomVRAD. " +
-	"Damps bounce (and optionally direct) lighting inside the volume. Soft blend like light_env_vol."
+	"Absorbs bounce (and optionally direct) lighting inside this brush. " +
+	"Soft fade works the same way as light_env_vol."
 [
 	Strength(float) : "Strength" : "0.5" : "How much light to absorb (0 = none, 1 = full). Soft-blended by Blend Distance."
 	AbsorbDirect(choices) : "Absorb Direct" : 0 : "Also damp direct lights (sun/point/spot) at sample positions." =
@@ -144,10 +182,9 @@
 // Place like a trigger (tools/toolstrigger or nodraw).
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname) color(255 160 80) = light_bounce_vol :
-	"Compile-time radiosity override volume for CustomVRAD. " +
-	"Overrides artistic bounce controls (bounce boost / bounce chroma / energy mode) inside the brush. " +
-	"Outside (and in the blend shell) settings mix with CLI -bounce_boost / -bounce_chroma / -energy. " +
-	"Use with -texbounce for colored floor bleed tests."
+	"Local bounce boost / chroma / energy inside this brush. " +
+	"Outside (and in the fade) settings mix with -bounce_boost / -bounce_chroma / -energy. " +
+	"Use with -texbounce if you want colored bounce."
 [
 	BounceBoost(float) : "Bounce Boost" : "-1" : "Artistic bounce brightness scale inside this volume (0..16). -1 = use CLI -bounce_boost (default 1)."
 	BounceChroma(float) : "Bounce Chroma" : "-1" : "Early-bounce saturation boost inside this volume (0..8). -1 = use CLI -bounce_chroma (default 0). Strongest on first bounce."
@@ -168,20 +205,148 @@
 ]
 
 // -----------------------------------------------------------------------------
-// light_spot - stock spot + optional IES photometric profile (CustomVRAD)
+// bake_volume - local rebake region (brush)
+// Place like a trigger (tools/toolstrigger or nodraw).
+// -----------------------------------------------------------------------------
+@SolidClass base(Targetname) color(80 220 140) = bake_volume :
+	"Only rebake lighting samples (luxels / prop verts) whose world position is inside this brush. " +
+	"A face or prop that sticks out keeps cached lighting on the part outside. " +
+	"Geometry outside still shadows and bounces in; it is not itself recalculated. " +
+	"Lighting outside comes from the previous compile (mapsrc/<map>.vradlm). " +
+	"Full-bake the map once, then add volumes for local updates. " +
+	"Ignore all bake_volume entities with VRAD -nobakevolume."
+[
+	Enabled(choices) : "Enabled" : 1 : "Disable to ignore this volume (full-map bake if every volume is off)." =
+	[
+		0 : "No"
+		1 : "Yes"
+	]
+	Rebake(choices) : "Rebake" : 0 : "What to recompute inside this volume." =
+	[
+		0 : "Both (lightmaps + props)"
+		1 : "Lightmaps only"
+		2 : "Props only"
+	]
+	Padding(float) : "Touch Padding" : "8" : "World units to expand the brush AABB when testing sample/vertex positions (catches surfaces sitting on the boundary)."
+]
+
+// -----------------------------------------------------------------------------
+// light / light_environment - stock entities + optional Kelvin CCT (PathRAD)
+// Replaces the stock definitions when this FGD is loaded after the game FGD.
+// LightTemperature 0 = use Brightness RGB. When set, RGB is replaced; 4th number kept.
+// -----------------------------------------------------------------------------
+@PointClass base(Targetname, Light) iconsprite("editor/light.vmt") sphere(_fifty_percent_distance) sphere(_zero_percent_distance) = light :
+	"An invisible omnidirectional light source.\n" +
+	"PathRAD LightTemperature (K): 0 = use Brightness RGB.\n" +
+	"\n" +
+	"Typical values:\n" +
+	"- 1800  candle / fire\n" +
+	"- 2700  incandescent\n" +
+	"- 3000  warm LED\n" +
+	"- 4000  cool white\n" +
+	"\n" +
+	"Examples:\n" +
+	"- 2700  room lamps\n" +
+	"- 1800  candles / fire\n" +
+	"- 4000  office / workshop\n" +
+	"- 0     custom RGB (neon, coloured LED)"
+[
+	LightTemperature(float) : "Color Temperature (K)" : "0" : "Optional blackbody CCT in Kelvin. 0 = keep Brightness RGB. When set, RGB is replaced; brightness (4th number) is kept. Also tints the exported engine worldlight.\n" +
+		"\n" +
+		"Typical values:\n" +
+		"- 1800  candle / fire\n" +
+		"- 2200  vintage filament\n" +
+		"- 2700  incandescent\n" +
+		"- 3000  halogen / warm LED\n" +
+		"- 3500  neutral white\n" +
+		"- 4000  cool white / fluorescent\n" +
+		"- 5000  noon-ish\n" +
+		"- 5600  daylight / flash\n" +
+		"- 6500  overcast\n" +
+		"\n" +
+		"Examples:\n" +
+		"- 2700  living-room lamps\n" +
+		"- 3000  museum / shop bulbs\n" +
+		"- 4000  office / workshop\n" +
+		"- 1800  candles\n" +
+		"- 0     non-blackbody colour (neon, RGB LED)"
+]
+
+@PointClass base(Targetname, Angles) iconsprite("editor/light_env.vmt") = light_environment :
+	"Special light used for lighting the entire map from the sky.\n" +
+	"PathRAD LightTemperature / AmbientTemperature (K), 0 = use RGB.\n" +
+	"\n" +
+	"Typical sun:\n" +
+	"- 3500  golden hour\n" +
+	"- 5600  noon\n" +
+	"- 6500  overcast\n" +
+	"Typical ambient (usually cooler):\n" +
+	"- 7500  shade\n" +
+	"- 10000  blue sky\n" +
+	"Example:\n" +
+	"- noon  5600 sun / 8000 ambient"
+[
+	pitch(integer) : "Pitch" : 0 : "The downward pitch of the light from the sun. 0 is horizontal, -90 is straight down."
+	_light(color255) : "Brightness" : "255 255 255 200" : "Sun color. Last number is brightness."
+	_ambient(color255) : "Ambient" : "255 255 255 20" : "Ambient color in shadows. Last number is brightness."
+	_lightHDR(color255) : "Brightness HDR" : "-1 -1 -1 1" : "Leave as '-1 -1 -1 1' to use the SDR values."
+	_ambientHDR(color255) : "Ambient HDR" : "-1 -1 -1 1" : "Leave as '-1 -1 -1 1' to use the SDR values."
+	_lightscaleHDR(float) : "Brightness Scale HDR" : "1" : "Amount to scale the light by when compiling for HDR."
+	_AmbientScaleHDR(float) : "Ambient Scale HDR" : "1" : "Amount to scale the ambient light by when compiling for HDR."
+	SunSpreadAngle(float) : "SunSpreadAngle" : 0 : "Angular extent of the sun for casting soft shadows (degrees). 0 = hard."
+	LightTemperature(float) : "Color Temperature (K)" : "0" : "Optional blackbody CCT for sun Brightness (_light). 0 = keep RGB. When set, RGB is replaced; brightness (4th number) is kept.\n" +
+		"\n" +
+		"Typical values:\n" +
+		"- 3500  golden hour\n" +
+		"- 4500  late afternoon\n" +
+		"- 5600  noon daylight\n" +
+		"- 6500  overcast\n" +
+		"- 8000  high / blue sky\n" +
+		"\n" +
+		"Examples:\n" +
+		"- 5600  outdoor noon\n" +
+		"- 3500  sunset\n" +
+		"- 6500  overcast day"
+	AmbientTemperature(float) : "Ambient Temperature (K)" : "0" : "Optional blackbody CCT for Ambient (_ambient). 0 = keep RGB. Same Kelvin scale as Color Temperature. Sky fill is usually cooler than the sun.\n" +
+		"\n" +
+		"Typical values:\n" +
+		"- 4000   indoor bounce\n" +
+		"- 6500   overcast fill\n" +
+		"- 7500   open shade\n" +
+		"- 10000  clear blue sky\n" +
+		"- 20000  twilight\n" +
+		"\n" +
+		"Examples:\n" +
+		"- 5600 sun + 8000 ambient   noon\n" +
+		"- 6500 sun + 7500 ambient   overcast\n" +
+		"- 8000 sun + 12000 ambient  night"
+]
+
+// -----------------------------------------------------------------------------
+// light_spot - stock spot + optional IES photometric profile (PathRAD)
 // Replaces the stock light_spot definition when this FGD is loaded after the game FGD.
 // Keep stock lightprop/lightcone helpers (iconsprite draws a white billboard plane).
 // IES is bake-only (not exported to engine worldlights). When IES is set, VRAD ignores
 // _inner_cone / _cone / _exponent for the lightmap bake.
 // -----------------------------------------------------------------------------
 @PointClass base(Targetname, Angles, Light) lightprop("models/editor/spot.mdl") lightcone() line(255 220 50, targetname, target) sphere(_fifty_percent_distance) sphere(_zero_percent_distance) = light_spot :
-	"Spot light. CustomVRAD: set IES to an .ies photometric file to drive the beam shape. " +
+	"Spot light. PathRAD: set IES to an .ies photometric file to drive the beam shape. " +
 	"When IES is set, Inner/Outer cone and Focus are ignored for the bake (engine dynamic lighting still uses cones). " +
 	"Use IESBrightness for bake intensity (leave Brightness at 0 to disable engine dynamic light). " +
 	"ProjectedTexture: materials/ path to a planar VTF (framed to the outer cone) or cubemap / spherical envmap VTF; auto-detected. " +
 	"If both IES and ProjectedTexture are set, IES acts as an angular mask on the projection. " +
 	"Editor: thin frustum = forward beam; yellow line appears when Target is set. " +
-	"Asymmetric IES/projection: rotate Yaw (or Roll) to spin around the beam."
+	"Asymmetric IES/projection: rotate Yaw (or Roll) to spin around the beam.\n" +
+	"\n" +
+	"LightTemperature (K): 0 = use Brightness RGB.\n" +
+	"Typical values:\n" +
+	"- 2700  incandescent\n" +
+	"- 3000  halogen / warm LED\n" +
+	"- 4000  cool white\n" +
+	"Examples:\n" +
+	"- 3000  museum / shop spots\n" +
+	"- 2700  interior downlights\n" +
+	"- 4000  workshop floods"
 [
 	target(target_destination) : "Entity to point at" : : "The name of an entity in the map that the spotlight will point at. This will override the spotlight's angles."
 	_inner_cone(integer) : "Inner (bright) angle (ignored if IES set)" : 30 : "Inner spotlight cone degrees. Ignored for bake when IES is set."
@@ -200,20 +365,34 @@
 		"fill" : "Fill - square sides touch the cone (corners clipped)"
 		"fit" : "Fit - whole square inside the cone (corners visible)"
 	]
+	LightTemperature(float) : "Color Temperature (K)" : "0" : "Optional blackbody CCT in Kelvin. 0 = keep Brightness RGB. When set, RGB is replaced; brightness (4th number) is kept. Also tints the exported engine worldlight.\n" +
+		"\n" +
+		"Typical values:\n" +
+		"- 1800  candle / fire\n" +
+		"- 2200  vintage filament\n" +
+		"- 2700  incandescent\n" +
+		"- 3000  halogen / warm LED\n" +
+		"- 3500  neutral white\n" +
+		"- 4000  cool white / fluorescent\n" +
+		"- 5000  noon-ish\n" +
+		"- 5600  daylight / flash\n" +
+		"- 6500  overcast\n" +
+		"\n" +
+		"Examples:\n" +
+		"- 3000  museum / shop spots\n" +
+		"- 2700  interior downlights\n" +
+		"- 4000  workshop floods\n" +
+		"- 5600  daylight-balanced fixtures\n" +
+		"- 0     non-blackbody colour (neon, RGB LED)"
 ]
 
 // -----------------------------------------------------------------------------
-// fog_volume - volumetric fog volume (brush)
-// Place like a trigger (tools/toolstrigger or nodraw).
-// CustomVRAD bakes a 3D light grid into the BSP pak and rewrites this entity to
-// lua_run_on_client with a short stub that draws fullscreen fog (no addon).
+// fog_volume - bake a 3D light grid into the BSP, rewrite the entity to lua_run.
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname) color(140 180 220) = fog_volume :
-	"Volumetric fog volume for CustomVRAD + Garry's Mod. " +
-	"VRAD bakes a 3D light grid and packs shaders/materials into the BSP. " +
-	"At compile end the entity becomes lua_run_on_client (map-embedded, no addon) " +
-	"which draws a screenspace_general raymarch using the baked light volume. " +
-	"Brush is bounds-only (use tools/toolstrigger)."
+	"Volumetric fog. VRAD bakes a 3D light grid and packs shaders/materials into the BSP. " +
+	"At the end of compile this entity becomes two lua_run entities (setup + draw, no addon) " +
+	"that draw a screenspace raymarch using the baked grid. Brush is bounds only (tools/toolstrigger)."
 [
 	Enabled(choices) : "Enabled" : 1 : "Disable to skip bake for this volume (no fog material / lua)." =
 	[
@@ -250,9 +429,8 @@
 // Place like a trigger. Soft edge via BlendDistance. Compile-only (rewritten to info_null).
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname) color(220 100 80) = fog_volume_blocker :
-	"Blocks CustomVRAD volumetric fog inside this brush. " +
-	"Overlaps any fog_volume; fog density is carved out (baked into the light-grid atlas alpha). " +
-	"Use tools/toolstrigger. Removed at compile end (info_null)."
+	"Cuts fog out of overlapping fog_volume brushes (baked into the light-grid atlas alpha). " +
+	"Use tools/toolstrigger. Removed at compile end (becomes info_null)."
 [
 	Enabled(choices) : "Enabled" : 1 =
 	[
@@ -268,10 +446,9 @@
 // Requires -underwater or -uw_volume on the VRAD command line.
 // -----------------------------------------------------------------------------
 @SolidClass base(Targetname) color(40 120 180) = water_light_vol :
-	"CustomVRAD underwater lighting override. " +
-	"Overlaps BSP water (leafWaterData) and replaces / tweaks absorption & scattering used during bake. " +
+	"Override underwater absorption and scattering for overlapping BSP water. " +
 	"Water materials still supply $fogcolor / $fogend by default (UseVmt). " +
-	"Compile with -underwater (Beer-Lambert+Kd) or -uw_volume (homogeneous volume PT)."
+	"Needs VRAD -underwater or -uw_volume."
 [
 	Enabled(choices) : "Enabled" : 1 =
 	[
@@ -298,10 +475,37 @@
 // Requires garrysmod.fgd (or equivalent) loaded before this FGD.
 // -----------------------------------------------------------------------------
 @PointClass base(Targetname, Light) iconsprite("editor/light.vmt") sphere(_fifty_percent_distance) sphere(_zero_percent_distance) sphere(Radius) = light_volume :
-	"Compile-time soft volume point light for CustomVRAD. " +
-	"Same settings as a normal light, plus Radius. " +
-	"VRAD soft-samples the light origin inside a sphere (like soft sun, but omnidirectional) " +
-	"for soft shadows / penumbra. Exported to the engine as a normal point light at the center."
+	"Soft-sphere point light. Same settings as a normal light, plus Radius. " +
+	"VRAD samples the origin inside the sphere so shadows have a penumbra. " +
+	"The engine still gets a normal point light at the center.\n" +
+	"\n" +
+	"LightTemperature (K): 0 = use Brightness RGB.\n" +
+	"Typical values:\n" +
+	"- 1800  candle / fire\n" +
+	"- 2700  incandescent\n" +
+	"- 3000  warm LED\n" +
+	"- 4000  cool white\n" +
+	"Examples:\n" +
+	"- 2700  hanging bulb\n" +
+	"- 1800  fire / lantern (raise Radius for a soft glow)"
 [
 	Radius(float) : "Soft Radius" : "16" : "Sphere radius for soft-shadow sampling (world units). 0 = hard point. Default 16. Soft samples scale with radius (like SunSpreadAngle)."
+	LightTemperature(float) : "Color Temperature (K)" : "0" : "Optional blackbody CCT in Kelvin. 0 = keep Brightness RGB. When set, RGB is replaced; brightness (4th number) is kept. Also tints the exported engine worldlight.\n" +
+		"\n" +
+		"Typical values:\n" +
+		"- 1800  candle / fire\n" +
+		"- 2200  vintage filament\n" +
+		"- 2700  incandescent\n" +
+		"- 3000  halogen / warm LED\n" +
+		"- 3500  neutral white\n" +
+		"- 4000  cool white / fluorescent\n" +
+		"- 5000  noon-ish\n" +
+		"- 5600  daylight / flash\n" +
+		"- 6500  overcast\n" +
+		"\n" +
+		"Examples:\n" +
+		"- 2700  hanging bulb\n" +
+		"- 1800  fire / lantern (raise Radius for a soft glow)\n" +
+		"- 3000  warm ceiling globes\n" +
+		"- 0     non-blackbody colour (neon, RGB LED)"
 ]

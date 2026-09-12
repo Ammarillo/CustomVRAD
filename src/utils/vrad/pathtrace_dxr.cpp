@@ -1,8 +1,8 @@
-//========= Copyright CustomVRAD contributors. ============//
+//========= Copyright PathRAD contributors. ============//
 //
-// DXR path-traced world-face lightmap baker (-pathtrace / -dxr).
-// Hardware closest-hit via DXR RayQuery; path integration on CPU with
-// soft area/sun sampling and CustomVRAD volume helpers.
+// Path-traced lightmaps (-pathtrace / -dxr).
+// GPU does closest-hit (DXR RayQuery). The CPU integrator walks the path,
+// including soft lights, sun, and PathRAD volumes.
 //
 //=============================================================================//
 
@@ -10,6 +10,7 @@
 #include "oklab.h"
 #include "lightmap.h"
 #include "pathtrace_dxr.h"
+#include "bake_volume.h"
 #include "pathtrace_dxr_device.h"
 #include "ies_profile.h"
 #include "light_projection.h"
@@ -1031,7 +1032,7 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 	default:
 		break;
 	}
-	// Sky/sun water attenuation is already in the probe transmittance (Kd / Mode C skip).
+	// Sky/sun water attenuation is already in the probe transmittance (Kd / Mode B skip).
 	return sum;
 }
 
@@ -1230,9 +1231,8 @@ static bool PtSurfaceEmissionContrib( const Vector &prevPos, const Vector &prevN
 	return false;
 }
 
-// Full unidirectional path tracer (Veach/PBRT style):
-// NEE+MIS at every vertex (incl. luxel = direct), BSDF bounce, emissive hits with MIS, RR.
-// With -uw_volume: homogeneous free-flight medium events inside water.
+// Unidirectional path tracer (Veach / PBRT): next-event estimation and MIS
+// at every bounce, including the luxel. -uw_volume adds scatter events inside water.
 static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned int seed, int sppIndex,
 						int maxBounces, int facenum, float *pSunAmt )
 {
@@ -1359,7 +1359,7 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 			break;
 		}
 
-		// Mode C: free-flight scatter before surface
+		// Mode B: free-flight scatter before surface
 		if ( bTryMedium && ( !bHit || tHit > tFree ) )
 		{
 			Vector scatterPos = pos + dir * tFree;
@@ -1408,7 +1408,7 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 
 		if ( !bHit )
 		{
-			// Path exited to sky. Mode C: Beer-Lambert through water (Kd is off in volume mode).
+			// Path exited to sky. Mode B: Beer-Lambert through water (Kd is off in volume mode).
 			// Mode A: sky irradiance uses Kd only via PtSampleSkyAmbient (no segment stack).
 			if ( bVolMode )
 				throughput *= WaterMedium_SegmentTransmittance( pos, pos + dir * (float)MAX_TRACE_LENGTH );
@@ -1474,10 +1474,9 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 	return radiance;
 }
 
-// Kept name for call sites: returns full path Li (direct+indirect). outIndirect unused (zero).
-// outVarMean: optional Var(E[luminance]) for Sakai Welch denoise (= sampleVar / nTaken).
-// aaOff / nAa: optional luxel-footprint offsets (world units). Path sample s uses
-// aaOff[s % nAa] so spatial AA costs nothing extra vs center-only sampling.
+// Returns full path Li (direct+indirect). outIndirect is unused (left at zero).
+// outVarMean: optional variance of mean luminance for Sakai/Welch denoise.
+// aaOff / nAa: luxel-footprint offsets. Sample s uses aaOff[s % nAa].
 static void PtBakeAtPosition( const Vector &pos, const Vector &normal, float luxelWorld, int facenum,
 							  int ni, Vector &outDirect, float &outSun, Vector &outIndirect,
 							  float *outVarMean, const Vector *aaOff = nullptr, int nAa = 0 )
@@ -1545,7 +1544,7 @@ static void PtBakeAtPosition( const Vector &pos, const Vector &normal, float lux
 	{
 		const float mean = sumL / (float)nTaken;
 		const float sampleVar = max( 0.0f, sumL2 / (float)nTaken - mean * mean );
-		// Variance of the mean estimator (Sakai / Welch input).
+// Variance of the sample mean (input for Sakai / Welch denoise).
 		*outVarMean = sampleVar / (float)max( nTaken, 1 );
 	}
 }
@@ -2025,6 +2024,44 @@ static void PtDenoiseCoplanarIslands()
 		}
 	}
 
+	// CustomVBSP charts: PairEdges often misses T-junction / duplicated-vert
+	// coplanar splits, so neighbor-based islands stay per-face. Union by chart
+	// id so OIDN sees continuous soft shadows across BSP cuts.
+	int nChartUnions = 0;
+	const int nCharts = LightmapChartCount();
+	if ( nCharts > 0 )
+	{
+		std::vector<int> chartRep( (size_t)nCharts, -1 );
+		for ( int facenum = 0; facenum < numfaces; ++facenum )
+		{
+			if ( !PtDenoiseIslandEligible( facenum ) )
+				continue;
+			const int cid = GetLightmapChartId( facenum );
+			if ( cid < 0 || cid >= nCharts )
+				continue;
+			if ( chartRep[(size_t)cid] < 0 )
+			{
+				chartRep[(size_t)cid] = facenum;
+				continue;
+			}
+			const int rep = chartRep[(size_t)cid];
+			if ( !PtDenoiseSameLuxelFrame( facenum, rep ) )
+				continue;
+			if ( !PtDenoiseCoplanarNeighbors( facenum, rep ) )
+				continue;
+			const int ra = PtDenoiseUfFind( parent, facenum );
+			const int rb = PtDenoiseUfFind( parent, rep );
+			if ( ra != rb )
+			{
+				parent[ra] = rb;
+				++nChartUnions;
+			}
+		}
+		if ( nChartUnions > 0 )
+			Msg( "[PathTrace-DXR] Chart denoise: merged %d face link(s) across %d chart(s)\n",
+				 nChartUnions, nCharts );
+	}
+
 	std::vector<std::vector<int>> islands( (size_t)numfaces );
 	for ( int facenum = 0; facenum < numfaces; ++facenum )
 	{
@@ -2352,6 +2389,8 @@ static int PtEstimateFaceLuxels( int facenum )
 		return 0;
 	if ( g_FacePatches.Element( facenum ) == g_FacePatches.InvalidIndex() )
 		return 0;
+	if ( !BakeVolume_ShouldBakeFace( facenum ) )
+		return 0;
 
 	int w = f->m_LightmapTextureSizeInLuxels[0] + 1;
 	int h = f->m_LightmapTextureSizeInLuxels[1] + 1;
@@ -2545,6 +2584,8 @@ static bool PtFaceIsBakeable( int facenum )
 	// Displacements are included - BuildSamplesAndLuxels_DoFast routes to Disp samples.
 	if ( g_FacePatches.Element( facenum ) == g_FacePatches.InvalidIndex() )
 		return false;
+	if ( !BakeVolume_ShouldBakeFace( facenum ) )
+		return false;
 	return true;
 }
 
@@ -2655,6 +2696,13 @@ static void PathTraceBakeOneFace( int facenum )
 		if ( g_bInterrupt )
 			break;
 
+		if ( !BakeVolume_ShouldBakeSample( facenum, fl->sample[i].pos ) )
+		{
+			BakeVolume_FillSampleFromCache( facenum, i );
+			g_ptLuxelsInFlight.fetch_add( 1, std::memory_order_relaxed );
+			continue;
+		}
+
 		Vector n0 = fl->sample[i].normal;
 		if ( n0.LengthSqr() < 1e-6f )
 			n0 = l.facenormal;
@@ -2737,8 +2785,8 @@ static void PathTraceClearAllFaces()
 
 
 // ---------------------------------------------------------------------------
-// GPU luxel baker (DXR RayQuery) - Frostbite-style: all work on GPU, luxels batched.
-// Hard NEE (no CHSS soft); use -pt_cpu for full CPU soft-shadow path.
+// GPU luxel baker (DXR RayQuery): all work on GPU, luxels in batches.
+// Hard NEE (no CHSS soft); use -pt_cpu if you need the full CPU soft-shadow path.
 // ---------------------------------------------------------------------------
 static void PtPackGpuLights( std::vector<PtGpuBakeLight> &out, std::vector<float> &iesAtlasOut,
 							 ProjGpuArray_t &cookieArr, ProjGpuArray_t &cubeArr )
@@ -3041,6 +3089,7 @@ struct PtGpuFaceJob
 	int normalCount;
 	int sampleBase;
 	LightingValue_t *pIndirect[NUM_BUMP_VECTS + 1];
+	std::vector<int> jobIndex; // [s * nc + ni] -> index relative to sampleBase, or -1 (cache)
 };
 
 static bool PathTraceBakeWorldFacesGPU()
@@ -3120,7 +3169,7 @@ static bool PathTraceBakeWorldFacesGPU()
 			 g_flBounceChroma );
 	}
 	if ( params.spectralMode )
-		Msg( "[PathTrace-DXR] Spectral transport: 4 stratified wavelengths/path (compact RGB lobes + CIE).\n" );
+		Msg( "[PathTrace-DXR] Spectral transport: 4 stratified wavelengths/path (Smits RGB->SPD + CIE).\n" );
 	if ( params.envVolCount > 0 )
 		Msg( "[PathTrace-DXR] GPU light_env_vol: %u volume(s) - weighted sky/ambient, shadow filters, BounceVol tint\n",
 			 params.envVolCount );
@@ -3214,43 +3263,47 @@ static bool PathTraceBakeWorldFacesGPU()
 
 	auto flush = [&]() -> bool
 	{
-		if ( jobs.empty() )
+		if ( jobs.empty() && faces.empty() )
 			return true;
 
-		const int sppTotal = max( 1, g_ptSpp );
-		const int chunk = max( 1, min( sppChunk, sppTotal ) );
-
-		std::vector<PtGpuBakeResult> acc( jobs.size() );
-		std::vector<PtGpuBakeResult> temp( jobs.size() );
-		for ( size_t i = 0; i < acc.size(); ++i )
+		std::vector<PtGpuBakeResult> acc;
+		if ( !jobs.empty() )
 		{
-			acc[i].radiance[0] = acc[i].radiance[1] = acc[i].radiance[2] = 0.0f;
-			acc[i].sunAmt = 0.0f;
-		}
+			const int sppTotal = max( 1, g_ptSpp );
+			const int chunk = max( 1, min( sppChunk, sppTotal ) );
 
-		for ( int off = 0; off < sppTotal; off += chunk )
-		{
-			const int n = min( chunk, sppTotal - off );
-			PathTraceDXR_GpuBakeConfigurePass( (uint32_t)n, (uint32_t)off );
-			if ( !PathTraceDXR_GpuBakeLuxels( jobs.data(), (uint32_t)jobs.size(), temp.data() ) )
-				return false;
-			// GPU returns mean over n samples - weight by n for the overall mean.
-			const float w = (float)n;
+			acc.resize( jobs.size() );
+			std::vector<PtGpuBakeResult> temp( jobs.size() );
 			for ( size_t i = 0; i < acc.size(); ++i )
 			{
-				acc[i].radiance[0] += temp[i].radiance[0] * w;
-				acc[i].radiance[1] += temp[i].radiance[1] * w;
-				acc[i].radiance[2] += temp[i].radiance[2] * w;
-				acc[i].sunAmt += temp[i].sunAmt * w;
+				acc[i].radiance[0] = acc[i].radiance[1] = acc[i].radiance[2] = 0.0f;
+				acc[i].sunAmt = 0.0f;
 			}
-		}
-		const float inv = 1.0f / (float)sppTotal;
-		for ( size_t i = 0; i < acc.size(); ++i )
-		{
-			acc[i].radiance[0] *= inv;
-			acc[i].radiance[1] *= inv;
-			acc[i].radiance[2] *= inv;
-			acc[i].sunAmt *= inv;
+
+			for ( int off = 0; off < sppTotal; off += chunk )
+			{
+				const int n = min( chunk, sppTotal - off );
+				PathTraceDXR_GpuBakeConfigurePass( (uint32_t)n, (uint32_t)off );
+				if ( !PathTraceDXR_GpuBakeLuxels( jobs.data(), (uint32_t)jobs.size(), temp.data() ) )
+					return false;
+				// GPU returns mean over n samples - weight by n for the overall mean.
+				const float w = (float)n;
+				for ( size_t i = 0; i < acc.size(); ++i )
+				{
+					acc[i].radiance[0] += temp[i].radiance[0] * w;
+					acc[i].radiance[1] += temp[i].radiance[1] * w;
+					acc[i].radiance[2] += temp[i].radiance[2] * w;
+					acc[i].sunAmt += temp[i].sunAmt * w;
+				}
+			}
+			const float inv = 1.0f / (float)sppTotal;
+			for ( size_t i = 0; i < acc.size(); ++i )
+			{
+				acc[i].radiance[0] *= inv;
+				acc[i].radiance[1] *= inv;
+				acc[i].radiance[2] *= inv;
+				acc[i].sunAmt *= inv;
+			}
 		}
 
 		for ( size_t fi = 0; fi < faces.size(); ++fi )
@@ -3261,9 +3314,20 @@ static bool PathTraceBakeWorldFacesGPU()
 			const int nc = fj.normalCount;
 			for ( int s = 0; s < nSamp; ++s )
 			{
+				bool bakedSample = false;
 				for ( int ni = 0; ni < nc; ++ni )
 				{
-					const int idx = fj.sampleBase + s * nc + ni;
+					const int slot = s * nc + ni;
+					int idx = -1;
+					if ( slot >= 0 && slot < (int)fj.jobIndex.size() )
+						idx = fj.jobIndex[slot];
+					if ( idx < 0 )
+					{
+						if ( ni == 0 )
+							BakeVolume_FillSampleFromCache( fj.facenum, s );
+						continue;
+					}
+					idx += fj.sampleBase;
 					if ( idx < 0 || idx >= (int)acc.size() )
 					{
 						Warning( "[PathTrace-DXR] GPU bake index OOB (idx=%d acc=%d) - aborting batch.\n",
@@ -3278,13 +3342,17 @@ static bool PathTraceBakeWorldFacesGPU()
 					fl->light[0][ni][s].m_flDirectSunAmount = r.sunAmt;
 					fj.pIndirect[ni][s].m_vecLighting.Init();
 					fj.pIndirect[ni][s].m_flDirectSunAmount = 0.0f;
+					bakedSample = true;
 				}
 
-				Vector emitGlow( 0, 0, 0 );
-				if ( VRadEmit_SampleAtPos( fj.facenum, fl->sample[s].pos, emitGlow ) )
+				if ( bakedSample )
 				{
-					for ( int ni = 0; ni < nc; ++ni )
-						fl->light[0][ni][s].m_vecLighting += emitGlow;
+					Vector emitGlow( 0, 0, 0 );
+					if ( VRadEmit_SampleAtPos( fj.facenum, fl->sample[s].pos, emitGlow ) )
+					{
+						for ( int ni = 0; ni < nc; ++ni )
+							fl->light[0][ni][s].m_vecLighting += emitGlow;
+					}
 				}
 			}
 			PtFinishFaceLighting( fj.facenum, fj.normalCount, fj.pIndirect );
@@ -3333,6 +3401,7 @@ static bool PathTraceBakeWorldFacesGPU()
 		fj.facenum = facenum;
 		fj.normalCount = normalCount;
 		fj.sampleBase = (int)jobs.size();
+		fj.jobIndex.assign( (size_t)fl->numsamples * (size_t)normalCount, -1 );
 		for ( int n = 0; n < normalCount; ++n )
 			fj.pIndirect[n] = (LightingValue_t *)calloc( fl->numsamples, sizeof( LightingValue_t ) );
 
@@ -3346,6 +3415,9 @@ static bool PathTraceBakeWorldFacesGPU()
 
 		for ( int i = 0; i < fl->numsamples; ++i )
 		{
+			if ( !BakeVolume_ShouldBakeSample( facenum, fl->sample[i].pos ) )
+				continue;
+
 			Vector n0 = fl->sample[i].normal;
 			if ( n0.LengthSqr() < 1e-6f )
 				n0 = l.facenormal;
@@ -3360,6 +3432,7 @@ static bool PathTraceBakeWorldFacesGPU()
 
 			for ( int ni = 0; ni < normalCount; ++ni )
 			{
+				fj.jobIndex[i * normalCount + ni] = (int)jobs.size() - fj.sampleBase;
 				PtGpuBakeLuxel job = {};
 				job.pos[0] = pos.x; job.pos[1] = pos.y; job.pos[2] = pos.z;
 				job.luxelWorld = luxelWorld;
@@ -3646,7 +3719,7 @@ static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int sof
 			 g_flBounceChroma );
 	}
 	if ( params.spectralMode )
-		Msg( "[PathTrace-DXR] Spectral transport: 4 stratified wavelengths/path (compact RGB lobes + CIE).\n" );
+		Msg( "[PathTrace-DXR] Spectral transport: 4 stratified wavelengths/path (Smits RGB->SPD + CIE).\n" );
 	if ( nEmitTris > 0 )
 	{
 		const VRadEmitTri_t *src = VRadEmitArea_Tris();
@@ -3697,7 +3770,8 @@ static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int sof
 
 bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamples,
 								   PtGpuBakeResult *outResults, bool bLightmapQuality,
-								   bool bEndSession, unsigned progressBase, unsigned progressTotal )
+								   bool bEndSession, unsigned progressBase, unsigned progressTotal,
+								   const char *tagOverride )
 {
 	if ( !PathTraceDXR_CanBakeProps() || !samples || !outResults || nSamples == 0 )
 		return false;
@@ -3740,6 +3814,8 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 		softSamplesMax = 1;
 		tag = "prop verts";
 	}
+	if ( tagOverride && tagOverride[0] )
+		tag = tagOverride;
 
 	const bool bNewSession = !PathTraceDXR_GpuBakeIsActive();
 	if ( bNewSession )

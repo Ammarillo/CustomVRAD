@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// Path-trace lightmap denoise backends: OIDN / OptiX / Sakai 2024.
+//========= Copyright PathRAD contributors. ============//
+// Path-trace denoise: OIDN, OptiX, or Sakai 2024.
 //=============================================================================//
 #ifndef PATHTRACE_DENOISE_H
 #define PATHTRACE_DENOISE_H

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate tools/vscode-vrad-cfg TextMate extension from vrad_cfg_flags.json."""
+"""Build the VS Code / Cursor grammar from tools/vrad_cfg_flags.json."""
 
 from __future__ import annotations
 
@@ -123,10 +123,10 @@ def main() -> None:
 
     package = {
         "name": "vrad-cfg",
-        "displayName": "CustomVRAD Config",
-        "description": "Syntax highlighting for CustomVRAD -config presets (configs/*.cfg).",
+        "displayName": "PathRAD Config",
+        "description": "Syntax highlighting for PathRAD -config presets (configs/*.cfg).",
         "version": "0.1.0",
-        "publisher": "customvrad",
+        "publisher": "pathrad",
         "engines": {"vscode": "^1.74.0"},
         "categories": ["Programming Languages"],
         "contributes": {
@@ -162,7 +162,7 @@ def main() -> None:
     )
 
     (EXT / "README.md").write_text(
-        """# CustomVRAD Config highlighter
+        """# PathRAD Config highlighter
 
 Cursor / VS Code TextMate grammar for `configs/*.cfg`.
 

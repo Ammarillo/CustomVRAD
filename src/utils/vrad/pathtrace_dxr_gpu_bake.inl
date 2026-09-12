@@ -1,4 +1,4 @@
-// GPU luxel path baker - included at end of pathtrace_dxr_device.cpp
+// GPU luxel baker. Included at the end of pathtrace_dxr_device.cpp.
 
 static const char *kPtLuxelBakeCS =
 R"HLSL(
@@ -1952,7 +1952,7 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 
 		if ( !hit )
 		{
-			// Mode C: always Beer-Lambert along escape (Kd disabled in volume mode).
+			// Mode B: always Beer-Lambert along escape (Kd disabled in volume mode).
 			if ( volMode )
 			{
 				float3 Tw = WaterSegT( pos, pos + dir * MaxTrace );
@@ -2427,7 +2427,7 @@ static bool PtLoadLuxelCsDiskCache( unsigned hash, bool enableVolumes, ID3DBlob 
 	char tmpDir[MAX_PATH] = {};
 	GetTempPathA( MAX_PATH, tmpDir );
 	char path[MAX_PATH];
-	_snprintf_s( path, _TRUNCATE, "%scvrad_luxel_%08x_v%d.dxil", tmpDir, hash, enableVolumes ? 1 : 0 );
+	_snprintf_s( path, _TRUNCATE, "%spathrad_luxel_%08x_v%d.dxil", tmpDir, hash, enableVolumes ? 1 : 0 );
 	HANDLE h = CreateFileA( path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr );
 	if ( h == INVALID_HANDLE_VALUE )
 		return false;
@@ -2462,7 +2462,7 @@ static void PtSaveLuxelCsDiskCache( unsigned hash, bool enableVolumes, ID3DBlob 
 	char tmpDir[MAX_PATH] = {};
 	GetTempPathA( MAX_PATH, tmpDir );
 	char path[MAX_PATH];
-	_snprintf_s( path, _TRUNCATE, "%scvrad_luxel_%08x_v%d.dxil", tmpDir, hash, enableVolumes ? 1 : 0 );
+	_snprintf_s( path, _TRUNCATE, "%spathrad_luxel_%08x_v%d.dxil", tmpDir, hash, enableVolumes ? 1 : 0 );
 	HANDLE h = CreateFileA( path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
 	if ( h == INVALID_HANDLE_VALUE )
 		return;

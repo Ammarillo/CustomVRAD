@@ -29,6 +29,7 @@
 #include "absorb.h"
 #include "fog_volume.h"
 #include "water_medium.h"
+#include "bake_volume.h"
 #include "radial.h"
 #include "byteswap.h"
 
@@ -114,6 +115,7 @@ bool g_bLargeDispSampleRadius = false;
 
 bool g_bOnlyStaticProps = false;
 bool g_bShowStaticPropNormals = false;
+bool g_bIgnoreBakeVolumes = false;
 
 
 float		gamma = 0.5;
@@ -2462,9 +2464,16 @@ bool RadWorld_Go()
 			}
 			RunThreadsOnIndividual (numfaces, true, FinalLightFace);
 
-			// Seam stitch blurs pathtrace detail into blotches - skip when pathtraced.
-			if ( g_bStitchSeams && !bPathTraced )
-				StitchLightmapSeams();
+			// Keep prior lighting on faces/luxels outside bake_volume, then stitch.
+			BakeVolume_RestoreFaces();
+
+			// Seam stitch: always for radiosity; for pathtrace use a narrow band so
+			// soft penumbrae meet across VBSP cuts without blotching interiors.
+			if ( g_bStitchSeams )
+				StitchLightmapSeams( bPathTraced );
+
+			// Stitch may touch luxels outside the volume; put cached values back.
+			BakeVolume_MergePartialFaces( false );
 		}
 		
 		// Distribute the lighting data to workers.
@@ -2575,6 +2584,8 @@ void VRAD_LoadBSP( char const *pFilename )
 	VMPI_SetCurrentStage( "LoadBSPFile" );
 #endif
 	LoadBSPFile (source);
+
+	LoadLightmapCharts();
 
 	// Add this bsp to our search path so embedded resources can be found
 #ifdef MPI
@@ -2750,6 +2761,7 @@ void VRAD_Finish()
 	VMPI_SetCurrentStage( "WriteBSPFile" );
 #endif
 	WriteBSPFile(source);
+	BakeVolume_WriteCache();
 
 	if ( g_bDumpPatches )
 	{
@@ -2884,7 +2896,7 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 		else if ( !Q_stricmp( argv[i], "-pt_spectral" ) )
 		{
 			g_bPathTraceSpectral = true;
-			Msg( "PathTrace spectral (-pt_spectral): 4-lambda stratified RGB-lobe+CIE ON.\n" );
+			Msg( "PathTrace spectral (-pt_spectral): 4-lambda stratified Smits+CIE ON.\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-pt_nospectral" ) )
 		{
@@ -3336,6 +3348,11 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 		else if ( !stricmp( argv[i], "-OnlyStaticProps" ) )
 		{
 			g_bOnlyStaticProps = true;
+		}
+		else if ( !Q_stricmp( argv[i], "-nobakevolume" ) )
+		{
+			g_bIgnoreBakeVolumes = true;
+			Msg( "bake_volume ignored (-nobakevolume): full map bake.\n" );
 		}
 		else if ( !Q_stricmp( argv[i], "-StaticPropPolys" ) )
 		{
@@ -3828,6 +3845,7 @@ void PrintUsage( int argc, char **argv )
         "  -StaticPropLighting   : generate backed static prop vertex lighting\n"
         "  -StaticPropPolys   : Perform shadow tests of static props at polygon precision\n"
         "  -OnlyStaticProps   : Only perform direct static prop lighting (vrad debug option)\n"
+		"  -nobakevolume   : Ignore bake_volume entities (full map rebake).\n"
 		"  -StaticPropNormals : when lighting static props, just show their normal vector\n"
 		"  -textureshadows : Alpha ($alphatest/$translucent) props cast cutout shadows - no MDL CAST_TEXTURE_SHADOWS required\n"
 		"  -noskyboxrecurse : Turn off recursion into 3d skybox (skybox shadows on world)\n"
@@ -3840,7 +3858,7 @@ void PrintUsage( int argc, char **argv )
 		"  -pathtrace/-dxr : Path-traced world lightmaps (direct+GI+sky; soft area/sun).\n"
 		"  -pt_samples N   : Samples per luxel (default 4; 2 with -fast; 8 with -final; max 4096).\n"
 		"  -pt_bounces N   : Indirect hops after luxel (0=direct+sky only; default 3; 1 with -fast; max 16).\n"
-		"  -pt_prop_samples N : Prop spp (default max(8, pt_samples/4); props are cheaper than world).\n"
+		"  -pt_prop_samples N : Prop/detail-prop spp (default max(8, pt_samples/4); cheaper than world).\n"
 		"  -pt_prop_bounces N : Prop indirect hops (0=direct+sky; default = -pt_bounces).\n"
 		"  -pt_prop_vertgrid N: Prop vert lighting: 0=per-vert; >0=8x8 tri charts in 64x64 atlas, closest gather (+denoise if -pt_denoise; default 4).\n"
 		"  -pt_aa N        : Luxel footprint AA grid 1..5 (1=off, 2=2x2 .. 5=5x5; default 3).\n"

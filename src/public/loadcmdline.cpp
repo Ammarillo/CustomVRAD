@@ -41,6 +41,19 @@ static char *DupArg( const char *s )
 	return V_strdup( s ? s : "" );
 }
 
+static void QuoteIfNeeded( const char *s, char *out, int outSize )
+{
+	if ( !s || !s[0] )
+	{
+		Q_strncpy( out, "", outSize );
+		return;
+	}
+	if ( strchr( s, ' ' ) || strchr( s, '\t' ) )
+		Q_snprintf( out, outSize, "\"%s\"", s );
+	else
+		Q_strncpy( out, s, outSize );
+}
+
 static void AdoptArgv( int &argc, char **&argv, CUtlVector<char *> &args )
 {
 	const int n = args.Count();
@@ -300,8 +313,50 @@ void ExpandConfigArgs( int &argc, char **&argv )
 	if ( bAny )
 	{
 		Msg( "[config] effective command line:\n" );
+
+		int flagWidth = 3; // "map"
 		for ( int i = 1; i < argc; ++i )
-			Msg( "  %s\n", argv[i] );
+		{
+			if ( argv[i][0] == '-' )
+			{
+				const int n = (int)Q_strlen( argv[i] );
+				if ( n > flagWidth )
+					flagWidth = n;
+			}
+		}
+
+		for ( int i = 1; i < argc; )
+		{
+			const char *a = argv[i];
+			if ( a[0] == '-' )
+			{
+				// Don't steal the trailing map path as a flag value.
+				const bool nextIsValue = ( i + 1 < argc ) && argv[i + 1][0] != '-' && ( i + 1 != argc - 1 );
+				if ( nextIsValue )
+				{
+					char val[1024];
+					char line[2048];
+					QuoteIfNeeded( argv[i + 1], val, sizeof( val ) );
+					Q_snprintf( line, sizeof( line ), "  %-*s  %s\n", flagWidth, a, val );
+					Msg( "%s", line );
+					i += 2;
+				}
+				else
+				{
+					Msg( "  %s\n", a );
+					++i;
+				}
+			}
+			else
+			{
+				char val[1024];
+				char line[2048];
+				QuoteIfNeeded( a, val, sizeof( val ) );
+				Q_snprintf( line, sizeof( line ), "  %-*s  %s\n", flagWidth, ( i == argc - 1 ) ? "map" : "arg", val );
+				Msg( "%s", line );
+				++i;
+			}
+		}
 	}
 }
 

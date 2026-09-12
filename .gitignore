@@ -1,6 +1,6 @@
 # =============================================================================
-# CustomVRAD — keep sources, FGDs, configs, docs sources, shaders; drop build
-# artifacts, local deploy trees, editor caches, and scratch files.
+# Keep sources, FGDs, configs, docs, and shaders.
+# Ignore build output, local deploy trees, editor caches, and scratch files.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -57,6 +57,7 @@
 bin/
 game/
 dist/
+bundle/
 
 # -----------------------------------------------------------------------------
 # Local-only / non-distribution trees
@@ -68,7 +69,7 @@ pertinents/
 *.vpc
 *.vpc_cache
 
-# Steamworks API dump (not required for CustomVRAD build)
+# Steamworks API dump (not required for PathRAD build)
 src/public/steam/steam_api.json
 
 # Downloaded third-party SDKs (see thirdparty READMEs)

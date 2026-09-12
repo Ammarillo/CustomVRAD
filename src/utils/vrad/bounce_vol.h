@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// light_bounce_vol - local artistic bounce overrides (boost / chroma).
+//========= Copyright PathRAD contributors. ============//
+// light_bounce_vol - local bounce boost / chroma / energy inside a brush.
 //=============================================================================//
 #ifndef VRAD_BOUNCE_VOL_H
 #define VRAD_BOUNCE_VOL_H

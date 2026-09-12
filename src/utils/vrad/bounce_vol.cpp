@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// light_bounce_vol - soft AABB blend of local bounce_boost / bounce_chroma.
+//========= Copyright PathRAD contributors. ============//
+// light_bounce_vol - fade local bounce boost / chroma with the CLI values.
 //=============================================================================//
 
 #include "vrad.h"

@@ -1,4 +1,4 @@
-# CustomVRAD Config highlighter
+# PathRAD Config highlighter
 
 Cursor / VS Code TextMate grammar for `configs/*.cfg`.
 

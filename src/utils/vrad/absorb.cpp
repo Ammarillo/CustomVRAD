@@ -1,6 +1,6 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
-// light_absorb volume weights (soft AABB blend).
+// light_absorb volume weights (soft box fade).
 //
 //=============================================================================//
 

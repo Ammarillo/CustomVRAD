@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// OIDN RTLightmap wrapper for CustomVRAD path-traced lightmaps.
+//========= Copyright PathRAD contributors. ============//
+// OIDN RTLightmap wrapper for path-traced lightmaps.
 //=============================================================================//
 
 #include "pathtrace_oidn.h"

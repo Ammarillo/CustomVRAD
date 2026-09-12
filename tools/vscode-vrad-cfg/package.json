@@ -1,9 +1,9 @@
 {
   "name": "vrad-cfg",
-  "displayName": "CustomVRAD Config",
-  "description": "Syntax highlighting for CustomVRAD -config presets (configs/*.cfg).",
+  "displayName": "PathRAD Config",
+  "description": "Syntax highlighting for PathRAD -config presets (configs/*.cfg).",
   "version": "0.1.0",
-  "publisher": "customvrad",
+  "publisher": "pathrad",
   "engines": {
     "vscode": "^1.74.0"
   },

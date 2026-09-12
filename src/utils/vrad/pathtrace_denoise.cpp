@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// Denoise dispatcher for path-traced lightmaps.
+//========= Copyright PathRAD contributors. ============//
+// Pick OIDN / OptiX / Sakai for path-traced lightmaps.
 //=============================================================================//
 
 #include "pathtrace_denoise.h"

@@ -27,6 +27,7 @@
 #include "envvolume.h"
 #include "ao.h"
 #include "absorb.h"
+#include "bake_volume.h"
 #include "bounce_vol.h"
 #include "fog_volume.h"
 #include "water_medium.h"
@@ -34,8 +35,103 @@
 #include "vrad_emit.h"
 #include "ies_profile.h"
 #include "light_projection.h"
+#include "gamebspfile.h"
+#include <math.h>
 
 extern char source[MAX_PATH];
+
+// CustomVBSP GAMELUMP_LIGHTMAP_CHARTS ('lmch')
+static CUtlVector<int> g_LightmapChartId; // per face; -1 = singleton / absent
+
+void LoadLightmapCharts()
+{
+	g_LightmapChartId.RemoveAll();
+
+	GameLumpHandle_t handle = g_GameLumps.GetGameLumpHandle( GAMELUMP_LIGHTMAP_CHARTS );
+	if ( handle == g_GameLumps.InvalidGameLump() )
+		return;
+
+	if ( g_GameLumps.GetGameLumpVersion( handle ) != GAMELUMP_LIGHTMAP_CHARTS_VERSION )
+	{
+		Warning( "GAMELUMP_LIGHTMAP_CHARTS: unsupported version %d (expected %d)\n",
+			g_GameLumps.GetGameLumpVersion( handle ), GAMELUMP_LIGHTMAP_CHARTS_VERSION );
+		return;
+	}
+
+	const int lumpSize = g_GameLumps.GameLumpSize( handle );
+	if ( lumpSize < (int)( sizeof( int ) * 2 ) )
+		return;
+
+	CUtlBuffer buf( g_GameLumps.GetGameLump( handle ), lumpSize, CUtlBuffer::READ_ONLY );
+	const int nFaces = buf.GetInt();
+	const int nCharts = buf.GetInt();
+	(void)nCharts;
+
+	if ( nFaces != numfaces )
+	{
+		Warning( "GAMELUMP_LIGHTMAP_CHARTS: face count %d != BSP numfaces %d — ignoring\n", nFaces, numfaces );
+		return;
+	}
+
+	if ( lumpSize < (int)( sizeof( int ) * ( 2 + nFaces ) ) )
+	{
+		Warning( "GAMELUMP_LIGHTMAP_CHARTS: truncated lump\n" );
+		return;
+	}
+
+	g_LightmapChartId.SetSize( nFaces );
+	int nMultiFaces = 0;
+	for ( int i = 0; i < nFaces; ++i )
+	{
+		g_LightmapChartId[i] = buf.GetInt();
+		if ( g_LightmapChartId[i] >= 0 )
+			++nMultiFaces;
+	}
+
+	Msg( "Loaded lightmap charts: %d multi-face chart member(s) across %d face(s)\n", nMultiFaces, nFaces );
+}
+
+bool FaceInMergedLightmapChart( int facenum )
+{
+	if ( facenum < 0 || facenum >= g_LightmapChartId.Count() )
+		return false;
+	return g_LightmapChartId[facenum] >= 0;
+}
+
+bool FacesShareMergedLightmapChart( int faceA, int faceB )
+{
+	if ( !FaceInMergedLightmapChart( faceA ) || !FaceInMergedLightmapChart( faceB ) )
+		return false;
+	return g_LightmapChartId[faceA] == g_LightmapChartId[faceB];
+}
+
+int GetLightmapChartId( int facenum )
+{
+	if ( facenum < 0 || facenum >= g_LightmapChartId.Count() )
+		return -1;
+	return g_LightmapChartId[facenum];
+}
+
+int LightmapChartCount()
+{
+	int nMax = -1;
+	for ( int i = 0; i < g_LightmapChartId.Count(); ++i )
+	{
+		if ( g_LightmapChartId[i] > nMax )
+			nMax = g_LightmapChartId[i];
+	}
+	return nMax + 1;
+}
+
+static bool ShouldEdgePullFace( lightinfo_t *pLightInfo )
+{
+	if ( !g_bEdgePull || !pLightInfo || !pLightInfo->face )
+		return false;
+	const int facenum = pLightInfo->face - g_pFaces;
+	if ( FaceInMergedLightmapChart( facenum ) )
+		return false;
+	return true;
+}
 
 enum
 {
@@ -667,7 +763,7 @@ bool BuildFacesamplesAndLuxels_DoFast( lightinfo_t *pLightInfo, facelight_t *pFa
 			pSamples->area = pFaceLight->worldAreaPerLuxel;
 			float sCoord = (float)s;
 			float tCoord = (float)t;
-			if ( g_bEdgePull )
+			if ( ShouldEdgePullFace( pLightInfo ) )
 				EdgePullLuxelCoord( sCoord, tCoord, width, height, g_flEdgePullInset );
 			pSamples->coord[0] = sCoord;
 			pSamples->coord[1] = tCoord;
@@ -771,7 +867,7 @@ bool BuildFacesamples( lightinfo_t *pLightInfo, facelight_t *pFaceLight )
 				pSamples->area = WindingAreaAndBalancePoint(  pWindingS2, center ) * pFaceLight->worldAreaPerLuxel;
 				pSamples->coord[0] = center.x; 
 				pSamples->coord[1] = center.y;
-				if ( g_bEdgePull )
+				if ( ShouldEdgePullFace( pLightInfo ) )
 					EdgePullLuxelCoord( pSamples->coord[0], pSamples->coord[1], width, height, g_flEdgePullInset );
 
 				// find winding bounds (then convert it to 2D)
@@ -919,7 +1015,7 @@ bool BuildFaceLuxels( lightinfo_t *pLightInfo, facelight_t *pFaceLight )
 		{
 			float sCoord = (float)s;
 			float tCoord = (float)t;
-			if ( g_bEdgePull )
+			if ( ShouldEdgePullFace( pLightInfo ) )
 				EdgePullLuxelCoord( sCoord, tCoord, width, height, g_flEdgePullInset );
 			LuxelSpaceToWorld( pLightInfo, sCoord, tCoord, pFaceLight->luxel[s+t*width] );
 		}
@@ -1074,6 +1170,7 @@ void FreeDLights()
 	gAmbient = NULL;
 	LightEnv_ClearVolumes();
 	Absorb_Clear();
+	BakeVolume_Clear();
 	BounceVol_Clear();
 	FogVolume_Clear();
 	WaterMedium_Clear();
@@ -1197,6 +1294,104 @@ int LightForString( char *pLight, Vector& intensity )
 }
 
 //-----------------------------------------------------------------------------
+// Optional LightTemperature / AmbientTemperature (Kelvin). Tanner Helland /
+// Mitchell Charity blackbody to sRGB, then the same 2.2 gamma as LightForString.
+// Chromaticity comes from CCT; Rec.709 luminance is taken from _light / _ambient.
+//-----------------------------------------------------------------------------
+static bool ColorTemperatureKelvinToLinearRgb( float kelvin, Vector &out )
+{
+	float T = kelvin;
+	if ( T < 1000.0f )
+		T = 1000.0f;
+	if ( T > 40000.0f )
+		T = 40000.0f;
+
+	const float t = T / 100.0f;
+	float r, g, b;
+
+	if ( t <= 66.0f )
+	{
+		r = 255.0f;
+		g = 99.4708025861f * logf( t ) - 161.1195681661f;
+	}
+	else
+	{
+		r = 329.698727446f * powf( t - 60.0f, -0.1332047592f );
+		g = 288.1221695283f * powf( t - 60.0f, -0.0755148492f );
+	}
+
+	if ( t >= 66.0f )
+		b = 255.0f;
+	else if ( t <= 19.0f )
+		b = 0.0f;
+	else
+		b = 138.5177312231f * logf( t - 10.0f ) - 305.0447927307f;
+
+	if ( r < 0.0f ) r = 0.0f;
+	if ( g < 0.0f ) g = 0.0f;
+	if ( b < 0.0f ) b = 0.0f;
+	if ( r > 255.0f ) r = 255.0f;
+	if ( g > 255.0f ) g = 255.0f;
+	if ( b > 255.0f ) b = 255.0f;
+
+	out.x = powf( r / 255.0f, 2.2f );
+	out.y = powf( g / 255.0f, 2.2f );
+	out.z = powf( b / 255.0f, 2.2f );
+	return true;
+}
+
+static float ReadColorTemperatureK( entity_t *e, const char *pKey, const char *pAlt )
+{
+	float k = FloatForKeyWithDefault( e, const_cast<char *>( pKey ), -1.0f );
+	if ( k < 0.0f )
+		k = pAlt ? FloatForKeyWithDefault( e, const_cast<char *>( pAlt ), 0.0f ) : 0.0f;
+	return k;
+}
+
+static void ApplyColorTemperatureToIntensity( entity_t *e, Vector &intensity,
+	const char *pKey, const char *pAlt, const Vector *pOrigin, const char *pWhat, bool bLog )
+{
+	const float k = ReadColorTemperatureK( e, pKey, pAlt );
+	if ( k <= 0.0f )
+		return;
+
+	Vector bb;
+	if ( !ColorTemperatureKelvinToLinearRgb( k, bb ) )
+		return;
+
+	const float y0 = 0.2126f * intensity.x + 0.7152f * intensity.y + 0.0722f * intensity.z;
+	const float yb = 0.2126f * bb.x + 0.7152f * bb.y + 0.0722f * bb.z;
+	if ( y0 <= 1e-20f || yb <= 1e-20f )
+		return;
+
+	VectorScale( bb, y0 / yb, intensity );
+
+	if ( !bLog )
+		return;
+	if ( pOrigin )
+	{
+		Msg( "%s at (%.0f %.0f %.0f): %s %.0f K\n",
+			 pWhat, pOrigin->x, pOrigin->y, pOrigin->z, pKey, k );
+	}
+	else
+	{
+		Msg( "%s: %s %.0f K\n", pWhat, pKey, k );
+	}
+}
+
+static void ApplyLightTemperature( entity_t *e, Vector &intensity, const Vector *pOrigin, bool bLog )
+{
+	ApplyColorTemperatureToIntensity( e, intensity,
+		"LightTemperature", "_lighttemperature", pOrigin, "light", bLog );
+}
+
+static void ApplyAmbientTemperature( entity_t *e, Vector &intensity, const Vector *pOrigin, bool bLog )
+{
+	ApplyColorTemperatureToIntensity( e, intensity,
+		"AmbientTemperature", "_ambienttemperature", pOrigin, "ambient", bLog );
+}
+
+//-----------------------------------------------------------------------------
 // Various parsing methods
 //-----------------------------------------------------------------------------
 
@@ -1245,6 +1440,8 @@ static void ParseLightGeneric( entity_t *e, directlight_t *dl )
 		VectorScale( dl->light.intensity, 
 					 FloatForKeyWithDefault( e, "_lightscaleHDR", 1.0 ),
 					 dl->light.intensity );
+
+	ApplyLightTemperature( e, dl->light.intensity, &dl->light.origin, true );
 }
 
 static void SetLightFalloffParams( entity_t * e, directlight_t * dl )
@@ -1432,6 +1629,7 @@ static void ParseLightSpot( entity_t* e, directlight_t* dl )
 							 FloatForKeyWithDefault( e, "_lightscaleHDR", 1.0 ),
 							 dl->light.intensity );
 			}
+			ApplyLightTemperature( e, dl->light.intensity, &dl->light.origin, false );
 		}
 
 		if ( dl->m_pIes )
@@ -1770,6 +1968,7 @@ static void ParseSkyAmbientFromEntity( entity_t* e, directlight_t *pSky, directl
 					 FloatForKeyWithDefault( e, "_AmbientScaleHDR", 1.0 ),
 					 pAmbient->light.intensity );
 	}
+	ApplyAmbientTemperature( e, pAmbient->light.intensity, &pAmbient->light.origin, true );
 }
 
 static float ParseSunSpreadExtent( entity_t* e )
@@ -1897,6 +2096,7 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 		{
 			VectorCopy( gSkyLight->light.intensity, pSky->light.intensity );
 			bInheritedColor = true;
+			ApplyLightTemperature( e, pSky->light.intensity, &pSky->light.origin, false );
 		}
 
 		// SunSpreadAngle left at 0 -> use default env's soft-sun extent
@@ -1921,6 +2121,7 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 		if ( pAmbKey && ( !pAmbKey[0] || !Q_stricmp( pAmbKey, "255 255 255 20" ) ) )
 		{
 			VectorCopy( gAmbient->light.intensity, pAmbient->light.intensity );
+			ApplyAmbientTemperature( e, pAmbient->light.intensity, &pAmbient->light.origin, false );
 		}
 	}
 
@@ -1959,7 +2160,7 @@ static void ParseLightPoint( entity_t* e, directlight_t* dl )
 	SetLightFalloffParams(e,dl);
 }
 
-// Soft sphere point light (CustomVRAD light_volume). Same keys as light, plus Radius.
+// Soft sphere point light (PathRAD light_volume). Same keys as light, plus Radius.
 static void ParseLightVolume( entity_t* e, directlight_t* dl )
 {
 	Vector dest;
@@ -2122,6 +2323,22 @@ void CreateDirectLights (void)
 	}
 	if ( BounceVol_HasVolumes() )
 		Msg( "light_bounce_vol: %d volume(s) parsed\n", BounceVol_VolumeCount() );
+
+	for (i=0 ; i<(unsigned)num_entities ; i++)
+	{
+		e = &entities[i];
+		name = ValueForKey (e, "classname");
+		if (!strcmp(name, "bake_volume"))
+			BakeVolume_ParseEntity( e );
+	}
+	if ( BakeVolume_Count() )
+	{
+		if ( g_bIgnoreBakeVolumes )
+			Msg( "bake_volume: %d volume(s) ignored (-nobakevolume, full bake)\n", BakeVolume_Count() );
+		else
+			Msg( "bake_volume: %d volume(s) active - rebaking luxels/verts inside AABB (full scene still lights them)\n", BakeVolume_Count() );
+		BakeVolume_LoadCache();
+	}
 
 	for (i=0 ; i<(unsigned)num_entities ; i++)
 	{
@@ -4325,6 +4542,9 @@ void BuildFacelights (int iThread, int facenum)
 	if ( texinfo[f->texinfo].flags & TEX_SPECIAL)
 		return;		// non-lit texture
 
+	if ( !BakeVolume_ShouldBakeFace( facenum ) )
+		return;
+
 	// check for patches for this face.  If none it must be degenerate.  Ignore.
 	if( g_FacePatches.Element( facenum ) == g_FacePatches.InvalidIndex() )
 		return;
@@ -4358,20 +4578,31 @@ void BuildFacelights (int iThread, int facenum)
 			v[i] = ( i < numSamples ) ? sample[i].pos : sample[numSamples - 1].pos;
 			n[i] = ( i < numSamples ) ? sample[i].normal : sample[numSamples - 1].normal;
 		}
-		positions.LoadAndSwizzle( v[0], v[1], v[2], v[3] );
-		normals.LoadAndSwizzle( n[0], n[1], n[2], n[3] );
 
-		ComputeIlluminationPointAndNormalsSSE( l, positions, normals, &sampleInfo, numSamples );
-
-		// Fixup sample normals in case of smooth faces
-		if ( !l.isflat )
+		bool anyBake = false;
+		for ( int i = 0; i < numSamples; i++ )
 		{
-			for ( int i = 0; i < numSamples; i++ )
-				sample[i].normal = sampleInfo.m_PointNormals[0].Vec( i );
+			if ( BakeVolume_ShouldBakeSample( facenum, sample[i].pos ) )
+				anyBake = true;
 		}
 
-		// Iterate over all the lights and add their contribution to this group of spots
-		GatherSampleLightAt4Points( sampleInfo, nSample, numSamples );
+		if ( anyBake )
+		{
+			positions.LoadAndSwizzle( v[0], v[1], v[2], v[3] );
+			normals.LoadAndSwizzle( n[0], n[1], n[2], n[3] );
+
+			ComputeIlluminationPointAndNormalsSSE( l, positions, normals, &sampleInfo, numSamples );
+
+			// Fixup sample normals in case of smooth faces
+			if ( !l.isflat )
+			{
+				for ( int i = 0; i < numSamples; i++ )
+					sample[i].normal = sampleInfo.m_PointNormals[0].Vec( i );
+			}
+
+			// Iterate over all the lights and add their contribution to this group of spots
+			GatherSampleLightAt4Points( sampleInfo, nSample, numSamples );
+		}
 	}
 	
 	// Tell the incremental light manager that we're done with this face.

@@ -1,4 +1,4 @@
-// cvrad_fog_vs30.hlsl - fullscreen for screenspace_general (SM3.0)
+// Fullscreen triangle for GMod screenspace_general (SM3.0).
 struct VS_INPUT {
 	float3 pos : POSITION;
 	float2 uv : TEXCOORD0;

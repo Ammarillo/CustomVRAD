@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install CustomVRAD config syntax highlighter into Cursor extensions."""
+"""Copy the PathRAD .cfg highlighter into Cursor's extensions folder."""
 
 from __future__ import annotations
 

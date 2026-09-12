@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// Internal DXR device API (shared by pathtrace modules).
+//========= Copyright PathRAD contributors. ============//
+// DXR device helpers shared by the path-trace modules.
 //=============================================================================//
 #ifndef PATHTRACE_DXR_DEVICE_H
 #define PATHTRACE_DXR_DEVICE_H

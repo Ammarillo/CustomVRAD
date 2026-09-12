@@ -23,6 +23,8 @@
 #include "messbuf.h"
 #include "byteswap.h"
 #include "vrad_gpu.h"
+#include "pathtrace_dxr.h"
+#include "pathtrace_dxr_device.h"
 
 #include <vector>
 #include <algorithm>
@@ -893,42 +895,44 @@ static void ComputeAmbientLighting( int iThread, DetailObjectLump_t& prop, Vecto
 
 
 //-----------------------------------------------------------------------------
-// Computes lighting for a single detal prop
+// Per-prop gather (thread-safe). Commit to the lightstyle lump is serial.
 //-----------------------------------------------------------------------------
-
-static void ComputeLighting( DetailObjectLump_t& prop, int iThread )
+struct DetailLightingSample_t
 {
-	// We're going to take the maximum of the ambient lighting and 
-	// the strongest directional light. This works because we're assuming
-	// the props will have built-in faked lighting.
+	Vector direct[MAX_LIGHTSTYLES];
+	Vector amb[MAX_LIGHTSTYLES];
+};
 
-	Vector directColor[MAX_LIGHTSTYLES];
-	Vector ambColor[MAX_LIGHTSTYLES];
+static void GatherDetailLighting( DetailObjectLump_t &prop, DetailLightingSample_t &s, int iThread )
+{
+	ComputeMaxDirectLighting( prop, s.direct, iThread );
+	ComputeAmbientLighting( iThread, prop, s.amb );
+}
 
-	// Get the max influence of all direct lights
-	ComputeMaxDirectLighting( prop, directColor, iThread );
-
-	// Get the ambient lighting + lightstyles	  
-	ComputeAmbientLighting( iThread, prop, ambColor );
-
-	// Base lighting
+static void CommitDetailLighting( DetailObjectLump_t &prop, const DetailLightingSample_t &s, bool bAmbOnlyStyle0 )
+{
+	// Stock adds classic direct on top of lightmap ambient. After a path-trace
+	// world bake those lightmaps already include sun+GI, so adding direct
+	// double-counts. GPU path writes style 0 itself; this is the CPU fallback.
 	Vector totalColor;
-	VectorAdd( directColor[0], ambColor[0], totalColor );
+	if ( bAmbOnlyStyle0 )
+		VectorCopy( s.amb[0], totalColor );
+	else
+		VectorAdd( s.direct[0], s.amb[0], totalColor );
 	VectorToColorRGBExp32( totalColor, prop.m_Lighting );
 
 	bool hasLightstyles = false;
 	prop.m_LightStyleCount = 0;
-	
-	// lightstyles
-	for (int i = 1; i < MAX_LIGHTSTYLES; ++i )
+
+	for ( int i = 1; i < MAX_LIGHTSTYLES; ++i )
 	{
-		VectorAdd( directColor[i], ambColor[i], totalColor );
+		VectorAdd( s.direct[i], s.amb[i], totalColor );
 		totalColor *= 0.5f;
 
-		if ((totalColor[0] != 0.0f) || (totalColor[1] != 0.0f) ||
-			(totalColor[2] != 0.0f) )
+		if ( ( totalColor[0] != 0.0f ) || ( totalColor[1] != 0.0f ) ||
+			 ( totalColor[2] != 0.0f ) )
 		{
-			if (!hasLightstyles)
+			if ( !hasLightstyles )
 			{
 				prop.m_LightStyles = s_pDetailPropLightStyleLump->Size();
 				hasLightstyles = true;
@@ -936,10 +940,226 @@ static void ComputeLighting( DetailObjectLump_t& prop, int iThread )
 
 			int j = s_pDetailPropLightStyleLump->AddToTail();
 			VectorToColorRGBExp32( totalColor, (*s_pDetailPropLightStyleLump)[j].m_Lighting );
-			(*s_pDetailPropLightStyleLump)[j].m_Style = i;
+			(*s_pDetailPropLightStyleLump)[j].m_Style = (unsigned char)i;
 			++prop.m_LightStyleCount;
 		}
 	}
+}
+
+static void ComputeLighting( DetailObjectLump_t &prop, int iThread )
+{
+	DetailLightingSample_t s;
+	GatherDetailLighting( prop, s, iThread );
+	CommitDetailLighting( prop, s, PathTraceDXR_IsActive() );
+}
+
+static bool DetailHasStyledLights()
+{
+	for ( directlight_t *dl = activelights; dl != NULL; dl = dl->next )
+	{
+		if ( dl->light.type != emit_skyambient && dl->light.style != 0 )
+			return true;
+	}
+	return false;
+}
+
+static void PackDetailBakeLuxel( PtGpuBakeLuxel &job, const Vector &pos, const Vector &nrm, int propIndex )
+{
+	memset( &job, 0, sizeof( job ) );
+	job.pos[0] = pos.x;
+	job.pos[1] = pos.y;
+	job.pos[2] = pos.z;
+	job.luxelWorld = 2.0f;
+	Vector n = nrm;
+	if ( n.LengthSqr() < 1e-8f )
+		n.Init( 0, 0, 1 );
+	else
+		n.NormalizeInPlace();
+	job.normal[0] = n.x;
+	job.normal[1] = n.y;
+	job.normal[2] = n.z;
+	unsigned int h = (unsigned int)propIndex * 747796405u;
+	h ^= (unsigned int)( pos.x * 12.9898f + pos.y * 78.233f + pos.z * 37.719f );
+	h *= 1597334677u;
+	job.seed = h;
+	job.faceNum = -1;
+	job.aaN = 1;
+	job.skipPropIndex = -1;
+}
+
+// Grass sprites are billboards. Shading with the host displacement normal
+// aims the Lambert lobe into the hillside in a bowl, so NEE sun dies and
+// cosine-hemi bounces hit the opposite inner slope (near-black).
+static void DetailVegetationNormal( const Vector &surfN, Vector &out )
+{
+	Vector n = surfN;
+	if ( n.LengthSqr() < 1e-8f )
+		n.Init( 0, 0, 1 );
+	else
+		n.NormalizeInPlace();
+	out.x = n.x * 0.30f;
+	out.y = n.y * 0.30f;
+	out.z = n.z * 0.30f + 0.70f;
+	if ( out.LengthSqr() < 1e-8f )
+		out.Init( 0, 0, 1 );
+	else
+		out.NormalizeInPlace();
+	if ( out.z < 0.25f )
+	{
+		out.z = 0.25f;
+		out.NormalizeInPlace();
+	}
+}
+
+// Style-0 linear luxel on the host ground (no extra albedo multiply).
+static bool SampleHostLuxelLinear( int iThread, const Vector &origin, Vector &out )
+{
+	out.Init();
+	Vector start = origin;
+	start.z += 16.0f;
+	Vector end = origin;
+	end.z -= 80.0f;
+
+	Ray_t ray;
+	ray.Init( start, end, vec3_origin, vec3_origin );
+	CLightSurface surfEnum( iThread );
+	if ( !surfEnum.FindIntersection( ray ) || !surfEnum.m_pSurface )
+		return false;
+
+	dface_t *pFace = surfEnum.m_pSurface;
+	texinfo_t *pTex = &texinfo[pFace->texinfo];
+	if ( ( pTex->flags & SURF_SKY ) || pFace->lightofs < 0 || pFace->styles[0] == 255 )
+		return false;
+
+	if ( !surfEnum.m_bHasLuxel )
+	{
+		ColorRGBExp32ToVector( *dface_AvgLightColor( pFace, 0 ), out );
+		return out.LengthSqr() > 0.0f;
+	}
+
+	const int smax = pFace->m_LightmapTextureSizeInLuxels[0] + 1;
+	const int tmax = pFace->m_LightmapTextureSizeInLuxels[1] + 1;
+	const int ds = clamp( (int)surfEnum.m_LuxelCoord.x, 0, smax - 1 );
+	const int dt = clamp( (int)surfEnum.m_LuxelCoord.y, 0, tmax - 1 );
+	ColorRGBExp32 *pLightmap = (ColorRGBExp32 *)&(*pdlightdata)[pFace->lightofs];
+	pLightmap += dt * smax + ds;
+	ColorRGBExp32ToVector( *pLightmap, out );
+	return out.LengthSqr() > 0.0f;
+}
+
+static Vector *s_pDetailGpuCol = NULL;
+static int *s_pDetailJobProp = NULL;
+static DetailObjectLump_t *s_pDetailFloorProps = NULL;
+
+static void ThreadFloorDetailGpu( int iThread, int j )
+{
+	Vector origin, surfN;
+	ComputeWorldCenter( s_pDetailFloorProps[s_pDetailJobProp[j]], origin, surfN );
+	Vector host;
+	if ( !SampleHostLuxelLinear( iThread, origin, host ) )
+		return;
+	if ( host.x > s_pDetailGpuCol[j].x ) s_pDetailGpuCol[j].x = host.x;
+	if ( host.y > s_pDetailGpuCol[j].y ) s_pDetailGpuCol[j].y = host.y;
+	if ( host.z > s_pDetailGpuCol[j].z ) s_pDetailGpuCol[j].z = host.z;
+}
+
+// One GPU path-trace sample at each sprite/model centre (style 0). Matches world GI.
+static bool ComputeDetailPropLightingPathTraceGPU( DetailObjectLump_t *pProps, int count )
+{
+	if ( !PathTraceDXR_CanBakeProps() || !pProps || count <= 0 )
+		return false;
+
+	CUtlVector<PtGpuBakeLuxel> jobs;
+	CUtlVector<int> jobProp;
+	CUtlVector<char> baked;
+	jobs.EnsureCapacity( count );
+	jobProp.EnsureCapacity( count );
+	baked.SetCount( count );
+	memset( baked.Base(), 0, count );
+
+	for ( int i = 0; i < count; ++i )
+	{
+		Vector origin, surfN;
+		ComputeWorldCenter( pProps[i], origin, surfN );
+		if ( !origin.IsValid() || !surfN.IsValid() )
+			continue;
+
+		Vector nShade;
+		DetailVegetationNormal( surfN, nShade );
+
+		// Sprite centre is already off the mesh. Lift in world Z so a bowl
+		// normal cannot slide the sample into the opposite hillside.
+		Vector pos = origin;
+		pos.z += 2.0f;
+
+		PtGpuBakeLuxel job;
+		PackDetailBakeLuxel( job, pos, nShade, i );
+		jobs.AddToTail( job );
+		jobProp.AddToTail( i );
+		baked[i] = 1;
+	}
+
+	if ( jobs.Count() <= 0 )
+		return false;
+
+	CUtlVector<PtGpuBakeResult> results;
+	results.SetCount( jobs.Count() );
+
+	if ( !PathTraceDXR_BakePropSamples( jobs.Base(), (unsigned)jobs.Count(), results.Base(),
+										false, true, 0, 0, "detail props" ) )
+		return false;
+
+	CUtlVector<Vector> gpuCol;
+	gpuCol.SetCount( jobs.Count() );
+	for ( int j = 0; j < jobs.Count(); ++j )
+		gpuCol[j].Init( results[j].radiance[0], results[j].radiance[1], results[j].radiance[2] );
+
+	s_pDetailGpuCol = gpuCol.Base();
+	s_pDetailJobProp = jobProp.Base();
+	s_pDetailFloorProps = pProps;
+	RunThreadsOnIndividual( jobs.Count(), false, ThreadFloorDetailGpu );
+	s_pDetailGpuCol = NULL;
+	s_pDetailJobProp = NULL;
+	s_pDetailFloorProps = NULL;
+
+	const bool bStyles = DetailHasStyledLights();
+	for ( int j = 0; j < jobs.Count(); ++j )
+	{
+		DetailObjectLump_t &prop = pProps[jobProp[j]];
+		Vector c = gpuCol[j];
+		VectorToColorRGBExp32( c, prop.m_Lighting );
+		prop.m_LightStyleCount = 0;
+
+		if ( !bStyles )
+			continue;
+
+		DetailLightingSample_t s;
+		memset( &s, 0, sizeof( s ) );
+		ComputeMaxDirectLighting( prop, s.direct, THREADINDEX_MAIN );
+		s.direct[0].Init();
+		VectorCopy( c, s.amb[0] );
+		CommitDetailLighting( prop, s, true );
+	}
+
+	for ( int i = 0; i < count; ++i )
+	{
+		if ( baked[i] )
+			continue;
+		ColorRGBExp32 red;
+		VectorToColorRGBExp32( Vector( 1, 0, 0 ), red );
+		pProps[i].m_Lighting = red;
+		pProps[i].m_LightStyleCount = 0;
+	}
+
+	return true;
+}
+
+static DetailObjectLump_t *s_pDetailWorkProps = NULL;
+static DetailLightingSample_t *s_pDetailWorkSamples = NULL;
+
+static void ThreadGatherDetailLighting( int iThread, int iWorkItem )
+{
+	GatherDetailLighting( s_pDetailWorkProps[iWorkItem], s_pDetailWorkSamples[iWorkItem], iThread );
 }
 
 
@@ -1124,6 +1344,8 @@ void VMPI_ReceiveDetailPropWU( int iWorkUnit, MessageBuffer *pBuf, int iWorker )
 //-----------------------------------------------------------------------------
 void ComputeDetailPropLighting( int iThread )
 {
+	NOTE_UNUSED( iThread );
+
 	// illuminate them all
 	DetailObjectLump_t* pProps;
 	int count = UnserializeDetailProps( pProps );
@@ -1140,15 +1362,33 @@ void ComputeDetailPropLighting( int iThread )
 		UnserializeDetailPropLighting( GAMELUMP_DETAIL_PROP_LIGHTING_HDR, GAMELUMP_DETAIL_PROP_LIGHTING_HDR_VERSION, s_DetailPropLightStyleLumpHDR );
 	}
 
-	StartPacifier("Computing detail prop lighting : ");
-
-	for (int i = 0; i < count; ++i)
+	if ( ComputeDetailPropLightingPathTraceGPU( pProps, count ) )
 	{
-		UpdatePacifier( (float)i / (float)count );
-		ComputeLighting( pProps[i], iThread );
+		WriteDetailLightingLumps();
+		return;
 	}
+
+	const bool bAmbOnlyStyle0 = PathTraceDXR_IsActive();
+	if ( bAmbOnlyStyle0 )
+	{
+		Msg( "Detail prop lighting: pathtrace GPU unavailable - sampling world lightmaps (no extra direct).\n" );
+		fflush( stdout );
+	}
+
+	Vector skyWarm;
+	ComputeSkyAmbientAtPos( vec3_origin, skyWarm );
+
+	CUtlVector<DetailLightingSample_t> samples;
+	samples.SetCount( count );
+	s_pDetailWorkProps = pProps;
+	s_pDetailWorkSamples = samples.Base();
+	RunThreadsOnIndividual( count, true, ThreadGatherDetailLighting );
+	s_pDetailWorkProps = NULL;
+	s_pDetailWorkSamples = NULL;
+
+	for ( int i = 0; i < count; ++i )
+		CommitDetailLighting( pProps[i], samples[i], bAmbOnlyStyle0 );
 
 	// Write detail prop lightstyle lump...
 	WriteDetailLightingLumps();
-	EndPacifier( true );
 }

@@ -1,8 +1,8 @@
-//========= Copyright CustomVRAD, All rights reserved. ============//
+//========= Copyright PathRAD, All rights reserved. ============//
 //
-// water_medium - physically based underwater lighting for bake (CustomVRAD).
-// Auto from BSP leafWaterData + water VMT fog; optional water_light_vol override.
-// Mode A: Beer-Lambert + Kd. Mode C: homogeneous volume path tracing.
+// water_medium - underwater lighting for the bake.
+// Built from BSP leafWaterData + water VMT fog; optional water_light_vol override.
+// Mode A: Beer-Lambert + Kd. Mode B: homogeneous volume path tracing.
 //
 //=============================================================================//
 
@@ -21,7 +21,7 @@ enum WaterMediumMode_t
 {
 	WATER_MEDIUM_OFF = 0,
 	WATER_MEDIUM_ATTENUATION = 1,	// Mode A: Beer-Lambert + Kd
-	WATER_MEDIUM_VOLUME = 2,		// Mode C: free-flight volume PT
+	WATER_MEDIUM_VOLUME = 2,		// Mode B: free-flight volume PT
 };
 
 struct WaterIops_t
@@ -83,7 +83,7 @@ Vector WaterMedium_DownwellingScale( const Vector &pos );
 const WaterIops_t *WaterMedium_GetIops( int bodyIndex );
 bool WaterMedium_GetGpuBodies( WaterGpuBody_t *out, int maxOut, int *pCount );
 
-// Volume PT helpers (Mode C)
+// Volume PT helpers (Mode B)
 bool WaterMedium_SampleFreeFlight( const Vector &pos, const Vector &dir, float u,
 								  float *pTFree, Vector *pSigmaT, int *pBodyIndex );
 Vector WaterMedium_ScatterAlbedo( int bodyIndex );	// sigmaS / sigmaT

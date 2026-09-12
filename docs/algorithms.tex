@@ -1,4 +1,4 @@
-% CustomVRAD — Algorithm Reference
+% PathRAD — Algorithm Reference
 % Compile: pdflatex algorithms.tex  (×2 for TOC/refs)
 % Requires: amsmath, booktabs, hyperref, listings, microtype, tcolorbox (optional)
 \documentclass[11pt,a4paper]{article}
@@ -95,31 +95,30 @@
 
 \title{%
   \vspace{-1.2em}
-  {\color{cvBlue}\Huge\bfseries CustomVRAD}\\[0.35em]
+  {\color{cvBlue}\Huge\bfseries PathRAD}\\[0.35em]
   {\Large Technical Report: Lightmap Baking Algorithms}\\[0.5em]
   {\normalsize\color{cvMuted} Path-traced and radiosity pipelines for Source~SDK~2013 / Garry's~Mod}
 }
-\author{CustomVRAD contributors}
+\author{PathRAD contributors}
 \date{\today}
 
 \begin{document}
 \maketitle
 \begin{abstract}
 \noindent
-CustomVRAD is a 64-bit lightmap compiler derived from Valve VRAD (Source~SDK~2013)
-for Garry's~Mod. It retains the classical patch-radiosity pipeline and optionally
-replaces world-face (and static-prop) lighting with a DirectX~Raytracing (DXR)
-path tracer. Extensions include hero-wavelength spectral transport, contact-hardening
-soft shadows, textured emissive and filter materials, spatial volume overrides,
-multi-scale ambient occlusion, IESNA photometric spot evaluation, directional
-projected-texture modulation on \ent{light\_spot}, physically based underwater
-media (Beer--Lambert / Kd and homogeneous volume path tracing), BSP-shipped
-volumetric fog grids with convex brush SDFs and a screenspace shader,
-GPU texture shadows for \vmt{alphatest}/\vmt{translucent} props, and lightmap
-post-processes (denoising, seam stitching, edge pull).
-This document states the algorithms as implemented: estimators, coordinate
-conventions, parameter semantics, and the relationship between classic and
-path-traced bake modes.
+PathRAD is a 64-bit VRAD fork for Garry's~Mod (Source~SDK~2013).
+It still has Valve's patch-radiosity path, and you can swap world-face
+(and static-prop) lighting for a DirectX~Raytracing (DXR) path tracer.
+This paper writes down how those bakes actually work: what is estimated,
+how coordinates are defined, what the flags mean, and how the two pipelines
+relate.
+
+Also covered: hero-wavelength spectral transport, contact-hardening soft
+shadows, textured emissive and filter materials, lighting volumes, ambient
+occlusion, IES spots and projected textures, underwater media
+(Beer--Lambert / Kd and homogeneous volume path tracing), volumetric fog
+grids packed into the BSP, texture shadows on \vmt{alphatest}/\vmt{translucent}
+props, and lightmap post-process (denoise, seam stitch, edge pull).
 \end{abstract}
 
 \tableofcontents
@@ -129,7 +128,7 @@ path-traced bake modes.
 \section{System overview}
 %═══════════════════════════════════════════════════════════════════════════════
 
-CustomVRAD produces HDR and LDR lightmaps compatible with the Source engine.
+PathRAD writes HDR and LDR lightmaps the Source engine can load.
 World-face lighting uses exactly one of two pipelines:
 
 \begin{enumerate}[leftmargin=1.6em]
@@ -138,12 +137,17 @@ World-face lighting uses exactly one of two pipelines:
   \item \textbf{Path tracing} --- D3D12 DXR baker (\flag{-pathtrace} /
         \flag{-dxr}). On success it replaces world-face direct lighting and
         radiosity bounce. Static props may share the integrator under
-        \flag{-StaticPropLighting}.
+        \flag{-StaticPropLighting}. Detail props use the same GPU baker
+        (one sample at the sprite or model centre).
 \end{enumerate}
 
-Leaf ambient cubes, detail props, and engine-exported worldlights remain on
-stock paths, with volume-aware CustomVRAD extensions where noted.
-If DXR initialisation or bake fails, the compiler falls back to classic
+Leaf ambient cubes and engine-exported worldlights stay on
+stock paths, with PathRAD volume extras where noted.
+Detail props use the GPU path tracer when the world bake succeeded
+(same spp/bounces as prop verts). If that baker is unavailable, they
+sample nearby world lightmaps and do not add classic direct (which
+would double-count the sun).
+If DXR setup or the bake fails, the compiler falls back to classic
 radiosity for world faces (and CPU gather for props).
 
 \begin{notebox}[GPU backends]
@@ -162,6 +166,20 @@ radiosity for world faces (and CPU gather for props).
   \item Optional AO, denoise, seam stitch, edge-pull-aware sampling.
   \item Write lightmaps / prop vertex colours into the BSP.
 \end{enumerate}
+
+\subsection{\texttt{bake\_volume} local rebake}
+
+If any enabled \ent{bake\_volume} brush is present (and \flag{-nobakevolume}
+was not passed), only lighting \emph{samples} whose world position lies inside
+the (padded) volume AABB are recomputed. World luxels and static-prop vertices
+outside the AABB are copied from the previous compile
+(\texttt{mapsrc/<map>.vradlm}). A face or prop that straddles the volume is
+updated only on the interior samples.
+
+The ray-tracing scene is unchanged: geometry outside the volume still occludes
+and bounces into interior samples; it is simply not itself written. Faces or
+vertices with no cache hit are still baked so they cannot go black.
+\flag{-nobakevolume} forces a full map bake (and still refreshes the cache).
 
 \subsection{Notation}
 
@@ -390,13 +408,17 @@ Four stratified wavelengths per path over $[380,780]\,\mathrm{nm}$:
 \subsection{RGB $\leftrightarrow$ spectrum}
 
 \begin{itemize}[leftmargin=1.4em]
-  \item \textbf{Upsampling:} Smits~(1999) bases as tabulated in PBRT-v3
-        ($32$ samples over the visible range) --- separate bases for reflectance
-        and illuminants.
+  \item \textbf{Upsampling:} Smits~(1999) combination as in PBRT-v3.
+        CPU tables are $32$ samples; the GPU baker uses $16$ knots (even samples
+        plus $720\,\mathrm{nm}$) so DXC stays stable. Separate illuminant and
+        reflectance bases. A previous GPU Gaussian-lobe upsample mixed green
+        into saturated red (lights looked orange); Smits red is near-zero below
+        $\sim 580\,\mathrm{nm}$.
   \item \textbf{Transport:} illumination adds and reflectance multiplies in
         $\lambda$-space.
   \item \textbf{Projection:} Wyman analytic CIE~1931 $2^\circ$ CMFs $\to$ XYZ,
-        then IEC~61966-2-1 / Rec.~709 matrix to linear sRGB.
+        then IEC~61966-2-1 / Rec.~709 matrix to linear sRGB, scaled so
+        $\mathrm{SpecIllum}(1,1,1)$ round-trips to neutral RGB.
 \end{itemize}
 
 Monte Carlo reconstruction weight uses the CIE $Y$ integral
@@ -630,7 +652,8 @@ Local overrides for \code{BounceBoost}, \code{BounceChroma}, and
 Soft sphere point light: low-discrepancy samples inside radius $R$ (default~$16$).
 Sample count scales with $R$ ($\sim\!16$ at default, cap~$40$; reduced with
 \flag{-fast}). Early-out when fully lit/shadowed. Exported as a hard point light
-at the centre (softness is bake-only).
+at the centre (softness is bake-only). Optional \code{LightTemperature} as in
+\cref{sec:cct}.
 
 \subsection{\ent{fog\_volume} (runtime volumetric fog)}
 \label{sec:fogvol}
@@ -650,7 +673,7 @@ modulates density; wind scrolls the atlas in world space.
 \ent{fog\_volume\_blocker} carves fog (soft blend, also plane-aware) into atlas
 alpha and is
 rewritten to \code{info\_null}. Enabled volumes are rewritten to
-\code{lua\_run\_on\_client} stubs that hook \code{RenderScreenspaceEffects}.
+\code{lua\_run} stubs that hook \code{RenderScreenspaceEffects}.
 Clients that block map client Lua will not draw fog.
 
 \subsection{\ent{water\_light\_vol}}
@@ -664,7 +687,7 @@ Priority resolves overlapping overrides.
 \label{sec:underwater}
 %═══════════════════════════════════════════════════════════════════════════════
 
-Physically motivated participating-medium bake for BSP water
+Participating-medium bake for BSP water
 (\code{leafWaterData} / \code{CONTENTS\_WATER}). Units: hammer inches;
 ocean tables in $1/\mathrm{m}$ are scaled by $1/39.3700787$.
 
@@ -676,9 +699,9 @@ ocean tables in $1/\mathrm{m}$ are scaled by $1/39.3700787$.
   Flag & Mode & Estimator \\
   \midrule
   \flag{-underwater} & A & Beer--Lambert segment $T$ $+$ Kd downwelling for sky/sun \\
-  \flag{-uw\_volume} & C & Homogeneous free-flight volume PT (implies A media) \\
-  \flag{-uw\_off} & --- & Force disable \\
-  \flag{-uw\_maxscatter}~$N$ & C cap & Max medium events (default~$8$, max~$64$) \\
+	\flag{-uw\_volume} & B & Homogeneous free-flight volume PT (implies A media) \\
+	\flag{-uw\_off} & --- & Force disable \\
+	\flag{-uw\_maxscatter}~$N$ & B cap & Max medium events (default~$8$, max~$64$) \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -719,9 +742,9 @@ Sky/sun irradiance at a submerged receiver uses \emph{only}
   S_{\mathrm{sky}}(\vect{x})=\exp(-\vect{k}_d\, z_{\mathrm{depth}}),
 \end{equation}
 floored at $0.04$ per channel --- not $T\times S_{\mathrm{sky}}$
-(double counting). Local lights use segment $T$ only. Mode~C disables Kd.
+(double counting). Local lights use segment $T$ only. Mode~B disables Kd.
 
-\subsection{Mode C (volume path tracing)}
+\subsection{Mode B (volume path tracing)}
 
 Inside water, free-flight distance $t=-\ln(1-u)/\max(\sigma_t)$ is accepted
 only if $t$ is strictly less than the AABB exit distance; otherwise the ray
@@ -819,6 +842,20 @@ The photometric weight is $w_{\mathrm{IES}}=s\,I(\theta,\phi)$ with scale
 $s=\texttt{IESScale}$ (default~$1$). Optional \code{IESBrightness}${}\ge 0$
 overrides stock \code{\_light} brightness for the bake only;
 \code{IESMaxIntensity} caps per-sample RGB after attenuation.
+
+\subsection{Color temperature}
+\label{sec:cct}
+
+Optional entity keys \code{LightTemperature} and \code{AmbientTemperature}
+(Kelvin). A value $\le 0$ leaves authored RGB unchanged. Otherwise the
+correlated colour temperature is converted to sRGB with the Tanner Helland
+approximation of Mitchell Charity's blackbody locus (clamped to
+$1000\,\mathrm{K}$--$40000\,\mathrm{K}$), decoded with the same $\gamma=2.2$
+as Hammer \code{\_light} colours, then scaled to preserve Rec.~709 luminance
+of the existing intensity so brightness (the fourth \code{\_light} number)
+is unchanged. The tinted linear RGB is used for the bake and for exported
+worldlights. \code{AmbientTemperature} applies to \code{\_ambient} on
+\ent{light\_environment} / \ent{light\_env\_vol}.
 
 \subsection{Projected texture classification}
 \label{sec:projtex}
@@ -1061,8 +1098,8 @@ displacements skipped. Disable with \flag{-nostitch}.
   \flag{-pt\_denoiser} & oidn & oidn $\mid$ optix $\mid$ sakai \\
   \flag{-pt\_prop\_vertgrid} & $4$ & Prop vert atlas on ($0$=per-vert) \\
   \flag{-underwater} & off & Mode~A Beer--Lambert $+$ Kd \\
-  \flag{-uw\_volume} & off & Mode~C free-flight volume PT \\
-  \flag{-uw\_maxscatter}~$N$ & $8$ & Cap medium scatters (Mode~C) \\
+  \flag{-uw\_volume} & off & Mode~B free-flight volume PT \\
+  \flag{-uw\_maxscatter}~$N$ & $8$ & Cap medium scatters (Mode~B) \\
   \flag{-bounce}~$N$ & $100$ & Classic radiosity rounds ($0$=direct) \\
   \flag{-texbounce} & off & Textured radiosity albedo \\
   \flag{-energy}/\flag{-cavity} & off / $0.70$ & Cavity damp \\
@@ -1075,6 +1112,7 @@ displacements skipped. Disable with \flag{-nostitch}.
   \flag{-ao\_force} & off & AO even under pathtrace GI \\
   \flag{-edgepull} & $0.5$ & Luxel edge inset \\
   \flag{-nostitch} & --- & Disable seam stitch \\
+  \flag{-nobakevolume} & --- & Ignore \texttt{bake\_volume}; full map rebake \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -1099,7 +1137,8 @@ displacements skipped. Disable with \flag{-nostitch}.
   \code{pathtrace\_dxr.cpp} & CPU PathLi, bake orchestration, AA, cleanup \\
   \code{pathtrace\_dxr\_gpu\_bake.inl} & HLSL PathLi (spectral, NEE, filters) \\
   \code{pathtrace\_dxr\_device.*} & D3D12 / DXR device, AS, dispatches \\
-  \code{pt\_spectral.h} & Smits bases, CIE CMFs, RGB$\leftrightarrow\lambda$ \\
+  \code{pt\_spectral.h} & Smits bases, CIE CMFs, RGB$\leftrightarrow\lambda$ (CPU) \\
+  \code{pt\_spectral\_hlsl.cpp} & GPU 16-knot Smits + CIE injection \\
   \code{oklab.h} & Perceptual colour ops \\
   \code{vrad\_emit*.cpp} & Textured emission + area mesh \\
   \code{vrad\_filter.cpp} & Colored glass transmittance \\
@@ -1110,6 +1149,7 @@ displacements skipped. Disable with \flag{-nostitch}.
   \code{absorb.cpp} / \code{bounce\_vol.cpp} & Volume effects \\
   \code{fog\_volume.*} & Fog grid bake + BSP Lua/shader pack \\
   \code{water\_medium.*} & Underwater IOPs, Beer--Lambert, volume PT hooks \\
+  \code{bake\_volume.*} & Local AABB rebake (per-luxel / per-vert) + cache \\
   \code{ies\_profile.*} & IESNA LM-63 load + angular eval \\
   \code{light\_projection.*} & Projected VTF load, CPU sample, GPU arrays \\
   \code{pathtrace\_*denoise*} & OIDN / OptiX / Sakai \\
@@ -1137,6 +1177,8 @@ displacements skipped. Disable with \flag{-nostitch}.
   \item Intel Open Image Denoise --- \code{RTLightmap} model.
   \item NVIDIA OptiX --- HDR AI denoiser.
   \item IESNA LM-63 --- standard file format for luminous intensity distributions.
+  \item Tanner Helland / Mitchell Charity --- blackbody (Planckian) RGB approximation
+        for correlated colour temperature.
   \item Microsoft Direct3D --- cubemap face selection and $(s,t)$ mapping
         (\code{texCUBE} / environment maps).
   \item Jerlov / Solonenko \& Mobley --- ocean optical water types (IOP tables).
@@ -1152,9 +1194,9 @@ displacements skipped. Disable with \flag{-nostitch}.
 \vspace{1.5em}
 {\color{cvMuted}\footnotesize
 \noindent
-Algorithms are described as implemented in the CustomVRAD source tree.
-CLI defaults and clamps may change between revisions; \texttt{vrad.exe} help
-output and \texttt{configs/full.cfg} define shipping presets.
+This matches the code in the PathRAD tree.
+Flag defaults can change; trust \texttt{vrad.exe} help and
+\texttt{configs/full.cfg} for what actually ships.
 }
 
 \end{document}

@@ -1,5 +1,5 @@
 {
-  "_comment": "CustomVRAD -config flag catalog for tools/lint_vrad_cfg.ps1. arity = number of value args after the flag.",
+  "_comment": "Flag list for tools/lint_vrad_cfg.py. arity = how many values follow the flag.",
   "bannedInConfig": [
     "-config",
     "-cfg",
@@ -400,6 +400,10 @@
     {
       "arity": 0,
       "name": "-nostitch"
+    },
+    {
+      "arity": 0,
+      "name": "-nobakevolume"
     },
     {
       "arity": 0,

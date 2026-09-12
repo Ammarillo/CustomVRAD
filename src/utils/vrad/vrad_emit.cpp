@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// VMT-driven textured emissive surfaces for VRAD.
+//========= Copyright PathRAD contributors. ============//
+// Textured emission from VMT ($vrad_emit*).
 //=============================================================================//
 
 #include "vrad_emit.h"

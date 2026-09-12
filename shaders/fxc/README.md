@@ -1,11 +1,18 @@
-# Shaders for fog_volume (GMod screenspace_general)
+# Fog shaders
 
-Place compiled Valve shaders here after running:
+These are the compiled Valve shaders for GMod `screenspace_general`.
 
-    .\shaders\build_shaders.ps1
+Build them with:
 
-Required files:
-  cvrad_fog_ps30.vcs
-  cvrad_fog_vs30.vcs
+```powershell
+.\shaders\build_shaders.ps1
+```
 
-CustomVRAD packs these when fog_volume entities are present.
+You need `ShaderCompile.exe` (see the script if it isn't on PATH).
+
+Required files in this folder:
+
+- `pathrad_fog_vs30.vcs` (fullscreen VS)
+- `pathrad_fog_ps30.vcs` (fog)
+
+VRAD packs this pair into the BSP when the map has a `fog_volume`.

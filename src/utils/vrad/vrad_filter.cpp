@@ -1,5 +1,5 @@
-//========= Copyright CustomVRAD contributors. ============//
-// VMT-driven colored light transmission through thin-sheet glass.
+//========= Copyright PathRAD contributors. ============//
+// Colored light through thin glass ($vrad_filter*). Path tracing only.
 //=============================================================================//
 
 #include "vrad_filter.h"

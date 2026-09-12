@@ -469,6 +469,9 @@
     <ClCompile Include="absorb.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="bake_volume.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="water_medium.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

@@ -1114,7 +1114,7 @@ static void StitchSampleLightmap( const byte *pSnapshot, const dface_t *f, int n
 		  c01 * ( ( 1.0f - fs ) * ft ) + c11 * ( fs * ft );
 }
 
-void StitchLightmapSeams()
+void StitchLightmapSeams( bool bPathTraceNarrow )
 {
 	if ( !pdlightdata->Count() )
 		return;
@@ -1125,7 +1125,27 @@ void StitchLightmapSeams()
 	snapshot.SetCount( pdlightdata->Count() );
 	Q_memcpy( snapshot.Base(), pdlightdata->Base(), pdlightdata->Count() );
 
+	// Pathtrace: only weld the edge itself (~1 luxel). Wider radiosity band
+	// blurs PT detail into blotches; skipping stitch entirely leaves penumbra shifts.
+	const float luxelRange = bPathTraceNarrow ? 1.25f : STITCH_LUXEL_RANGE;
+
+	// Chart membership — PairEdges misses T-junction splits (duplicated verts),
+	// so faceneighbor alone almost never sees coplanar floor cuts.
+	const int nCharts = LightmapChartCount();
+	CUtlVector< CUtlVector<int> > chartMembers;
+	if ( nCharts > 0 )
+	{
+		chartMembers.SetSize( nCharts );
+		for ( int i = 0; i < numfaces; ++i )
+		{
+			const int cid = GetLightmapChartId( i );
+			if ( cid >= 0 && cid < nCharts )
+				chartMembers[cid].AddToTail( i );
+		}
+	}
+
 	int nStitchedLuxels = 0;
+	int nChartSeams = 0;
 
 	for ( int facenum = 0; facenum < numfaces; ++facenum )
 	{
@@ -1146,9 +1166,37 @@ void StitchLightmapSeams()
 
 		faceneighbor_t *fn = &faceneighbor[facenum];
 
+		// Candidate partners: vertex neighbors + same lightmap chart.
+		CUtlVector<int> candidates;
+		candidates.EnsureCapacity( fn->numneighbors + 8 );
 		for ( int j = 0; j < fn->numneighbors; ++j )
+			candidates.AddToTail( fn->neighbor[j] );
+		const int cid = GetLightmapChartId( facenum );
+		if ( cid >= 0 && cid < chartMembers.Count() )
 		{
-			const int neighborFace = fn->neighbor[j];
+			const CUtlVector<int> &mates = chartMembers[cid];
+			for ( int m = 0; m < mates.Count(); ++m )
+			{
+				const int other = mates[m];
+				if ( other == facenum )
+					continue;
+				bool bDup = false;
+				for ( int c = 0; c < candidates.Count(); ++c )
+				{
+					if ( candidates[c] == other )
+					{
+						bDup = true;
+						break;
+					}
+				}
+				if ( !bDup )
+					candidates.AddToTail( other );
+			}
+		}
+
+		for ( int j = 0; j < candidates.Count(); ++j )
+		{
+			const int neighborFace = candidates[j];
 			dface_t *fB = &g_pFaces[neighborFace];
 			if ( texinfo[fB->texinfo].flags & TEX_SPECIAL )
 				continue;
@@ -1158,6 +1206,8 @@ void StitchLightmapSeams()
 			// only stitch across (nearly) coplanar seams
 			if ( DotProduct( fn->facenormal, faceneighbor[neighborFace].facenormal ) < STITCH_COPLANAR_DOT )
 				continue;
+
+			const bool bSameChart = FacesShareMergedLightmapChart( facenum, neighborFace );
 
 			// Collect geometrically overlapping coplanar edges (identical vert
 			// indices OR T-junction / duplicated-vert seams), in A's luxel space.
@@ -1186,12 +1236,18 @@ void StitchLightmapSeams()
 			if ( !nEdges )
 				continue;
 
+			if ( bSameChart )
+				++nChartSeams;
+
 			lightinfo_t lB;
 			InitLightinfo( &lB, neighborFace );
 			const int wB = fB->m_LightmapTextureSizeInLuxels[0] + 1;
 			const int hB = fB->m_LightmapTextureSizeInLuxels[1] + 1;
 			const int bumpCountB = ( texinfo[fB->texinfo].flags & SURF_BUMPLIGHT ) ? ( NUM_BUMP_VECTS + 1 ) : 1;
 			const int bumpCount = min( bumpCountA, bumpCountB );
+
+			// Chart seams under pathtrace: slightly wider weld.
+			const float pairRange = ( bPathTraceNarrow && bSameChart ) ? 1.75f : luxelRange;
 
 			for ( int i = 0; i < fl->numluxels; ++i )
 			{
@@ -1205,12 +1261,15 @@ void StitchLightmapSeams()
 					if ( d < dist )
 						dist = d;
 				}
-				if ( dist > STITCH_LUXEL_RANGE )
+				if ( dist > pairRange )
 					continue;
 
 				// 0.5 at the edge (both sides meet at the average), fading to 0
-				float x = 1.0f - ( dist / STITCH_LUXEL_RANGE );
+				float x = 1.0f - ( dist / pairRange );
 				float blend = 0.5f * x * x * ( 3.0f - 2.0f * x );
+				// Chart members under pathtrace: force a hard 50/50 at the edge row.
+				if ( bPathTraceNarrow && bSameChart && dist <= 0.75f )
+					blend = 0.5f;
 
 				Vector2D coordB;
 				WorldToLuxelSpace( &lB, fl->luxel[i], coordB );
@@ -1249,5 +1308,8 @@ void StitchLightmapSeams()
 		}
 	}
 
-	Msg( "Stitched %d seam luxel(s)\n", nStitchedLuxels );
+	if ( bPathTraceNarrow )
+		Msg( "Stitched %d pathtrace seam luxel(s) (narrow band, %d chart seam pair(s))\n", nStitchedLuxels, nChartSeams );
+	else
+		Msg( "Stitched %d seam luxel(s)\n", nStitchedLuxels );
 }

@@ -1,6 +1,6 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
-// light_environment_volume support: per-volume sky/ambient with blend.
+// light_env_vol: per-volume sky/ambient with a fade.
 //
 //=============================================================================//
 

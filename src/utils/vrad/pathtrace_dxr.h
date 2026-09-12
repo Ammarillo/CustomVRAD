@@ -1,7 +1,6 @@
-//========= Copyright CustomVRAD contributors. ============//
+//========= Copyright PathRAD contributors. ============//
 //
-// Optional D3D12 + DXR path-traced lightmap baker (-pathtrace / -dxr).
-// Independent of the OpenCL -gpu path.
+// Path-traced lightmaps (-pathtrace / -dxr). Separate from the OpenCL -gpu bounce path.
 //
 //=============================================================================//
 
@@ -53,7 +52,8 @@ bool PathTraceDXR_BakeWorldFaces();
 bool PathTraceDXR_BakePropSamples( const struct PtGpuBakeLuxel *samples, unsigned nSamples,
 								   struct PtGpuBakeResult *outResults, bool bLightmapQuality = false,
 								   bool bEndSession = true,
-								   unsigned progressBase = 0, unsigned progressTotal = 0 );
+								   unsigned progressBase = 0, unsigned progressTotal = 0,
+								   const char *tagOverride = nullptr );
 
 // Direct light only (0 bounces): local lights, sun, sky, emit surfaces — including
 // $vrad_filter colored-glass transmission. Used for fog_volume LightBoost.

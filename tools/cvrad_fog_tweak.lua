@@ -1,4 +1,0 @@
--- Obsolete: fog live ConVars are now embedded in the BSP via two lua_run entities.
--- After rebaking with current CustomVRAD, use console:
---   cvf_de / cvf_ns / cvf_cov / cvf_wspd / cvf_wyaw / cvf_bd
--- Do not install this file; keep the map-only path.

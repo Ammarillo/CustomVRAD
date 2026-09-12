@@ -1,4 +1,4 @@
-//========= Copyright CustomVRAD contributors. ============//
+//========= Copyright PathRAD contributors. ============//
 // Sakai et al. SIGGRAPH Asia 2024 - Welch-gated filter for luxels.
 // Small multi-pass kernels (no large windows / dilated A-Trous) to avoid
 // lightmap "block" plateaus. Variance is spatially stabilized and a mild

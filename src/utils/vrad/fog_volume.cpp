@@ -1,6 +1,6 @@
-//========= Copyright CustomVRAD, All rights reserved. ============//
+//========= Copyright PathRAD, All rights reserved. ============//
 //
-// fog_volume - 3D light-grid bake + BSP pak embed + lua_run_on_client rewrite.
+// fog_volume - bake a 3D light grid into the BSP, rewrite the entity to lua_run.
 //
 //=============================================================================//
 
@@ -9,6 +9,8 @@
 #include "vtf/vtf.h"
 #include "bitmap/imageformat.h"
 #include "tier1/utlbuffer.h"
+#include "tier1/checksum_crc.h"
+#include "filesystem_tools.h"
 #include "pathtrace_dxr.h"
 #include "pathtrace_dxr_device.h"
 
@@ -135,7 +137,7 @@ static void ComputeGridDims( const Vector &mins, const Vector &maxs, float spaci
 }
 
 // Encode brush signed distance into atlas alpha (0..1). Positive dist = inside.
-// Range must match kFogSdfRange in cvrad_fog_ps30.hlsl.
+// Range must match kFogSdfRange in pathrad_fog_ps30.hlsl.
 static const float kFogSdfRange = 1024.0f;
 
 static void AddAABBPlanes( const Vector &mins, const Vector &maxs,
@@ -873,7 +875,7 @@ static float FogValueNoisePeriodic( float px, float py, float pz )
 	return nxy0 + ( nxy1 - nxy0 ) * fz;
 }
 
-// Tileable FBM: octave frequencies are integers so the period stays seamless.
+// Tileable FBM: integer octave frequencies so the tile repeats without an edge.
 static float FogFbmPeriodic( float px, float py, float pz )
 {
 	float a = 0.0f;
@@ -965,15 +967,89 @@ static bool EnsureFogNoiseAtlasPacked()
 	return true;
 }
 
-// Unique per-bake shader name suffix. The engine caches pixel shaders by
-// name, and a stale cache entry silently shadows an updated .vcs. A fresh
-// name every bake makes that impossible. Must keep the _ps30/_vs30 postfix.
+// Unique per-bake suffix for shader + material names. GMod caches:
+//   1) IMaterial by path (Lua Material())
+//   2) pixel shaders by $pixshader name
+//   3) VCS by filename under garrysmod/shaders/fxc (often preferred over BSP pak)
+// A timestamp-only id is not enough if the same second is reused or if a stale
+// on-disk .vcs / Material() entry keeps the old bytecode. Mix VCS bytes + time.
+// Must keep the _ps30/_vs30 postfix on the packed names.
+static char s_ShaderId[16];
+
+static bool FileExistsDisk( const char *path );
+static bool FindShaderFile( const char *fileName, char *outPath, int outSize );
+
+static unsigned FogVolume_HashFile( const char *diskPath )
+{
+	FILE *f = fopen( diskPath, "rb" );
+	if ( !f )
+		return 0;
+	fseek( f, 0, SEEK_END );
+	long sz = ftell( f );
+	fseek( f, 0, SEEK_SET );
+	if ( sz <= 0 )
+	{
+		fclose( f );
+		return 0;
+	}
+	CUtlBuffer buf( 0, (int)sz, 0 );
+	buf.EnsureCapacity( (int)sz );
+	fread( buf.Base(), 1, sz, f );
+	fclose( f );
+	return (unsigned)CRC32_ProcessSingleBuffer( buf.Base(), (int)sz );
+}
+
 static const char *FogVolume_ShaderId()
 {
-	static char s_ShaderId[16];
-	if ( !s_ShaderId[0] )
-		Q_snprintf( s_ShaderId, sizeof( s_ShaderId ), "%08x", (unsigned int)time( NULL ) );
+	if ( s_ShaderId[0] )
+		return s_ShaderId;
+
+	unsigned h = (unsigned)time( NULL );
+#ifdef _WIN32
+	h ^= (unsigned)GetTickCount();
+	LARGE_INTEGER qpc;
+	if ( QueryPerformanceCounter( &qpc ) )
+		h ^= (unsigned)qpc.LowPart ^ (unsigned)qpc.HighPart;
+#endif
+
+	char disk[MAX_PATH];
+	const char *src[] = {
+		"pathrad_fog_vs30.vcs",
+		"pathrad_fog_ps30.vcs"
+	};
+	for ( int i = 0; i < 2; ++i )
+	{
+		if ( FindShaderFile( src[i], disk, sizeof( disk ) ) )
+			h ^= FogVolume_HashFile( disk ) + (unsigned)( i * 0x9e3779b9 );
+	}
+
+	if ( !h )
+		h = 0x6d5a4c3u;
+	Q_snprintf( s_ShaderId, sizeof( s_ShaderId ), "%08x", h );
 	return s_ShaderId;
+}
+
+static void StampFogMaterialPaths()
+{
+	char mapName[64];
+	GetMapBaseName( mapName, sizeof( mapName ) );
+	const char *id = FogVolume_ShaderId();
+	for ( int i = 0; i < s_nVolumes; ++i )
+	{
+		Q_snprintf( s_Volumes[i].materialPath, sizeof( s_Volumes[i].materialPath ),
+					"maps/%s/fog_volume_%d_%s", mapName, s_Volumes[i].hammerId, id );
+	}
+}
+
+static int ActiveFogCount()
+{
+	int n = 0;
+	for ( int i = 0; i < s_nVolumes; ++i )
+	{
+		if ( s_Volumes[i].bEnabled )
+			++n;
+	}
+	return n;
 }
 
 static int FogGridLog2Minus2( int n )
@@ -989,7 +1065,7 @@ static int FogGridLog2Minus2( int n )
 	return log;
 }
 
-// Bit-pack for shader c3.w (see cvrad_fog_ps30.hlsl). Fits in float32 ints (<2^24).
+// Bit-pack for shader c3.w (see pathrad_fog_ps30.hlsl). Fits in float32 ints (<2^24).
 // NoiseScale + WindSpeed are full floats (c2.z / c2.w) — not packed.
 static int PackFogShaderConst( int nz, int blendMode, float coverage, float windYaw, float blendDist )
 {
@@ -1036,8 +1112,8 @@ static void WriteVMT( const FogVolume_t &v, int nx, int ny, int nz, int atlasW, 
 	Q_snprintf( body, sizeof( body ),
 		"\"screenspace_general\"\n"
 		"{\n"
-		"\t\"$pixshader\" \"cvrad_fog_%s_ps30\"\n"
-		"\t\"$vertexshader\" \"cvrad_fog_%s_vs30\"\n"
+		"\t\"$pixshader\" \"%s_%s_ps30\"\n"
+		"\t\"$vertexshader\" \"%s_%s_vs30\"\n"
 		"\t\"$basetexture\" \"%s\"\n"
 		"\t\"$texture1\" \"_rt_ResolvedFullFrameDepth\"\n"
 		"\t\"$texture2\" \"%s\"\n"
@@ -1071,7 +1147,7 @@ static void WriteVMT( const FogVolume_t &v, int nx, int ny, int nz, int atlasW, 
 		"\t\"$c3_z\" \"0\"\n"
 		"\t\"$c3_w\" \"%d\"\n"
 		"}\n",
-		FogVolume_ShaderId(), FogVolume_ShaderId(),
+		"pathrad_fog", FogVolume_ShaderId(), "pathrad_fog", FogVolume_ShaderId(),
 		v.materialPath, noisePath,
 		v.density,
 		v.mins.x, v.mins.y, v.mins.z, v.maxs.z,
@@ -1112,14 +1188,14 @@ static bool FindShaderFile( const char *fileName, char *outPath, int outSize )
 		char dir[MAX_PATH];
 		Q_strncpy( dir, modulePath, sizeof( dir ) );
 		Q_StripFilename( dir );
-		// CustomVRAD/bin -> CustomVRAD/shaders/fxc
+		// PathRAD/bin -> PathRAD/shaders/fxc
 		Q_snprintf( candidate, sizeof( candidate ), "%s\\..\\shaders\\fxc\\%s", dir, fileName );
 		if ( FileExistsDisk( candidate ) )
 		{
 			Q_strncpy( outPath, candidate, outSize );
 			return true;
 		}
-		// CustomVRAD/game/bin/x64 -> ../../shaders/fxc
+		// PathRAD/game/bin/x64 -> ../../shaders/fxc
 		Q_snprintf( candidate, sizeof( candidate ), "%s\\..\\..\\..\\shaders\\fxc\\%s", dir, fileName );
 		if ( FileExistsDisk( candidate ) )
 		{
@@ -1142,6 +1218,52 @@ static bool FindShaderFile( const char *fileName, char *outPath, int outSize )
 		return true;
 	}
 	return false;
+}
+
+static void ClearOldGameShaders()
+{
+	if ( !gamedir[0] )
+		return;
+	char pattern[MAX_PATH];
+	Q_snprintf( pattern, sizeof( pattern ), "%sshaders\\fxc\\pathrad_*.vcs", gamedir );
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA( pattern, &fd );
+	if ( h == INVALID_HANDLE_VALUE )
+		return;
+	int n = 0;
+	do
+	{
+		if ( fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY )
+			continue;
+		char del[MAX_PATH];
+		Q_snprintf( del, sizeof( del ), "%sshaders\\fxc\\%s", gamedir, fd.cFileName );
+		if ( DeleteFileA( del ) )
+			++n;
+	} while ( FindNextFileA( h, &fd ) );
+	FindClose( h );
+	if ( n > 0 )
+		Msg( "screenspace: removed %d stale pathrad_*.vcs from %sshaders\\fxc\n", n, gamedir );
+}
+
+static void InstallShaderToGame( const char *pakFileName, const void *data, int size )
+{
+	if ( !gamedir[0] || !data || size <= 0 )
+		return;
+	char shadersDir[MAX_PATH], fxcDir[MAX_PATH], dest[MAX_PATH];
+	Q_snprintf( shadersDir, sizeof( shadersDir ), "%sshaders", gamedir );
+	Q_snprintf( fxcDir, sizeof( fxcDir ), "%s\\fxc", shadersDir );
+	CreateDirectoryA( shadersDir, NULL );
+	CreateDirectoryA( fxcDir, NULL );
+	Q_snprintf( dest, sizeof( dest ), "%s\\%s", fxcDir, pakFileName );
+	FILE *f = fopen( dest, "wb" );
+	if ( !f )
+	{
+		Warning( "screenspace: could not write %s (GMod will keep any cached shader)\n", dest );
+		return;
+	}
+	fwrite( data, 1, size, f );
+	fclose( f );
+	Msg( "screenspace: installed %s (%d bytes) — GMod loads this over the BSP pak\n", dest, size );
 }
 
 static void PackShaderIfPresent( const char *fileName, const char *pakFileName )
@@ -1178,6 +1300,19 @@ static void PackShaderIfPresent( const char *fileName, const char *pakFileName )
 	Q_snprintf( pakName, sizeof( pakName ), "shaders/fxc/%s", pakFileName );
 	AddBufferToPak( GetPakFile(), pakName, buf.Base(), buf.TellPut(), false );
 	Msg( "fog_volume: packed %s (%d bytes)\n", pakName, buf.TellPut() );
+	InstallShaderToGame( pakFileName, buf.Base(), buf.TellPut() );
+}
+
+static void PackScreenspaceShaders()
+{
+	ClearOldGameShaders();
+	char psName[80], vsName[80];
+	Q_snprintf( psName, sizeof( psName ), "pathrad_fog_%s_ps30.vcs", FogVolume_ShaderId() );
+	Q_snprintf( vsName, sizeof( vsName ), "pathrad_fog_%s_vs30.vcs", FogVolume_ShaderId() );
+	PackShaderIfPresent( "pathrad_fog_ps30.vcs", psName );
+	PackShaderIfPresent( "pathrad_fog_vs30.vcs", vsName );
+	Msg( "screenspace: packed pathrad_fog id=%s (unique names bust GMod shader cache)\n",
+		 FogVolume_ShaderId() );
 }
 
 static void BuildLuaCodeSetup( const FogVolume_t &v, char *out, int outSize )
@@ -1297,6 +1432,8 @@ static void RewriteEntity( FogVolume_t &v )
 	char codeB[MAX_VALUE];
 	BuildLuaCodeSetup( v, codeA, sizeof( codeA ) );
 	BuildLuaCodeDraw( v, codeB, sizeof( codeB ) );
+	Msg( "fog_volume %d: lua_run setup=%d draw=%d / %d\n",
+		 v.hammerId, (int)strlen( codeA ), (int)strlen( codeB ), MAX_VALUE - 1 );
 	if ( (int)strlen( codeA ) >= MAX_VALUE - 1 || (int)strlen( codeB ) >= MAX_VALUE - 1 )
 	{
 		Warning( "fog_volume: generated Code too long for hammerid %d (setup=%d draw=%d)\n",
@@ -1405,6 +1542,7 @@ void FogVolume_Clear()
 	s_nBlockers = 0;
 	s_bNoiseAtlasPacked = false;
 	s_NoiseMaterialPath[0] = 0;
+	s_ShaderId[0] = 0;
 }
 
 bool FogVolume_HasVolumes()
@@ -1537,28 +1675,25 @@ void FogVolume_ParseEntity( entity_t *e )
 
 void FogVolume_BakeAndEmbed()
 {
-	if ( s_nVolumes <= 0 && s_nBlockers <= 0 )
+	const int nActive = ActiveFogCount();
+	const bool bFog = nActive > 0;
+
+	if ( !bFog && s_nBlockers <= 0 )
 		return;
 
-	int nActive = 0;
-	for ( int i = 0; i < s_nVolumes; ++i )
+	if ( bFog )
 	{
-		if ( s_Volumes[i].bEnabled )
-			++nActive;
+		StampFogMaterialPaths();
+		PackScreenspaceShaders();
 	}
 
-	if ( nActive > 0 )
+	if ( bFog )
 	{
 		if ( s_nBlockers > 0 )
-			Msg( "fog_volume: baking %d volume(s) with %d blocker(s)...\n", nActive, s_nBlockers );
+			Msg( "fog_volume: baking %d volume(s) with %d blocker(s)...\n",
+				 nActive, s_nBlockers );
 		else
 			Msg( "fog_volume: baking %d volume(s)...\n", nActive );
-
-		char psName[64], vsName[64];
-		Q_snprintf( psName, sizeof( psName ), "cvrad_fog_%s_ps30.vcs", FogVolume_ShaderId() );
-		Q_snprintf( vsName, sizeof( vsName ), "cvrad_fog_%s_vs30.vcs", FogVolume_ShaderId() );
-		PackShaderIfPresent( "cvrad_fog_ps30.vcs", psName );
-		PackShaderIfPresent( "cvrad_fog_vs30.vcs", vsName );
 
 		for ( int i = 0; i < s_nVolumes; ++i )
 		{
