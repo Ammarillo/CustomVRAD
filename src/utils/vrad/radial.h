@@ -80,6 +80,17 @@ radial_t *BuildPatchRadial( int facenum );
 // bPathTraceNarrow: tighter blend (path-trace soft shadows without blotching).
 void StitchLightmapSeams( bool bPathTraceNarrow = false );
 
+// Dilate dark outer luxels on concave creases (and any non-coplanar border
+// whose last luxel is a sharp outlier) from that row's own stable interior texel.
+// A light/shadow terminator keeps each side. Diagonal concave edges fill luxels
+// that sit mostly outside the face. Coplanar VBSP splits are left for StitchLightmapSeams.
+// bConcaveOnly skips the unknown-border fallback; use that after stitching.
+void ReconstructLightmapEdgeLuxels( Vector *grid, int width, int height, int facenum, bool bConcaveOnly = false );
+
+// Lit-side hard shadow edges: small lift toward bright neighbors (capped) so
+// bilinear filtering does not smear darkness into open areas.
+void CompressBilinearShadowLeak( Vector *grid, int width, int height );
+
 // utilities
 bool FloatLess( float const& src1, float const& src2 );
 

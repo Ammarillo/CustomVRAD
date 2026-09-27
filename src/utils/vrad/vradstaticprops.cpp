@@ -40,6 +40,7 @@
 
 #include "pathtrace_dxr.h"
 #include "pathtrace_dxr_device.h"
+#include "bounce_albedo.h"
 #include "messbuf.h"
 #include "vmpi.h"
 #include "vmpi_distribute_work.h"
@@ -73,6 +74,9 @@ struct colorTexel_t
 	float		m_fDistanceToTri; // If we are outside of the triangle, how far away is it?
 	bool		m_bValid;
 	bool		m_bPossiblyInteresting;
+	Vector		m_AxisU;		// world/model units per lightmap texel
+	Vector		m_AxisV;
+	float		m_LuxelWorld;	// texel footprint (0 = unknown)
 
 };
 
@@ -263,6 +267,8 @@ public:
 
 	// iterate all the instanced static props and compute their vertex lighting
 	void ComputeLighting( int iThread );
+	void AddAmbientSamplePositions( int leafIndex, CUtlVector<Vector> &positions, int maxPositions ) const;
+	bool IsPointInsideStaticProp( int iThread, int leafIndex, const Vector &position ) const;
 
 private:
 	// VMPI stuff.
@@ -317,6 +323,9 @@ private:
 		Vector					m_maxs;
 		Vector					m_LightingOrigin;
 		int						m_ModelIdx;
+		unsigned short			m_FirstLeaf;
+		unsigned short			m_LeafCount;
+		unsigned char			m_Solid;
 		BSPTreeDataHandle_t		m_Handle;
 		CUtlVector<MeshData_t>	m_MeshData;
 		int                     m_Flags;
@@ -342,6 +351,8 @@ private:
 	// The list of all static props
 	CUtlVector <StaticPropDict_t>	m_StaticPropDict;
 	CUtlVector <CStaticProp>		m_StaticProps;
+	CUtlVector<StaticPropLeafLump_t> m_StaticPropLeaves;
+	CUtlVector< CUtlVector<int> >	m_LeafStaticProps;
 
 	bool m_bIgnoreStaticPropTrace;
 
@@ -363,6 +374,93 @@ static CVradStaticPropMgr	g_StaticPropMgr;
 IVradStaticPropMgr* StaticPropMgr()
 {
 	return &g_StaticPropMgr;
+}
+
+void CVradStaticPropMgr::AddAmbientSamplePositions( int leafIndex, CUtlVector<Vector> &positions, int maxPositions ) const
+{
+	if ( leafIndex < 0 || leafIndex >= m_LeafStaticProps.Count() || positions.Count() >= maxPositions )
+		return;
+
+	const CUtlVector<int> &leafProps = m_LeafStaticProps[leafIndex];
+	const int totalSlots = leafProps.Count() * 8;
+	const int wanted = min( maxPositions - positions.Count(), totalSlots );
+	static const int sideAxis[6] = { 2, 2, 0, 0, 1, 1 };
+	static const int sideSign[6] = { 1, -1, 1, -1, 1, -1 };
+	const float clearance = 16.0f;
+
+	for ( int i = 0; i < wanted; ++i )
+	{
+		const int slot = (int)( (int64)i * totalSlots / wanted );
+		const CStaticProp &prop = m_StaticProps[leafProps[slot / 8]];
+		const int propSlot = slot % 8;
+
+		Vector sample = ( prop.m_mins + prop.m_maxs ) * 0.5f;
+		if ( propSlot == 0 )
+		{
+			sample = prop.m_Origin;
+			sample.z = prop.m_mins.z + 36.0f;
+		}
+		else if ( propSlot >= 2 )
+		{
+			const int side = propSlot - 2;
+			const int axis = sideAxis[side];
+			if ( sideSign[side] > 0 )
+				sample[axis] = prop.m_maxs[axis] - clearance;
+			else
+				sample[axis] = prop.m_mins[axis] + clearance;
+		}
+		if ( PointLeafnum( sample ) == leafIndex )
+			positions.AddToTail( sample );
+	}
+}
+
+bool CVradStaticPropMgr::IsPointInsideStaticProp( int iThread, int leafIndex, const Vector &position ) const
+{
+	NOTE_UNUSED( iThread );
+	if ( !s_pPhysCollision || leafIndex < 0 || leafIndex >= m_LeafStaticProps.Count() )
+		return false;
+
+	const CUtlVector<int> &leafProps = m_LeafStaticProps[leafIndex];
+	for ( int i = 0; i < leafProps.Count(); ++i )
+	{
+		const CStaticProp &prop = m_StaticProps[leafProps[i]];
+		if ( prop.m_Solid == 0 )
+			continue;
+		if ( prop.m_ModelIdx < 0 || prop.m_ModelIdx >= m_StaticPropDict.Count() )
+			continue;
+		if ( position.x < prop.m_mins.x || position.x > prop.m_maxs.x ||
+			 position.y < prop.m_mins.y || position.y > prop.m_maxs.y ||
+			 position.z < prop.m_mins.z || position.z > prop.m_maxs.z )
+			continue;
+
+		const StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
+		Ray_t ray;
+		ray.Init( position, position, vec3_origin, vec3_origin );
+
+		bool tested = false;
+		for ( int solid = 0; solid < dict.m_loadedModel.solidCount; ++solid )
+		{
+			const CPhysCollide *pModel = dict.m_loadedModel.solids
+				? dict.m_loadedModel.solids[solid] : NULL;
+			if ( !pModel )
+				continue;
+			tested = true;
+			trace_t trace;
+			Q_memset( &trace, 0, sizeof( trace ) );
+			s_pPhysCollision->TraceBox( ray, pModel, prop.m_Origin, prop.m_Angles, &trace );
+			if ( trace.startsolid || trace.allsolid )
+				return true;
+		}
+		if ( !tested && dict.m_pModel )
+		{
+			trace_t trace;
+			Q_memset( &trace, 0, sizeof( trace ) );
+			s_pPhysCollision->TraceBox( ray, dict.m_pModel, prop.m_Origin, prop.m_Angles, &trace );
+			if ( trace.startsolid || trace.allsolid )
+				return true;
+		}
+	}
+	return false;
 }
 
 
@@ -1078,6 +1176,7 @@ void CVradStaticPropMgr::CreateCollisionModel( char const* pModelName )
 	int i = m_StaticPropDict.AddToTail();
 	m_StaticPropDict[i].m_pModel = NULL;
 	m_StaticPropDict[i].m_pStudioHdr = NULL;
+	Q_memset( &m_StaticPropDict[i].m_loadedModel, 0, sizeof( m_StaticPropDict[i].m_loadedModel ) );
 	Q_strncpy( m_StaticPropDict[i].m_Name, pModelName ? pModelName : "", sizeof( m_StaticPropDict[i].m_Name ) );
 
 	if ( !LoadStudioModel( pModelName, buf ) )
@@ -1173,8 +1272,50 @@ void CVradStaticPropMgr::UnserializeModels( CUtlBuffer& buf )
 		VectorCopy( lump.m_LightingOrigin, m_StaticProps[i].m_LightingOrigin );
 		m_StaticProps[i].m_bLightingOriginValid = ( lump.m_Flags & STATIC_PROP_USE_LIGHTING_ORIGIN ) > 0;
 		m_StaticProps[i].m_ModelIdx = lump.m_PropType;
+		m_StaticProps[i].m_FirstLeaf = lump.m_FirstLeaf;
+		m_StaticProps[i].m_LeafCount = lump.m_LeafCount;
+		m_StaticProps[i].m_Solid = lump.m_Solid;
 		m_StaticProps[i].m_Handle = TREEDATA_INVALID_HANDLE;
 		m_StaticProps[i].m_Flags = lump.m_Flags;
+
+		// Cache an oriented world AABB. Ambient probes use its faces as cheap
+		// surface-guided candidates; the final placement test uses real geometry.
+		m_StaticProps[i].m_mins = lump.m_Origin;
+		m_StaticProps[i].m_maxs = lump.m_Origin;
+		if ( lump.m_PropType >= 0 && lump.m_PropType < m_StaticPropDict.Count() )
+		{
+			const StaticPropDict_t &dict = m_StaticPropDict[lump.m_PropType];
+			matrix3x4_t matrix;
+			AngleMatrix( lump.m_Angles, lump.m_Origin, matrix );
+			m_StaticProps[i].m_mins.Init( FLT_MAX, FLT_MAX, FLT_MAX );
+			m_StaticProps[i].m_maxs.Init( -FLT_MAX, -FLT_MAX, -FLT_MAX );
+			for ( int corner = 0; corner < 8; ++corner )
+			{
+				Vector local(
+					( corner & 1 ) ? dict.m_Maxs.x : dict.m_Mins.x,
+					( corner & 2 ) ? dict.m_Maxs.y : dict.m_Mins.y,
+					( corner & 4 ) ? dict.m_Maxs.z : dict.m_Mins.z );
+				Vector world;
+				VectorTransform( local, matrix, world );
+				VectorMin( m_StaticProps[i].m_mins, world, m_StaticProps[i].m_mins );
+				VectorMax( m_StaticProps[i].m_maxs, world, m_StaticProps[i].m_maxs );
+			}
+			// Collision can extend beyond studio hull bounds. Expand the broad phase
+			// so every VPhysics solid still reaches the exact point-containment test.
+			if ( s_pPhysCollision && dict.m_loadedModel.solids )
+			{
+				for ( int solid = 0; solid < dict.m_loadedModel.solidCount; ++solid )
+				{
+					if ( !dict.m_loadedModel.solids[solid] )
+						continue;
+					Vector collisionMins, collisionMaxs;
+					s_pPhysCollision->CollideGetAABB( &collisionMins, &collisionMaxs,
+						dict.m_loadedModel.solids[solid], lump.m_Origin, lump.m_Angles );
+					VectorMin( m_StaticProps[i].m_mins, collisionMins, m_StaticProps[i].m_mins );
+					VectorMax( m_StaticProps[i].m_maxs, collisionMaxs, m_StaticProps[i].m_maxs );
+				}
+			}
+		}
 
 		// Changed this from using DXT1 to RGB888 because the compression artifacts were pretty nasty. 
 		// TODO: Consider changing back or basing this on user selection in hammer.
@@ -1206,11 +1347,26 @@ void CVradStaticPropMgr::UnserializeStaticProps()
 		CUtlBuffer buf( g_GameLumps.GetGameLump(handle), size, CUtlBuffer::READ_ONLY );
 		UnserializeModelDict( buf );
 
-		// Skip the leaf list data
+		// Keep the leaf list so ambient probes can be seeded from nearby props.
 		int count = buf.GetInt();
-		buf.SeekGet( CUtlBuffer::SEEK_CURRENT, count * sizeof(StaticPropLeafLump_t) );
+		m_StaticPropLeaves.SetCount( count );
+		if ( count )
+			buf.Get( m_StaticPropLeaves.Base(), count * sizeof(StaticPropLeafLump_t) );
 
 		UnserializeModels( buf );
+
+		m_LeafStaticProps.SetCount( numleafs );
+		for ( int propIndex = 0; propIndex < m_StaticProps.Count(); ++propIndex )
+		{
+			const CStaticProp &prop = m_StaticProps[propIndex];
+			const int end = min( (int)prop.m_FirstLeaf + (int)prop.m_LeafCount, m_StaticPropLeaves.Count() );
+			for ( int i = prop.m_FirstLeaf; i < end; ++i )
+			{
+				const int leaf = m_StaticPropLeaves[i].m_Leaf;
+				if ( leaf >= 0 && leaf < numleafs )
+					m_LeafStaticProps[leaf].AddToTail( propIndex );
+			}
+		}
 	}
 }
 
@@ -1237,7 +1393,6 @@ void CVradStaticPropMgr::Init()
 
 void CVradStaticPropMgr::Shutdown()
 {
-
 	// Remove all static prop model data
 	for (int i = m_StaticPropDict.Size(); --i >= 0; )
 	{
@@ -1254,6 +1409,8 @@ void CVradStaticPropMgr::Shutdown()
 
 	m_StaticProps.Purge();
 	m_StaticPropDict.Purge();
+	m_StaticPropLeaves.Purge();
+	m_LeafStaticProps.Purge();
 }
 
 void ComputeLightmapColor( dface_t* pFace, Vector &color )
@@ -2126,6 +2283,9 @@ struct PtPropTexelTemplate
 	int resY = 0;
 	CUtlVector<Vector> localPos;
 	CUtlVector<Vector> localNrm;
+	CUtlVector<Vector> localAxisU;
+	CUtlVector<Vector> localAxisV;
+	CUtlVector<float> luxelWorld;
 	CUtlVector<bool> valid;
 	CUtlVector<bool> interesting;
 };
@@ -2161,6 +2321,26 @@ static void PtPackBakeLuxel( PtGpuBakeLuxel &job, const Vector &pos, const Vecto
 	job.faceNum = -1;
 	job.aaN = 1;
 	job.skipPropIndex = skipProp;
+	job.sampleScale = 1;
+}
+
+// Prop lightmap texels: same footprint AA and luxel size as world faces.
+static void PtPackBakeLuxelLightmap( PtGpuBakeLuxel &job, const Vector &pos, const Vector &nrm,
+									  const Vector &axisU, const Vector &axisV, float luxelWorld,
+									  int skipProp, int propIndex )
+{
+	PtPackBakeLuxel( job, pos, nrm, skipProp, propIndex );
+	if ( luxelWorld < 0.25f )
+		luxelWorld = 2.0f;
+	job.luxelWorld = luxelWorld;
+	job.axisU[0] = axisU.x; job.axisU[1] = axisU.y; job.axisU[2] = axisU.z;
+	job.axisV[0] = axisV.x; job.axisV[1] = axisV.y; job.axisV[2] = axisV.z;
+	int aaN = g_nPathTraceLuxelAA;
+	if ( aaN < 1 ) aaN = 1;
+	if ( aaN > 5 ) aaN = 5;
+	if ( axisU.LengthSqr() < 1e-8f || axisV.LengthSqr() < 1e-8f )
+		aaN = 1;
+	job.aaN = aaN;
 }
 
 // Lower LODs share the studio vertex pool. Verts never hit by the LOD0 sample grid
@@ -2202,6 +2382,151 @@ static void PtInheritUnlitPropVertColors( CUtlVector<colorVertex_t> &verts,
 		}
 		verts[i].m_Color = verts[bestIdx].m_Color;
 		verts[i].m_bValid = verts[bestIdx].m_bValid;
+	}
+}
+
+static float PropTexelLuma( const Vector &v )
+{
+	return 0.2126f * v.x + 0.7152f * v.y + 0.0722f * v.z;
+}
+
+// Prop texels inside a brush stay marked valid with a black bake, and denoise
+// then smears that black onto the visible chart. Drop them from the chart and
+// lift the one straddling texel from the visible side. Dilate fills the hole.
+static void PtHealPropBrushIntersection( CUtlVector<colorTexel_t> &texels, int resX, int resY )
+{
+	if ( resX <= 1 || resY <= 1 || texels.Count() != resX * resY )
+		return;
+
+	const int n = resX * resY;
+	CUtlVector<char> embedded;
+	CUtlVector<char> partial;
+	embedded.SetCount( n );
+	partial.SetCount( n );
+	int nEmb = 0;
+	for ( int i = 0; i < n; ++i )
+	{
+		embedded[i] = 0;
+		partial[i] = 0;
+		colorTexel_t &ct = texels[i];
+		if ( !ct.m_bValid )
+			continue;
+
+		Vector p = ct.m_WorldPosition;
+		const bool centerIn = PositionInSolid( p );
+		int cornersIn = 0;
+		if ( ct.m_AxisU.LengthSqr() > 1e-8f && ct.m_AxisV.LengthSqr() > 1e-8f )
+		{
+			const Vector hu = ct.m_AxisU * 0.5f;
+			const Vector hv = ct.m_AxisV * 0.5f;
+			Vector c0 = p + hu + hv;
+			Vector c1 = p + hu - hv;
+			Vector c2 = p - hu + hv;
+			Vector c3 = p - hu - hv;
+			if ( PositionInSolid( c0 ) ) ++cornersIn;
+			if ( PositionInSolid( c1 ) ) ++cornersIn;
+			if ( PositionInSolid( c2 ) ) ++cornersIn;
+			if ( PositionInSolid( c3 ) ) ++cornersIn;
+		}
+		if ( centerIn || cornersIn >= 2 )
+		{
+			embedded[i] = 1;
+			++nEmb;
+		}
+		else if ( cornersIn == 1 )
+		{
+			partial[i] = 1;
+		}
+	}
+	if ( !nEmb )
+		return;
+
+	const int kDx[4] = { 1, -1, 0, 0 };
+	const int kDy[4] = { 0, 0, 1, -1 };
+	for ( int y = 0; y < resY; ++y )
+	{
+		for ( int x = 0; x < resX; ++x )
+		{
+			const int idx = y * resX + x;
+			if ( embedded[idx] || !texels[idx].m_bValid )
+				continue;
+			if ( !partial[idx] )
+			{
+				bool beside = false;
+				for ( int k = 0; k < 4 && !beside; ++k )
+				{
+					const int nx = x + kDx[k];
+					const int ny = y + kDy[k];
+					if ( nx < 0 || ny < 0 || nx >= resX || ny >= resY )
+						continue;
+					if ( embedded[ny * resX + nx] )
+						beside = true;
+				}
+				if ( !beside )
+					continue;
+			}
+
+			float refL = -1.0f;
+			Vector ref( 0, 0, 0 );
+			bool agree = true;
+			int nRef = 0;
+			bool touch = false;
+			for ( int k = 0; k < 4; ++k )
+			{
+				const int nx = x + kDx[k];
+				const int ny = y + kDy[k];
+				if ( nx < 0 || ny < 0 || nx >= resX || ny >= resY )
+					continue;
+				const int ni = ny * resX + nx;
+				if ( embedded[ni] )
+				{
+					touch = true;
+					const int ox = x - kDx[k];
+					const int oy = y - kDy[k];
+					if ( ox < 0 || oy < 0 || ox >= resX || oy >= resY )
+						continue;
+					const int oi = oy * resX + ox;
+					if ( embedded[oi] || partial[oi] || !texels[oi].m_bValid )
+						continue;
+					const float ol = PropTexelLuma( texels[oi].m_Color );
+					if ( !nRef )
+					{
+						refL = ol;
+						ref = texels[oi].m_Color;
+					}
+					else if ( fabsf( ol - refL ) / max( max( ol, refL ), 1e-4f ) > 0.35f )
+						agree = false;
+					++nRef;
+					continue;
+				}
+				if ( !partial[idx] || partial[ni] || !texels[ni].m_bValid )
+					continue;
+				const float ol = PropTexelLuma( texels[ni].m_Color );
+				if ( !nRef )
+				{
+					refL = ol;
+					ref = texels[ni].m_Color;
+				}
+				else if ( fabsf( ol - refL ) / max( max( ol, refL ), 1e-4f ) > 0.35f )
+					agree = false;
+				++nRef;
+			}
+			if ( partial[idx] )
+				touch = true;
+			if ( !touch || !agree || !nRef || refL <= 0.02f )
+				continue;
+			if ( PropTexelLuma( texels[idx].m_Color ) < refL * 0.90f )
+				texels[idx].m_Color = ref;
+		}
+	}
+
+	for ( int i = 0; i < n; ++i )
+	{
+		if ( !embedded[i] )
+			continue;
+		texels[i].m_bValid = false;
+		texels[i].m_Color.Init();
+		texels[i].m_bPossiblyInteresting = true;
 	}
 }
 
@@ -2255,6 +2580,179 @@ static void PtDilatePropTexels( CUtlVector<colorTexel_t> &texels, int resX, int 
 		}
 		for ( int k = 0; k < stagedIdx.Count(); ++k )
 			texels[stagedIdx[k]].m_Color = staged[k];
+	}
+}
+
+// Denoise each UV island on its own, edge-extended so gutters stay out of the filter.
+// A single atlas pass would mix unrelated charts and darken them against empty padding.
+static void PtDenoisePropLightmap( CUtlVector<colorTexel_t> &texels, int resX, int resY )
+{
+	if ( !g_bPathTraceDenoise || !PathTraceDenoise_IsReady() )
+		return;
+	if ( resX <= 1 || resY <= 1 || texels.Count() != resX * resY )
+		return;
+
+	const int n = resX * resY;
+	const float blend = min( 1.0f, max( 0.0f, g_flPathTraceDenoiseStrength ) );
+	CUtlVector<int> comp;
+	comp.SetCount( n );
+	memset( comp.Base(), 0, n * sizeof( int ) );
+
+	auto inChart = [&]( int i ) -> bool
+	{
+		if ( texels[i].m_bValid )
+			return true;
+		return texels[i].m_bPossiblyInteresting && texels[i].m_Color.LengthSqr() > 1e-12f;
+	};
+
+	CUtlVector<int> stack;
+	stack.EnsureCapacity( 1024 );
+	int nextId = 1;
+
+	for ( int seed = 0; seed < n; ++seed )
+	{
+		if ( comp[seed] != 0 || !inChart( seed ) )
+			continue;
+
+		const int id = nextId++;
+		int count = 0;
+		int minX = resX, minY = resY, maxX = 0, maxY = 0;
+		int sp = 0;
+		stack.RemoveAll();
+		stack.AddToTail( seed );
+		comp[seed] = id;
+		while ( sp < stack.Count() )
+		{
+			const int i = stack[sp++];
+			const int x = i % resX;
+			const int y = i / resX;
+			if ( x < minX ) minX = x;
+			if ( y < minY ) minY = y;
+			if ( x > maxX ) maxX = x;
+			if ( y > maxY ) maxY = y;
+			++count;
+
+			const int nb[4] = {
+				( x > 0 ) ? i - 1 : -1,
+				( x + 1 < resX ) ? i + 1 : -1,
+				( y > 0 ) ? i - resX : -1,
+				( y + 1 < resY ) ? i + resX : -1
+			};
+			for ( int k = 0; k < 4; ++k )
+			{
+				const int j = nb[k];
+				if ( j < 0 || comp[j] != 0 || !inChart( j ) )
+					continue;
+				comp[j] = id;
+				stack.AddToTail( j );
+			}
+		}
+
+		if ( count < 16 )
+			continue;
+
+		const int pad = 8;
+		const int bw = ( maxX - minX + 1 ) + pad * 2;
+		const int bh = ( maxY - minY + 1 ) + pad * 2;
+		if ( bw < 4 || bh < 4 )
+			continue;
+
+		CUtlVector<Vector> img;
+		CUtlVector<unsigned char> filled;
+		img.SetCount( bw * bh );
+		filled.SetCount( bw * bh );
+		memset( img.Base(), 0, img.Count() * sizeof( Vector ) );
+		memset( filled.Base(), 0, filled.Count() );
+
+		for ( int i = 0; i < stack.Count(); ++i )
+		{
+			const int src = stack[i];
+			if ( comp[src] != id )
+				continue;
+			const int x = src % resX;
+			const int y = src / resX;
+			const int dx = ( x - minX ) + pad;
+			const int dy = ( y - minY ) + pad;
+			const int di = dx + dy * bw;
+			img[di] = texels[src].m_Color;
+			filled[di] = 1;
+		}
+
+		CUtlVector<Vector> next;
+		CUtlVector<unsigned char> nextF;
+		next.SetCount( bw * bh );
+		nextF.SetCount( bw * bh );
+		for ( int pass = 0; pass < pad + 2; ++pass )
+		{
+			memcpy( next.Base(), img.Base(), img.Count() * sizeof( Vector ) );
+			memcpy( nextF.Base(), filled.Base(), filled.Count() );
+			bool any = false;
+			for ( int y = 0; y < bh; ++y )
+			{
+				for ( int x = 0; x < bw; ++x )
+				{
+					const int i = x + y * bw;
+					if ( filled[i] )
+						continue;
+					Vector sum( 0, 0, 0 );
+					int nn = 0;
+					const int ox[4] = { -1, 1, 0, 0 };
+					const int oy[4] = { 0, 0, -1, 1 };
+					for ( int k = 0; k < 4; ++k )
+					{
+						const int nx = x + ox[k];
+						const int ny = y + oy[k];
+						if ( nx < 0 || ny < 0 || nx >= bw || ny >= bh )
+							continue;
+						const int j = nx + ny * bw;
+						if ( !filled[j] )
+							continue;
+						sum += img[j];
+						++nn;
+					}
+					if ( nn > 0 )
+					{
+						next[i] = sum * ( 1.0f / (float)nn );
+						nextF[i] = 1;
+						any = true;
+					}
+				}
+			}
+			img.Swap( next );
+			filled.Swap( nextF );
+			if ( !any )
+				break;
+		}
+
+		CUtlVector<float> flat;
+		flat.SetCount( bw * bh * 3 );
+		for ( int i = 0; i < bw * bh; ++i )
+		{
+			flat[i * 3 + 0] = img[i].x;
+			flat[i * 3 + 1] = img[i].y;
+			flat[i * 3 + 2] = img[i].z;
+		}
+		if ( !PathTraceDenoise_DenoiseRGB( flat.Base(), bw, bh ) )
+			continue;
+
+		for ( int i = 0; i < stack.Count(); ++i )
+		{
+			const int src = stack[i];
+			if ( comp[src] != id )
+				continue;
+			const int x = src % resX;
+			const int y = src / resX;
+			const int dx = ( x - minX ) + pad;
+			const int dy = ( y - minY ) + pad;
+			const int di = dx + dy * bw;
+			Vector d( flat[di * 3 + 0], flat[di * 3 + 1], flat[di * 3 + 2] );
+			if ( !_finite( d.x ) || !_finite( d.y ) || !_finite( d.z ) )
+				continue;
+			if ( blend >= 0.999f )
+				texels[src].m_Color = d;
+			else
+				texels[src].m_Color = texels[src].m_Color * ( 1.0f - blend ) + d * blend;
+		}
 	}
 }
 
@@ -2908,12 +3406,18 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 		tt.resY = lightmapH;
 		tt.localPos.SetCount( texels.Count() );
 		tt.localNrm.SetCount( texels.Count() );
+		tt.localAxisU.SetCount( texels.Count() );
+		tt.localAxisV.SetCount( texels.Count() );
+		tt.luxelWorld.SetCount( texels.Count() );
 		tt.valid.SetCount( texels.Count() );
 		tt.interesting.SetCount( texels.Count() );
 		for ( int i = 0; i < texels.Count(); ++i )
 		{
 			tt.localPos[i] = texels[i].m_WorldPosition;
 			tt.localNrm[i] = texels[i].m_WorldNormal;
+			tt.localAxisU[i] = texels[i].m_AxisU;
+			tt.localAxisV[i] = texels[i].m_AxisV;
+			tt.luxelWorld[i] = texels[i].m_LuxelWorld;
 			tt.valid[i] = texels[i].m_bValid;
 			tt.interesting[i] = texels[i].m_bPossiblyInteresting;
 		}
@@ -2978,8 +3482,24 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 						ct.m_bPossiblyInteresting = tt->interesting[i];
 						ct.m_fDistanceToTri = 0;
 						ct.m_Color.Init();
-						if ( ct.m_bValid && !PositionInSolid( ct.m_WorldPosition ) )
+						if ( ct.m_bValid )
 						{
+							Vector axisU( 0, 0, 0 ), axisV( 0, 0, 0 );
+							float luxel = 2.0f;
+							if ( i < tt->luxelWorld.Count() && tt->luxelWorld[i] > 0.05f )
+							{
+								luxel = tt->luxelWorld[i];
+								VectorRotate( tt->localAxisU[i], matNormal, axisU );
+								VectorRotate( tt->localAxisV[i], matNormal, axisV );
+							}
+							// Same crease bias as world luxels. Keep the surface point for cache keys.
+							Vector samplePos;
+							PathTraceDXR_LuxelOriginInFront( ct.m_WorldPosition, ct.m_WorldNormal, luxel, samplePos );
+							if ( PositionInSolid( samplePos ) )
+								samplePos = ct.m_WorldPosition;
+							if ( PositionInSolid( samplePos ) )
+								continue;
+
 							if ( !BakeVolume_ShouldBakePropPoint( prop.m_Origin, dict.m_Name, ct.m_WorldPosition ) )
 							{
 								Vector cached;
@@ -2991,7 +3511,7 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 							SampleMap_t m = { propIndex, section, i, true };
 							texelMaps.AddToTail( m );
 							PtGpuBakeLuxel job;
-							PtPackBakeLuxel( job, ct.m_WorldPosition, ct.m_WorldNormal, skip_prop, propIndex );
+							PtPackBakeLuxelLightmap( job, samplePos, ct.m_WorldNormal, axisU, axisV, luxel, skip_prop, propIndex );
 							texelJobs.AddToTail( job );
 							++totalTexelJobs;
 							if ( texelJobs.Count() >= kJobChunk )
@@ -3271,7 +3791,13 @@ bool CVradStaticPropMgr::ComputeLightingPathTraceGPU()
 			{
 				if ( !pRes->m_ColorTexelsArrays[s] )
 					continue;
+				PtHealPropBrushIntersection( *pRes->m_ColorTexelsArrays[s],
+									(int)prop.m_LightmapImageWidth,
+									(int)prop.m_LightmapImageHeight );
 				PtDilatePropTexels( *pRes->m_ColorTexelsArrays[s],
+									(int)prop.m_LightmapImageWidth,
+									(int)prop.m_LightmapImageHeight );
+				PtDenoisePropLightmap( *pRes->m_ColorTexelsArrays[s],
 									(int)prop.m_LightmapImageWidth,
 									(int)prop.m_LightmapImageHeight );
 			}
@@ -3470,8 +3996,6 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 			}
 			else
 			{
-				VectorAdd ( dict.m_Mins, prop.m_Origin, prop.m_mins );
-				VectorAdd ( dict.m_Maxs, prop.m_Origin, prop.m_maxs );
 				g_RtEnv.AddAxisAlignedRectangularSolid ( TRACE_ID_STATICPROP | nProp, prop.m_mins, prop.m_maxs, fullCoverage );
 			}
 			
@@ -3491,8 +4015,10 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 
 		CUtlVector<Vector> *pLocalDxr = nullptr;
 		CUtlVector<int> *pLocalDxrMats = nullptr;
+		CUtlVector<Vector> *pLocalDxrAlbedo = nullptr;
 		CUtlVector<Vector> localDxrVerts;
 		CUtlVector<int> localDxrMats;
+		CUtlVector<Vector> localDxrAlbedo;
 		if ( bRegisterDxr )
 		{
 			bool already = false;
@@ -3504,6 +4030,7 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 			{
 				pLocalDxr = &localDxrVerts;
 				pLocalDxrMats = &localDxrMats;
+				pLocalDxrAlbedo = &localDxrAlbedo;
 				s_registeredStudio.AddToTail( prop.m_ModelIdx );
 			}
 		}
@@ -3622,6 +4149,31 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 										pLocalDxr->AddToTail( *vertData->Position( vertex3 ) );
 										if ( pLocalDxrMats )
 											pLocalDxrMats->AddToTail( materialIndex );
+										if ( pLocalDxrAlbedo )
+										{
+											Vector alb( -1.0f, -1.0f, -1.0f );
+											if ( pTxtr && pTxtr->pszName() )
+											{
+												const Vector2D uv0 = *vertData->Texcoord( vertex1 );
+												const Vector2D uv1 = *vertData->Texcoord( vertex2 );
+												const Vector2D uv2 = *vertData->Texcoord( vertex3 );
+												const Vector2D uvs[3] = { uv0, uv1, uv2 };
+												Vector acc( 0, 0, 0 );
+												int ns = 0;
+												for ( int s = 0; s < 3; ++s )
+												{
+													Vector c;
+													if ( BounceAlbedo_SampleMaterialUV( pTxtr->pszName(), uvs[s].x, uvs[s].y, c ) )
+													{
+														acc += c;
+														++ns;
+													}
+												}
+												if ( ns > 0 )
+													alb = acc * ( 1.0f / (float)ns );
+											}
+											pLocalDxrAlbedo->AddToTail( alb );
+										}
 									}
 // 		printf( "\ngl 3\n" );
 // 		printf( "gl %6.3f %6.3f %6.3f 1 0 0\n", XYZ(position1));
@@ -3649,7 +4201,8 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 		{
 			const int nLocalTris = localDxrVerts.Count() / 3;
 			PathTraceDXR_RegisterPropModel( prop.m_ModelIdx, localDxrVerts.Base(), nLocalTris,
-											( localDxrMats.Count() == nLocalTris ) ? localDxrMats.Base() : nullptr );
+											( localDxrMats.Count() == nLocalTris ) ? localDxrMats.Base() : nullptr,
+											( localDxrAlbedo.Count() == nLocalTris ) ? localDxrAlbedo.Base() : nullptr );
 		}
 	}
 }
@@ -4032,6 +4585,30 @@ static void GenerateLightmapSamplesForMesh( const matrix3x4_t& _matPos, const ma
 							colorTexels[linearPos].m_bValid = it->insideTriangle;
 							colorTexels[linearPos].m_bPossiblyInteresting = true;
 							colorTexels[linearPos].m_fDistanceToTri = ourDistancetoTri;
+
+							const float sx = (float)_lightmapResX;
+							const float sy = (float)_lightmapResY;
+							const Vector2D d1( ( texcoord[1].x - texcoord[0].x ) * sx, ( texcoord[1].y - texcoord[0].y ) * sy );
+							const Vector2D d2( ( texcoord[2].x - texcoord[0].x ) * sx, ( texcoord[2].y - texcoord[0].y ) * sy );
+							const float det = d1.x * d2.y - d1.y * d2.x;
+							Vector axisU( 0, 0, 0 ), axisV( 0, 0, 0 );
+							float luxel = 0.0f;
+							if ( fabsf( det ) > 1e-6f )
+							{
+								const float invDet = 1.0f / det;
+								const Vector e1 = worldPos[1] - worldPos[0];
+								const Vector e2 = worldPos[2] - worldPos[0];
+								axisU = ( e1 * d2.y - e2 * d1.y ) * invDet;
+								axisV = ( e2 * d1.x - e1 * d2.x ) * invDet;
+								luxel = sqrtf( 0.5f * ( axisU.LengthSqr() + axisV.LengthSqr() ) );
+								if ( luxel < 0.25f )
+									luxel = 0.25f;
+								if ( luxel > 48.0f )
+									luxel = 48.0f;
+							}
+							colorTexels[linearPos].m_AxisU = axisU;
+							colorTexels[linearPos].m_AxisV = axisV;
+							colorTexels[linearPos].m_LuxelWorld = luxel;
 						}
 					}
 				}

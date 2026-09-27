@@ -327,6 +327,65 @@ float Hash01( uint x )
 	return ( WangHash( x ) & 0xFFFFFFu ) / 16777216.0f;
 }
 
+// Joe-Kuo Sobol dims 0-33 (two independent dimensions per path vertex).
+// Eight direction bits cover each 256-sample block; higher sample blocks get
+// a fresh Cranley-Patterson rotation.
+static const uint kSobolV[272] = {
+	0x80000000u, 0x40000000u, 0x20000000u, 0x10000000u, 0x08000000u, 0x04000000u, 0x02000000u, 0x01000000u,
+	0x80000000u, 0xC0000000u, 0xA0000000u, 0xF0000000u, 0x88000000u, 0xCC000000u, 0xAA000000u, 0xFF000000u,
+	0x80000000u, 0xC0000000u, 0x60000000u, 0x90000000u, 0xE8000000u, 0x5C000000u, 0x8E000000u, 0xC5000000u,
+	0x80000000u, 0xC0000000u, 0x20000000u, 0x50000000u, 0xF8000000u, 0x74000000u, 0xA2000000u, 0x93000000u,
+	0x80000000u, 0x40000000u, 0x20000000u, 0xB0000000u, 0xF8000000u, 0xDC000000u, 0x7A000000u, 0x9D000000u,
+	0x80000000u, 0x40000000u, 0x60000000u, 0x30000000u, 0xC8000000u, 0x24000000u, 0x56000000u, 0xFB000000u,
+	0x80000000u, 0xC0000000u, 0xA0000000u, 0xD0000000u, 0x58000000u, 0x94000000u, 0x3E000000u, 0xE3000000u,
+	0x80000000u, 0x40000000u, 0xA0000000u, 0x50000000u, 0x88000000u, 0x24000000u, 0x12000000u, 0x2D000000u,
+	0x80000000u, 0x40000000u, 0xA0000000u, 0x50000000u, 0x28000000u, 0xD4000000u, 0x6A000000u, 0x71000000u,
+	0x80000000u, 0x40000000u, 0xE0000000u, 0xB0000000u, 0x98000000u, 0x94000000u, 0x8A000000u, 0x5B000000u,
+	0x80000000u, 0x40000000u, 0xA0000000u, 0x10000000u, 0x08000000u, 0x6C000000u, 0x9E000000u, 0x23000000u,
+	0x80000000u, 0x40000000u, 0x20000000u, 0x30000000u, 0x58000000u, 0xAC000000u, 0x96000000u, 0x2B000000u,
+	0x80000000u, 0xC0000000u, 0xA0000000u, 0x50000000u, 0xF8000000u, 0x8C000000u, 0xE2000000u, 0x33000000u,
+	0x80000000u, 0xC0000000u, 0x60000000u, 0x90000000u, 0x38000000u, 0xC4000000u, 0x42000000u, 0xA3000000u,
+	0x80000000u, 0x40000000u, 0x20000000u, 0xF0000000u, 0xA8000000u, 0x54000000u, 0x9A000000u, 0x9D000000u,
+	0x80000000u, 0xC0000000u, 0x20000000u, 0xD0000000u, 0xD8000000u, 0xC4000000u, 0x46000000u, 0x85000000u,
+	0x80000000u, 0x40000000u, 0x20000000u, 0xF0000000u, 0x38000000u, 0x14000000u, 0xF6000000u, 0x67000000u,
+	0x80000000u, 0xC0000000u, 0x20000000u, 0xF0000000u, 0x68000000u, 0x64000000u, 0x36000000u, 0x6D000000u,
+	0x80000000u, 0x40000000u, 0xA0000000u, 0x50000000u, 0x98000000u, 0xF4000000u, 0xAE000000u, 0xBB000000u,
+	0x80000000u, 0xC0000000u, 0xE0000000u, 0xB0000000u, 0xB8000000u, 0x3C000000u, 0xCE000000u, 0x41000000u,
+	0x80000000u, 0xC0000000u, 0xE0000000u, 0xD0000000u, 0x68000000u, 0x3C000000u, 0x8A000000u, 0x51000000u,
+	0x80000000u, 0x40000000u, 0x60000000u, 0xD0000000u, 0x38000000u, 0x8C000000u, 0x7E000000u, 0x71000000u,
+	0x80000000u, 0xC0000000u, 0xA0000000u, 0x90000000u, 0x08000000u, 0x64000000u, 0x6A000000u, 0x89000000u,
+	0x80000000u, 0xC0000000u, 0x20000000u, 0xD0000000u, 0x48000000u, 0x8C000000u, 0xD6000000u, 0x39000000u,
+	0x80000000u, 0xC0000000u, 0x20000000u, 0x50000000u, 0xD8000000u, 0xF4000000u, 0x3E000000u, 0x95000000u,
+	0x80000000u, 0x40000000u, 0xA0000000u, 0xB0000000u, 0x98000000u, 0xA4000000u, 0x7A000000u, 0xD5000000u,
+	0x80000000u, 0xC0000000u, 0xA0000000u, 0x30000000u, 0x18000000u, 0x34000000u, 0x8A000000u, 0x9D000000u,
+	0x80000000u, 0x40000000u, 0xE0000000u, 0xD0000000u, 0x08000000u, 0x4C000000u, 0x02000000u, 0xB5000000u,
+	0x80000000u, 0xC0000000u, 0xE0000000u, 0x50000000u, 0x68000000u, 0x4C000000u, 0x76000000u, 0xF7000000u,
+	0x80000000u, 0x40000000u, 0x60000000u, 0x90000000u, 0xC8000000u, 0x74000000u, 0x52000000u, 0x03000000u,
+	0x80000000u, 0xC0000000u, 0xA0000000u, 0xD0000000u, 0xB8000000u, 0x04000000u, 0x6E000000u, 0x97000000u,
+	0x80000000u, 0xC0000000u, 0xE0000000u, 0x30000000u, 0x68000000u, 0xEC000000u, 0x22000000u, 0x2B000000u,
+	0x80000000u, 0xC0000000u, 0x20000000u, 0x30000000u, 0x28000000u, 0xD4000000u, 0x8A000000u, 0xFF000000u,
+	0x80000000u, 0x40000000u, 0xA0000000u, 0x50000000u, 0xB8000000u, 0x84000000u, 0x1A000000u, 0xAF000000u
+};
+float Sobol( uint index, uint dim )
+{
+	dim = min( dim, 33u );
+	uint g = index ^ ( index >> 1 );
+	uint x = 0;
+	[unroll] for ( uint b = 0; b < 8u; ++b )
+	{
+		if ( g & 1u )
+			x ^= kSobolV[dim * 8u + b];
+		g >>= 1;
+	}
+	return x * 2.3283064365386963e-10;
+}
+float SobolRot( uint index, uint dim, float rot )
+{
+	return frac( Sobol( index, dim ) + rot );
+}
+)HLSL"
+R"HLSL(
+
 float3 ClampFirefly( float3 v, float cap )
 {
 	// Luminance-preserving clamp (PBRT / Veach practice): scale RGB together so
@@ -1317,23 +1376,38 @@ void SoftDiskOffset( float3 diskN, float radius, uint i, uint seed, out float3 o
 		return;
 	float3 t, b;
 	Orthonormal( normalize( diskN ), t, b );
-	float u = Hash01( seed + i * 19u + 5u );
+	float u = SobolRot( i, 0, Hash01( seed + 5u ) );
+	float v = SobolRot( i, 1, Hash01( seed + 13u ) );
 	float r = radius * sqrt( u );
-	float phi = Hash01( seed + i * 41u + 13u ) * 2.0f * PI;
+	float phi = v * 2.0f * PI;
 	offsetOut = t * ( r * cos( phi ) ) + b * ( r * sin( phi ) );
+}
+
+int SoftSunSampleCount( float sinExtent )
+{
+	if ( sinExtent <= 0.0f || SoftSamplesMax <= 1 )
+		return 1;
+	float angleDeg = degrees( asin( saturate( sinExtent ) ) );
+	int n = min( 40, 8 + (int)( angleDeg * 0.6f ) );
+	n = min( n, (int)SoftSamplesMax );
+	return max( n, 1 );
 }
 
 void SoftSunDir( float3 axis, float sinExtent, uint i, uint nSoft, uint seed, out float3 outDir )
 {
+	if ( nSoft <= 1 )
+	{
+		outDir = normalize( axis );
+		return;
+	}
 	float3 t1, t2;
 	Orthonormal( axis, t1, t2 );
 	float cosThetaMax = sqrt( max( 0.0f, 1.0f - sinExtent * sinExtent ) );
-	float uRot = Hash01( seed + 17u );
-	float phiRot = Hash01( seed + 91u ) * 2.0f * PI;
-	float u = ( nSoft <= 1 ) ? 0.0f : ( (float)i + uRot ) / (float)nSoft;
+	float u = SobolRot( i, 0, Hash01( seed + 17u ) );
+	float v = SobolRot( i, 1, Hash01( seed + 91u ) );
 	float cosTheta = 1.0f - u * ( 1.0f - cosThetaMax );
 	float sinTheta = sqrt( max( 0.0f, 1.0f - cosTheta * cosTheta ) );
-	float phi = (float)i * 2.3999632f + phiRot;
+	float phi = v * 2.0f * PI;
 	outDir = normalize( axis * cosTheta + ( t1 * cos( phi ) + t2 * sin( phi ) ) * sinTheta );
 }
 
@@ -1388,44 +1462,6 @@ bool OccludedT( float3 from, float3 to, int skipProp, uint seed, out float tHit 
 	return false;
 }
 
-bool SunBlockedT( float3 pos, float3 axis, int skipProp, uint seed, out float tHit )
-{
-	tHit = MaxTrace;
-	float tmin = OccludeBias;
-	uint lastPrim = 0xFFFFFFFFu;
-	[loop] for ( int pass = 0; pass < MAX_FILTER_HITS + 1; ++pass )
-	{
-		float t; uint flags, prim; float3 nHit; float2 bary;
-		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, t, flags, prim, nHit, bary ) )
-			return false;
-		if ( flags & TRACE_ID_SKY )
-			return false;
-#if PT_ENABLE_VOLUMES
-		if ( EnvVolCount > 0 && IgnoreSkyOccluder( pos, pos + axis * t ) )
-			return false;
-#endif
-		if ( ( flags & TRACE_ID_FILTER ) != 0 || IsFilterPrim( prim ) )
-		{
-			if ( prim == lastPrim )
-			{
-				tmin = FilterAdvancePast( t );
-				continue;
-			}
-			lastPrim = prim;
-			tmin = FilterAdvancePast( t );
-			continue;
-		}
-		if ( ShadowAlphaMode( prim ) >= 0.5f && !AlphaHitBlocks( prim, bary, seed, (uint)pass ) )
-		{
-			tmin = FilterAdvancePast( t );
-			continue;
-		}
-		tHit = t;
-		return true;
-	}
-	return false;
-}
-
 float3 EvalLight( uint i, float3 pos, float3 normal, uint seed, int faceNum, int skipProp, bool allowSoft, inout float sunAmt, float lambda )
 {
 	float4 a0 = LA0( i );
@@ -1459,7 +1495,7 @@ R"HLSL(
 		{
 			float3 offset = 0;
 			if ( radius > 0.0f && ns > 1 )
-				SoftDiskOffset( diskN, radius, (uint)s, seed + (uint)s * 53u, offset );
+				SoftDiskOffset( diskN, radius, (uint)s, seed, offset );
 			float3 lightPos = origin + offset;
 			float3 delta = lightPos - pos;
 			float dist = length( delta );
@@ -1512,60 +1548,38 @@ R"HLSL(
 #endif
 
 		float3 axis = normalize( LB0( i ).xyz );
-		float ndl0 = dot( normal, axis );
-		if ( ndl0 <= 0 )
+		float sinExt = LC1( i ).y; // sunExtent
+		// Finite sun wraps past 90°: cull only when the whole disk is below the horizon.
+		if ( dot( normal, axis ) <= -sinExt )
 			return 0;
 
-		float sinExt = LC1( i ).y; // sunExtent
 		int nSoft = 1;
-		if ( allowSoft && sinExt > 0.0f && SoftSamplesMax > 1 )
-		{
-			float tHit = MaxTrace;
-			bool blocked = SunBlockedT( pos, axis, skipProp, seed, tHit );
-			float refDist = max( tHit, 64.0f );
-			float lightSize = sinExt * refDist;
-			nSoft = EstimatePenumbraSamples( lightSize, refDist, tHit, blocked );
-			// legacy soft-sun style cap
-			float angleDeg = degrees( asin( saturate( sinExt ) ) );
-			int legacy = min( 40, 8 + (int)( angleDeg * 0.6f ) );
-			nSoft = min( nSoft, legacy );
-			nSoft = min( nSoft, (int)SoftSamplesMax );
-			nSoft = max( nSoft, 1 );
-		}
-
-		float cosThetaMax = sqrt( max( 0.0f, 1.0f - sinExt * sinExt ) );
-		float sunSolidAngle = max( 1e-6f, 2.0f * PI * ( 1.0f - cosThetaMax ) );
-		float pdfLight = 1.0f / sunSolidAngle;
+		if ( allowSoft && sinExt > 0.0f )
+			nSoft = SoftSunSampleCount( sinExt );
 
 		float3 visAccum = 0;
-		float ndlAccum = 0;
-		float misAccum = 0;
+		float3 contrib = 0;
 		float nVis = 0;
 		for ( int s = 0; s < nSoft; ++s )
 		{
 			float3 dir = axis;
 			if ( nSoft > 1 && sinExt > 0 )
-				SoftSunDir( axis, sinExt, (uint)s, (uint)nSoft, seed + (uint)s * 97u, dir );
+				SoftSunDir( axis, sinExt, (uint)s, (uint)nSoft, seed, dir );
 			float ndlS = dot( normal, dir );
 			if ( ndlS <= 0 )
 				continue;
 			float3 visS = SunVisRGB( pos, dir, skipProp, seed + (uint)s * 53u );
 			if ( max( visS.x, max( visS.y, visS.z ) ) < 1e-5f )
 				continue;
-			float pdfBsdf = ndlS * INV_PI;
-			float mis = ( pdfLight * pdfLight ) / max( 1e-8f, pdfLight * pdfLight + pdfBsdf * pdfBsdf );
 			visAccum += visS;
-			ndlAccum += ndlS;
-			misAccum += mis;
+			contrib += ndlS * visS;
 			nVis += 1.0f;
 		}
 		if ( nVis > 0 )
 		{
-			float3 vis = visAccum / (float)nSoft;
-			float ndlSoft = ndlAccum / nVis;
-			float mis = misAccum / nVis;
-			sum = LightContrib( intensity, ndlSoft * mis * wEnv, vis, lambda );
-			sunAmt += ( ( vis.x + vis.y + vis.z ) * ( 1.0f / 3.0f ) ) * wEnv;
+			float inv = 1.0f / (float)nSoft;
+			sum = LightContrib( intensity, wEnv, contrib * inv, lambda );
+			sunAmt += ( ( visAccum.x + visAccum.y + visAccum.z ) * ( 1.0f / 3.0f ) ) * inv * wEnv;
 		}
 	}
 	else if ( type > 2.5f && type < 3.5f )
@@ -1602,7 +1616,7 @@ R"HLSL(		// emit_surface / $vrad_emit*: hard center NEE + area falloff.
 		{
 			float3 offset = 0;
 			if ( s > 0 && softRadius > 0.5f )
-				SoftDiskOffset( Lnor, softRadius, (uint)s, seed + (uint)s * 31u, offset );
+				SoftDiskOffset( Lnor, softRadius, (uint)s, seed, offset );
 			float3 lightPos = origin + offset + Lnor * 1.0f;
 			float3 delta = lightPos - pos;
 			float dist = length( delta );
@@ -1826,8 +1840,16 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 		if ( bounce == 0 )
 			sunAmt = sunB;
 
-		float u1 = Hash01( seed + bounce * 13u + sppIndex * 7u + 11u );
-		float u2 = Hash01( seed + bounce * 17u + sppIndex * 11u + 13u );
+		// Independent Sobol dimensions per path vertex. Only the BSDF direction
+		// uses QMC; wavelength, NEE, media, and roulette remain independently
+		// hashed to avoid the cross-decision correlations of the old attempt.
+		uint qmcIndex = sppIndex & 255u;
+		uint qmcBlock = sppIndex >> 8u;
+		uint qmcDim = min( bounce * 2u, 32u );
+		float u1 = SobolRot( qmcIndex, qmcDim,
+			Hash01( seed + bounce * 13u + qmcBlock * 0x9E3779B9u + 11u ) );
+		float u2 = SobolRot( qmcIndex, qmcDim + 1u,
+			Hash01( seed + bounce * 17u + qmcBlock * 0xBB67AE85u + 13u ) );
 		float3 dir = inMedium ? medDir : CosineHemi( normal, u1, u2 );
 
 		float tFree = MaxTrace;
@@ -2024,7 +2046,7 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 				throughput *= invQ;
 		}
 
-		pos = hitPos + hitN * 0.5f;
+		pos = hitPos + hitN * 1.0f;
 		normal = hitN;
 		inMedium = false;
 		skipFace = -1;
@@ -2066,31 +2088,35 @@ void CSMain( uint3 dtid : SV_DispatchThreadID )
 	int faceNum = LuxelsC[i].x;
 	int aaN = max( LuxelsC[i].y, 1 );
 	int skipProp = LuxelsC[i].z;
+	uint sampleScale = (uint)max( LuxelsC[i].w, 1 );
 
 	float3 sum = 0;
 	float sunSum = 0;
 	uint spp = max( Spp, 1u );
 	for ( uint s = 0; s < spp; ++s )
 	{
-		uint sGlobal = SampleOffset + s;
-		float3 samplePos = pos0;
-		if ( aaN > 1 )
+		for ( uint sub = 0; sub < sampleScale; ++sub )
 		{
-			int tap = (int)( sGlobal % (uint)( aaN * aaN ) );
-			int tx = tap % aaN;
-			int ty = tap / aaN;
-			float span = 0.66f;
-			float u = ( (float)tx / (float)( aaN - 1 ) - 0.5f ) * span;
-			float v = ( (float)ty / (float)( aaN - 1 ) - 0.5f ) * span;
-			samplePos += axisU * u + axisV * v;
+			uint sGlobal = ( SampleOffset + s ) * sampleScale + sub;
+			float3 samplePos = pos0;
+			if ( aaN > 1 )
+			{
+				int tap = (int)( sGlobal % (uint)( aaN * aaN ) );
+				int tx = tap % aaN;
+				int ty = tap / aaN;
+				float span = 0.66f;
+				float u = ( (float)tx / (float)( aaN - 1 ) - 0.5f ) * span;
+				float v = ( (float)ty / (float)( aaN - 1 ) - 0.5f ) * span;
+				samplePos += axisU * u + axisV * v;
+			}
+			float sunAmt = 0;
+			float3 li = PathLi( samplePos, normal, seed, sGlobal, faceNum, skipProp, sunAmt );
+			li = ClampFirefly( li, FireflyCap );
+			sum += li;
+			sunSum += sunAmt;
 		}
-		float sunAmt = 0;
-		float3 li = PathLi( samplePos, normal, seed, sGlobal, faceNum, skipProp, sunAmt );
-		li = ClampFirefly( li, FireflyCap );
-		sum += li;
-		sunSum += sunAmt;
 	}
-	float inv = 1.0f / (float)spp;
+	float inv = 1.0f / (float)( spp * sampleScale );
 	OutRGB[i] = float4( sum * inv, sunSum * inv );
 }
 )HLSL";
@@ -2600,6 +2626,17 @@ bool PathTraceDXR_GetCapturedTri( uint32_t triIndex, Vector &a, Vector &b, Vecto
 	c = t.c;
 	if ( outFlags )
 		*outFlags = t.flags;
+	return true;
+}
+
+bool PathTraceDXR_GetCapturedTriAlbedo( uint32_t triIndex, Vector &outLinearRGB )
+{
+	if ( triIndex >= (uint32_t)g_ptTris.size() )
+		return false;
+	const Vector &a = g_ptTris[triIndex].albedo;
+	if ( a.x < 0.0f )
+		return false;
+	outLinearRGB = a;
 	return true;
 }
 
@@ -3392,7 +3429,8 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 			*(uint32 *)&pa[i * 8 + 7] = L.seed;
 			pb[i * 8 + 0] = L.axisU[0]; pb[i * 8 + 1] = L.axisU[1]; pb[i * 8 + 2] = L.axisU[2]; pb[i * 8 + 3] = 0;
 			pb[i * 8 + 4] = L.axisV[0]; pb[i * 8 + 5] = L.axisV[1]; pb[i * 8 + 6] = L.axisV[2]; pb[i * 8 + 7] = 0;
-			pc[i * 4 + 0] = L.faceNum; pc[i * 4 + 1] = L.aaN; pc[i * 4 + 2] = L.skipPropIndex; pc[i * 4 + 3] = 0;
+			pc[i * 4 + 0] = L.faceNum; pc[i * 4 + 1] = L.aaN; pc[i * 4 + 2] = L.skipPropIndex;
+			pc[i * 4 + 3] = max( L.sampleScale, 1 );
 		}
 		g_ptBake.luxelAUp->Unmap( 0, nullptr );
 		g_ptBake.luxelBUp->Unmap( 0, nullptr );

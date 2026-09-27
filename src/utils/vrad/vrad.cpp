@@ -2903,6 +2903,29 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 			g_bPathTraceSpectral = false;
 			Msg( "PathTrace spectral (-pt_nospectral): RGB transport.\n" );
 		}
+		else if ( !Q_stricmp( argv[i], "-pt_adaptive" ) )
+		{
+			g_bPathTraceAdaptive = true;
+			Msg( "PathTrace adaptive sampling (-pt_adaptive): extra spp on high-variance luxels.\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_noadaptive" ) )
+		{
+			g_bPathTraceAdaptive = false;
+			Msg( "PathTrace adaptive sampling (-pt_noadaptive): off.\n" );
+		}
+		else if ( !Q_stricmp( argv[i], "-pt_adaptive_max" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nPathTraceAdaptiveMax = atoi( argv[i] );
+				if ( g_nPathTraceAdaptiveMax < 0 ) g_nPathTraceAdaptiveMax = 0;
+				if ( g_nPathTraceAdaptiveMax > 4096 ) g_nPathTraceAdaptiveMax = 4096;
+				g_bPathTraceAdaptive = true;
+				Msg( "PathTrace adaptive extra spp cap (-pt_adaptive_max): %d%s.\n",
+					 g_nPathTraceAdaptiveMax,
+					 g_nPathTraceAdaptiveMax == 0 ? " (same as -pt_samples)" : "" );
+			}
+		}
 		else if ( !Q_stricmp( argv[i], "-underwater" ) )
 		{
 			g_bUwCliEnable = true;
@@ -3866,6 +3889,9 @@ void PrintUsage( int argc, char **argv )
 		"  -pt_emit_samples N : $vrad_emit area NEE samples (0=all tris; default 64; higher=less noise).\n"
 		"  -pt_spectral    : Hero-wavelength spectral transport (Smits RGB->SPD + CIE; default ON).\n"
 		"  -pt_nospectral  : Disable spectral; linear RGB path transport.\n"
+		"  -pt_adaptive    : Extra spp on high-variance luxels (default ON).\n"
+		"  -pt_noadaptive  : Disable adaptive extra sampling.\n"
+		"  -pt_adaptive_max N : Extra spp cap per noisy luxel (default = -pt_samples; 0..4096).\n"
 		"  -underwater     : Bake underwater Beer-Lambert + Kd from BSP water / VMT fog (mode A).\n"
 		"  -uw_volume      : Full homogeneous volume path tracing in water (mode C; implies underwater).\n"
 		"  -uw_off         : Force-disable underwater medium bake.\n"

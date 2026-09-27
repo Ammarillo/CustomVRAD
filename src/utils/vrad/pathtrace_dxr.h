@@ -26,6 +26,8 @@ extern int		g_nPathTracePropSamples;	// prop spp (0 = auto: max(8, world/4))
 extern int		g_nPathTracePropBounces;	// prop bounces (-1 = auto: world; 0 = direct+sky)
 extern int		g_nPathTracePropVertGrid;	// 0=per-vert; >0=8x8 tri atlas + closest gather (+denoise)
 extern bool		g_bPathTraceSpectral;		// hero-wavelength Smits+CIE (default true)
+extern bool		g_bPathTraceAdaptive;		// extra spp on high-variance luxels
+extern int		g_nPathTraceAdaptiveMax;	// extra spp cap (0 = same as -pt_samples)
 extern float	g_flPtLightRadius;		// -pt_lightradius: soft disk for light/light_spot (0=hard)
 extern float	g_flPtLightPenumbra;	// -pt_lightpenumbra: CHSS growth scale
 extern int		g_nPtSoftSamples;		// -pt_softsamples: max soft rays per NEE
@@ -45,8 +47,9 @@ void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv );
 // Bake world-face lightmaps. On failure returns false (caller falls back to stock).
 bool PathTraceDXR_BakeWorldFaces();
 
-// GPU-bake static prop samples. bLightmapQuality=true -> same spp/bounces/NEE as world luxels
-// (for prop lightmap texels). false -> cheaper vertex defaults (-pt_prop_samples/bounces).
+// GPU-bake static prop samples. bLightmapQuality=true -> same spp/bounces/NEE/AA/adaptive
+// as world luxels (prop lightmap texels). false -> cheaper vertex defaults
+// (-pt_prop_samples/bounces, hard NEE, no AA).
 // bEndSession=false keeps the GPU bake session open for additional chunks (same quality).
 // progressBase/progressTotal: overall stream progress (one \r line). total=0 -> no % (silent chunks).
 bool PathTraceDXR_BakePropSamples( const struct PtGpuBakeLuxel *samples, unsigned nSamples,
@@ -72,8 +75,16 @@ bool PathTraceDXR_CanBakeProps();
 // Phase 2: register unique-model local shadow meshes + instances (before DeviceInit).
 void PathTraceDXR_ClearPropInstances();
 // shadowMatIndices: per-triangle index into shadow material DB (-1 = opaque). Optional.
+// triAlbedo: per-triangle linear RGB ($basetexture). x < 0 = unset (neutral grey).
 void PathTraceDXR_RegisterPropModel( int modelIdx, const class Vector *verts, int nTris,
-									 const int *shadowMatIndices = nullptr );
+									 const int *shadowMatIndices = nullptr,
+									 const class Vector *triAlbedo = nullptr );
+
+// Place a luxel origin off the surface the same way world faces do (crease bias).
+void PathTraceDXR_LuxelOriginInFront( const class Vector &samplePos, const class Vector &faceNormal, float luxelWorld, class Vector &outPos );
+
+// True when this captured triangle has a textured prop albedo (not the neutral fallback).
+bool PathTraceDXR_GetCapturedTriAlbedo( unsigned triIndex, class Vector &outLinearRGB );
 void PathTraceDXR_RegisterPropInstance( int propIndex, int modelIdx, const float xform[3][4] );
 
 void PathTraceDXR_Shutdown();

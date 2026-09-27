@@ -15,6 +15,7 @@
 #include "macro_texture.h"
 #include "ao.h"
 #include "tier1/utlvector.h"
+#include "pathtrace_dxr_device.h"
 
 // Bounce luxel splat vs stock RADIALDIST. 1 = stock; <1 tighter; >1 wider.
 float g_flBounceRadialScale = 1.0f;
@@ -594,24 +595,15 @@ bool SampleRadial( radial_t *rad, Vector& pnt, LightingValue_t light[NUM_BUMP_VE
 	WorldToLuxelSpace( &rad->l, pnt, coord );
 	int u = ( int )( coord[0] + 0.5f );
 	int v = ( int )( coord[1] + 0.5f );
-	int i = u + v * rad->w;
-
-	if (u < 0 || u > rad->w || v < 0 || v > rad->h)
-	{
-		static bool warning = false;
-		if ( !warning )
-		{
-			// punting over to KenB
-			// 2d coord indexes off of lightmap, generation of pnt seems suspect
-			Warning( "SampleRadial: Punting, Waiting for fix\n" );
-			warning = true;
-		}
-		for( bumpSample = 0; bumpSample < bumpSampleCount; bumpSample++ )
-		{
-			light[bumpSample].m_vecLighting.Init( 2550, 0, 0 );
-		}
+	// Stock used `u > w` / `v > h`, so u==w indexed the next row (or past the
+	// allocation). That dropped energy on the last luxel of each edge/corner.
+	if ( rad->w <= 0 || rad->h <= 0 )
 		return false;
-	}
+	if ( u < 0 ) u = 0;
+	if ( v < 0 ) v = 0;
+	if ( u >= rad->w ) u = rad->w - 1;
+	if ( v >= rad->h ) v = rad->h - 1;
+	int i = u + v * rad->w;
 
 	bool baseSampleOk = true;
 	for( bumpSample = 0; bumpSample < bumpSampleCount; bumpSample++ )
@@ -734,6 +726,96 @@ void CloseDispLuxels()
 		{
 			g_pFileSystem->Close( pFileLuxels[iBump] );
 		}
+	}
+}
+
+static float ShadowLeakLuxelLuma( const Vector &v )
+{
+	return 0.2126f * v.x + 0.7152f * v.y + 0.0722f * v.z;
+}
+
+void CompressBilinearShadowLeak( Vector *grid, int width, int height )
+{
+	if ( !grid || width < 2 || height < 2 )
+		return;
+
+	const int n = width * height;
+	CUtlVector<Vector> src;
+	src.SetCount( n );
+	for ( int i = 0; i < n; ++i )
+		src[i] = grid[i];
+
+	static const int kDx[4] = { 0, 0, -1, 1 };
+	static const int kDy[4] = { -1, 1, 0, 0 };
+
+	for ( int t = 0; t < height; ++t )
+	{
+		for ( int s = 0; s < width; ++s )
+		{
+			const int idx = s + t * width;
+			const float L = ShadowLeakLuxelLuma( src[idx] );
+
+			float maxN = 0.0f;
+			float minN = 1e9f;
+			int nCard = 0;
+			for ( int k = 0; k < 4; ++k )
+			{
+				const int ns = s + kDx[k];
+				const int nt = t + kDy[k];
+				if ( ns < 0 || ns >= width || nt < 0 || nt >= height )
+					continue;
+				const float ln = ShadowLeakLuxelLuma( src[ns + nt * width] );
+				maxN = max( maxN, ln );
+				minN = min( minN, ln );
+				++nCard;
+			}
+
+			if ( nCard < 2 || maxN < 0.02f )
+				continue;
+
+			const float edgeRatio = maxN / max( minN, 1e-4f );
+			if ( edgeRatio < 3.0f )
+				continue;
+
+			// Lit-side boundary luxel undervalued by filters: small capped lift only.
+			if ( L > minN * 1.6f && L < maxN * 0.62f )
+			{
+				const float targetL = min( maxN * 0.90f, L * 1.18f );
+				if ( targetL > L * 1.03f )
+				{
+					const float scale = targetL / max( L, 1e-4f );
+					grid[idx] = src[idx] * scale;
+				}
+				continue;
+			}
+
+			// Isolated firefly on a hard edge or open face.
+			if ( L > maxN * 2.5f && L > 0.08f && maxN > 0.01f )
+			{
+				grid[idx] = src[idx] * ( ( maxN * 1.15f ) / max( L, 1e-4f ) );
+			}
+		}
+	}
+}
+
+static void LiftPackedBorderLuxels( byte *pStyleBase, int width, int height, int bumpCount, int facenum )
+{
+	if ( !pStyleBase || width < 3 || height < 3 || bumpCount < 1 )
+		return;
+
+	const int n = width * height;
+	CUtlVector<Vector> grid;
+	grid.SetCount( n );
+
+	for ( int bump = 0; bump < bumpCount; ++bump )
+	{
+		byte *p = pStyleBase + bump * n * 4;
+		for ( int i = 0; i < n; ++i )
+			ColorRGBExp32ToVector( *( ColorRGBExp32 * )( p + i * 4 ), grid[i] );
+		ReconstructLightmapEdgeLuxels( grid.Base(), width, height, facenum );
+		CompressBilinearShadowLeak( grid.Base(), width, height );
+		for ( int i = 0; i < n; ++i )
+			VectorToColorRGBExp32( grid[i], *( ColorRGBExp32 * )( p + i * 4 ) );
 	}
 }
 
@@ -974,6 +1056,18 @@ void FinalLightFace( int iThread, int facenum )
 			prad = NULL;
 		}
 
+		// Last lightmap row/column sits in the geometric fold on concave edges.
+		// Dilate those dark outliers from the first stable interior luxel.
+		{
+			const int width = f->m_LightmapTextureSizeInLuxels[0] + 1;
+			const int height = f->m_LightmapTextureSizeInLuxels[1] + 1;
+			if ( width >= 2 && height >= 2 && width * height == fl->numluxels )
+			{
+				byte *pStyle = &(*pdlightdata)[f->lightofs + k * bumpSampleCount * fl->numluxels * 4];
+				LiftPackedBorderLuxels( pStyle, width, height, bumpSampleCount, facenum );
+			}
+		}
+
 		// Compute the median color for this lightstyle
 		// Remember, the data goes *before* the specified light_ofs, in *reverse order*
 		ColorRGBExp32 *pAvgColor = dface_AvgLightColor( f, k );
@@ -1089,6 +1183,1079 @@ static bool StitchEdgesOverlap( const Vector &a0, const Vector &a1,
 	return true;
 }
 
+static float EdgeLuxelLuma( const Vector &v )
+{
+	return 0.2126f * v.x + 0.7152f * v.y + 0.0722f * v.z;
+}
+
+// Which lightmap rectangle borders a luxel-space segment sits on.
+// bit0=s0, bit1=sMax, bit2=t0, bit3=tMax.
+static int LuxelSegCreaseBorderMask( const Vector2D &a, const Vector2D &b, int w, int h )
+{
+	// Stay on one side of the face. A flat 2-luxel tolerance on a 3-luxel face
+	// would flag the opposite border from the same edge.
+	float eps = 2.0f;
+	const float limit = 0.45f * (float)min( w, h );
+	if ( eps > limit )
+		eps = limit;
+	if ( eps < 0.75f )
+		eps = 0.75f;
+	const float sMin = min( a.x, b.x ), sMax = max( a.x, b.x );
+	const float tMin = min( a.y, b.y ), tMax = max( a.y, b.y );
+	int mask = 0;
+	if ( sMax <= eps )
+		mask |= 1;
+	if ( sMin >= (float)( w - 1 ) - eps )
+		mask |= 2;
+	if ( tMax <= eps )
+		mask |= 4;
+	if ( tMin >= (float)( h - 1 ) - eps )
+		mask |= 8;
+	return mask;
+}
+
+// Vertex positions quantized to 4-unit cells so a 90° neighbor is found even
+// when VBSP did not weld the shared corner (duplicated verts / T-junctions).
+enum { kCreaseHashBuckets = 2048 };
+
+struct CreaseHashNode_t
+{
+	unsigned __int64 key;
+	int face;
+	int next;
+};
+
+static int g_CreaseHashHead[kCreaseHashBuckets];
+static CUtlVector<CreaseHashNode_t> g_CreaseHashNodes;
+static bool g_CreaseHashReady = false;
+
+static unsigned __int64 CreaseCellKey( int x, int y, int z )
+{
+	unsigned __int64 ux = (unsigned)x & 0x1FFFFFu;
+	unsigned __int64 uy = (unsigned)y & 0x1FFFFFu;
+	unsigned __int64 uz = (unsigned)z & 0x1FFFFFu;
+	return ux | ( uy << 21 ) | ( uz << 42 );
+}
+
+static int CreaseCellBucket( unsigned __int64 key )
+{
+	unsigned h = (unsigned)key ^ (unsigned)( key >> 21 ) ^ (unsigned)( key >> 42 );
+	h *= 0x9E3779B9u;
+	return (int)( h & ( kCreaseHashBuckets - 1 ) );
+}
+
+static void CreaseQuantize( const Vector &p, int &x, int &y, int &z )
+{
+	x = (int)floorf( p.x * 0.25f );
+	y = (int)floorf( p.y * 0.25f );
+	z = (int)floorf( p.z * 0.25f );
+}
+
+static void EnsureCreaseVertexHash()
+{
+	if ( g_CreaseHashReady )
+		return;
+
+	ThreadLock();
+	if ( !g_CreaseHashReady )
+	{
+		for ( int i = 0; i < kCreaseHashBuckets; ++i )
+			g_CreaseHashHead[i] = -1;
+		g_CreaseHashNodes.RemoveAll();
+
+		for ( int face = 0; face < numfaces; ++face )
+		{
+			dface_t *pf = &g_pFaces[face];
+			if ( texinfo[pf->texinfo].flags & TEX_SPECIAL )
+				continue;
+			for ( int e = 0; e < pf->numedges; ++e )
+			{
+				int x, y, z;
+				CreaseQuantize( dvertexes[RadialEdgeVertex( pf, e )].point, x, y, z );
+				unsigned __int64 key = CreaseCellKey( x, y, z );
+				int bucket = CreaseCellBucket( key );
+				CreaseHashNode_t node;
+				node.key = key;
+				node.face = face;
+				node.next = g_CreaseHashHead[bucket];
+				g_CreaseHashNodes.AddToTail( node );
+				g_CreaseHashHead[bucket] = g_CreaseHashNodes.Count() - 1;
+			}
+		}
+		g_CreaseHashReady = true;
+	}
+	ThreadUnlock();
+}
+
+static void CreaseAddNearFaces( const Vector &p, int selfFace, int *candidates, int &nCand, int cap )
+{
+	int x, y, z;
+	CreaseQuantize( p, x, y, z );
+	for ( int dz = -1; dz <= 1; ++dz )
+	{
+		for ( int dy = -1; dy <= 1; ++dy )
+		{
+			for ( int dx = -1; dx <= 1; ++dx )
+			{
+				unsigned __int64 key = CreaseCellKey( x + dx, y + dy, z + dz );
+				int bucket = CreaseCellBucket( key );
+				for ( int i = g_CreaseHashHead[bucket]; i >= 0; i = g_CreaseHashNodes[i].next )
+				{
+					if ( g_CreaseHashNodes[i].key != key )
+						continue;
+					const int other = g_CreaseHashNodes[i].face;
+					if ( other == selfFace )
+						continue;
+					bool dup = false;
+					for ( int c = 0; c < nCand; ++c )
+					{
+						if ( candidates[c] == other )
+						{
+							dup = true;
+							break;
+						}
+					}
+					if ( dup )
+						continue;
+					if ( nCand >= cap )
+						return;
+					candidates[nCand++] = other;
+				}
+			}
+		}
+	}
+}
+
+// Steps from (s,t) to the first inward texel that matches the one beyond it
+// and is actually brighter than the start. A light/shadow terminator is not a
+// plateau, so the walk stops there instead of mixing the two sides.
+// Returns 0 when the outer texel already agrees with a stable neighbor.
+static int CreaseStableSteps( const Vector *src, int width, int height,
+	int s, int t, int ds, int dt, int maxStep, float gate )
+{
+	const float Lstart = EdgeLuxelLuma( src[s + t * width] );
+	int cs = s;
+	int ct = t;
+	for ( int i = 0; i < maxStep; ++i )
+	{
+		const int s1 = cs + ds;
+		const int t1 = ct + dt;
+		if ( s1 < 0 || t1 < 0 || s1 >= width || t1 >= height )
+			break;
+		const float L1 = EdgeLuxelLuma( src[s1 + t1 * width] );
+		const int s2 = s1 + ds;
+		const int t2 = t1 + dt;
+		bool plateau = true;
+		if ( s2 >= 0 && t2 >= 0 && s2 < width && t2 < height )
+		{
+			const float L2 = EdgeLuxelLuma( src[s2 + t2 * width] );
+			const float rel = fabsf( L1 - L2 ) / max( max( L1, L2 ), 1e-4f );
+			plateau = rel <= 0.30f;
+		}
+		if ( plateau )
+		{
+			if ( L1 > 0.02f && Lstart < L1 * gate && ( L1 - Lstart ) > 0.01f )
+				return i + 1;
+			return 0;
+		}
+		// The next texel already left the dark band and is not stable with
+		// the one beyond it. Stop, so a shadow edge is not replaced by light
+		// further in.
+		const float relBand = fabsf( L1 - Lstart ) / max( max( max( L1, Lstart ), 0.05f ), 1e-4f );
+		if ( relBand > 0.45f )
+			return 0;
+		cs = s1;
+		ct = t1;
+	}
+	return 0;
+}
+
+// True when copying `plateau` onto this row would paint the lit side of a
+// terminator onto an outer texel that still belongs to the shadow side.
+static bool CreaseRowCrossesTerminator( float plateau, float outer, float sideA, float sideB )
+{
+	const float shadowRef = min( sideA, sideB );
+	return shadowRef > 0.02f && plateau > shadowRef * 1.8f && outer <= shadowRef * 1.15f + 0.01f;
+}
+
+// One row or column. Copies the raw plateau texel — no tangent blur, so a
+// shadow edge keeps its own side of the terminator.
+static void ApplyCreaseBorder( Vector *grid, const Vector *src, int width, int height,
+	int border, int maxStep, float gate, bool skipT0, bool skipT1, bool skipS0, bool skipS1 )
+{
+	const int sMax = width - 1;
+	const int tMax = height - 1;
+	if ( border == 0 || border == 1 )
+	{
+		const int ds = ( border == 0 ) ? 1 : -1;
+		const int s0 = ( border == 0 ) ? 0 : sMax;
+		for ( int t = 0; t <= tMax; ++t )
+		{
+			if ( ( skipT0 && t == 0 ) || ( skipT1 && t == tMax ) )
+				continue;
+			const int d = CreaseStableSteps( src, width, height, s0, t, ds, 0, maxStep, gate );
+			if ( d <= 0 )
+				continue;
+			const int srcS = s0 + ds * d;
+			if ( srcS < 0 || srcS >= width )
+				continue;
+			const Vector &v = src[srcS + t * width];
+			const float lv = EdgeLuxelLuma( v );
+			const float Louter = EdgeLuxelLuma( src[s0 + t * width] );
+			const float sideA = ( t > 0 ) ? EdgeLuxelLuma( src[srcS + ( t - 1 ) * width] ) : lv;
+			const float sideB = ( t < tMax ) ? EdgeLuxelLuma( src[srcS + ( t + 1 ) * width] ) : lv;
+			if ( CreaseRowCrossesTerminator( lv, Louter, sideA, sideB ) )
+				continue;
+			for ( int k = 0; k < d; ++k )
+			{
+				const int s = s0 + ds * k;
+				const int idx = s + t * width;
+				if ( EdgeLuxelLuma( src[idx] ) < lv * gate )
+					grid[idx] = v;
+			}
+		}
+	}
+	else
+	{
+		const int dt = ( border == 2 ) ? 1 : -1;
+		const int t0 = ( border == 2 ) ? 0 : tMax;
+		for ( int s = 0; s <= sMax; ++s )
+		{
+			if ( ( skipS0 && s == 0 ) || ( skipS1 && s == sMax ) )
+				continue;
+			const int d = CreaseStableSteps( src, width, height, s, t0, 0, dt, maxStep, gate );
+			if ( d <= 0 )
+				continue;
+			const int srcT = t0 + dt * d;
+			if ( srcT < 0 || srcT >= height )
+				continue;
+			const Vector &v = src[s + srcT * width];
+			const float lv = EdgeLuxelLuma( v );
+			const float Louter = EdgeLuxelLuma( src[s + t0 * width] );
+			const float sideA = ( s > 0 ) ? EdgeLuxelLuma( src[( s - 1 ) + srcT * width] ) : lv;
+			const float sideB = ( s < sMax ) ? EdgeLuxelLuma( src[( s + 1 ) + srcT * width] ) : lv;
+			if ( CreaseRowCrossesTerminator( lv, Louter, sideA, sideB ) )
+				continue;
+			for ( int k = 0; k < d; ++k )
+			{
+				const int t = t0 + dt * k;
+				const int idx = s + t * width;
+				if ( EdgeLuxelLuma( src[idx] ) < lv * gate )
+					grid[idx] = v;
+			}
+		}
+	}
+}
+
+// Single corner texel, stepped diagonally into the face. Rejected when that
+// sample is much brighter than both adjacent edge interiors (sun leaking
+// into a shadowed corner).
+static void ApplyCreaseCorner( Vector *grid, const Vector *src, int width, int height,
+	int s0, int t0, int ds, int dt, int maxStep, float gate )
+{
+	const int steps = CreaseStableSteps( src, width, height, s0, t0, ds, dt, maxStep, gate );
+	if ( steps <= 0 )
+		return;
+	const int ss = s0 + ds * steps;
+	const int tt = t0 + dt * steps;
+	if ( ss < 0 || tt < 0 || ss >= width || tt >= height )
+		return;
+
+	const int sAxis = s0 + ds;
+	const int tAxis = t0 + dt;
+	float local = 0.0f;
+	if ( sAxis >= 0 && sAxis < width )
+		local = max( local, EdgeLuxelLuma( src[sAxis + t0 * width] ) );
+	if ( tAxis >= 0 && tAxis < height )
+		local = max( local, EdgeLuxelLuma( src[s0 + tAxis * width] ) );
+
+	const Vector &v = src[ss + tt * width];
+	const float lv = EdgeLuxelLuma( v );
+	if ( local > 0.02f && lv > local * 1.35f )
+		return;
+
+	const int idx = s0 + t0 * width;
+	if ( EdgeLuxelLuma( src[idx] ) < lv * gate )
+		grid[idx] = v;
+}
+
+// Concave edge that does not lie on the lightmap rectangle (stairs, other
+// non-axis brush edges). Luxel centers along it can fall outside the face.
+struct CreaseDiagSeg_t
+{
+	Vector2D a;
+	Vector2D b;
+	float ix;
+	float iy;
+};
+
+static const int kCreaseMaxDiag = 24;
+
+static void CreasePushDiag( CreaseDiagSeg_t *diag, int &nDiag, int maxDiag,
+	const Vector2D &ls0, const Vector2D &ls1, const Vector2D &centroidLS )
+{
+	if ( !diag || nDiag >= maxDiag )
+		return;
+
+	const float dx = ls1.x - ls0.x;
+	const float dy = ls1.y - ls0.y;
+	const float len = sqrtf( dx * dx + dy * dy );
+	if ( len < 1.25f )
+		return;
+
+	const float adx = fabsf( dx );
+	const float ady = fabsf( dy );
+	// Axis-aligned edges are the rectangle borders. A diagonal has extent on
+	// both luxel axes and is not a shallow cut along one of them.
+	if ( adx <= 1.0f || ady <= 1.0f || adx <= 0.30f * len || ady <= 0.30f * len )
+		return;
+
+	float ix = -dy / len;
+	float iy = dx / len;
+	const float mx = 0.5f * ( ls0.x + ls1.x );
+	const float my = 0.5f * ( ls0.y + ls1.y );
+	if ( ix * ( centroidLS.x - mx ) + iy * ( centroidLS.y - my ) < 0.0f )
+	{
+		ix = -ix;
+		iy = -iy;
+	}
+
+	for ( int i = 0; i < nDiag; ++i )
+	{
+		const float ex = 0.5f * ( diag[i].a.x + diag[i].b.x ) - mx;
+		const float ey = 0.5f * ( diag[i].a.y + diag[i].b.y ) - my;
+		if ( ex * ex + ey * ey < 0.36f && ix * diag[i].ix + iy * diag[i].iy > 0.8f )
+			return;
+	}
+
+	diag[nDiag].a = ls0;
+	diag[nDiag].b = ls1;
+	diag[nDiag].ix = ix;
+	diag[nDiag].iy = iy;
+	++nDiag;
+}
+
+// Signed luxel distance to the segment, positive toward the face interior.
+// Points past either endpoint are rejected so the fill stays on this edge.
+static bool CreaseDiagSample( float px, float py, const CreaseDiagSeg_t &seg, float &outSigned )
+{
+	const float abx = seg.b.x - seg.a.x;
+	const float aby = seg.b.y - seg.a.y;
+	const float ab2 = abx * abx + aby * aby;
+	if ( ab2 < 1e-6f )
+		return false;
+
+	float t = ( ( px - seg.a.x ) * abx + ( py - seg.a.y ) * aby ) / ab2;
+	t = clamp( t, 0.0f, 1.0f );
+	const float vx = px - ( seg.a.x + abx * t );
+	const float vy = py - ( seg.a.y + aby * t );
+	const float invLen = 1.0f / sqrtf( ab2 );
+	const float tang = ( vx * abx + vy * aby ) * invLen;
+	if ( fabsf( tang ) > 0.75f )
+		return false;
+
+	outSigned = vx * seg.ix + vy * seg.iy;
+	return true;
+}
+
+// Luxels that sit on or just outside a diagonal concave edge are mostly
+// occluded by the neighbor solid. Copy the raw interior plateau of that edge.
+static void ApplyCreaseDiagonals( Vector *grid, const Vector *src, int width, int height,
+	const CreaseDiagSeg_t *diag, int nDiag )
+{
+	if ( !diag || nDiag <= 0 )
+		return;
+
+	const float gate = 0.75f;
+	const int maxStep = 2;
+	for ( int t = 0; t < height; ++t )
+	{
+		for ( int s = 0; s < width; ++s )
+		{
+			const int idx = s + t * width;
+			if ( EdgeLuxelLuma( grid[idx] ) > EdgeLuxelLuma( src[idx] ) + 0.01f )
+				continue;
+
+			float bestAbs = 1.0e9f;
+			float bestSigned = 0.0f;
+			int best = -1;
+			for ( int e = 0; e < nDiag; ++e )
+			{
+				float sd;
+				if ( !CreaseDiagSample( (float)s, (float)t, diag[e], sd ) )
+					continue;
+				const float ad = fabsf( sd );
+				if ( ad < bestAbs )
+				{
+					bestAbs = ad;
+					bestSigned = sd;
+					best = e;
+				}
+			}
+			if ( best < 0 || bestSigned < -1.15f || bestSigned > 0.55f )
+				continue;
+
+			int ds = 0;
+			int dt = 0;
+			const float ix = diag[best].ix;
+			const float iy = diag[best].iy;
+			if ( fabsf( ix ) >= 0.4f )
+				ds = ( ix > 0.0f ) ? 1 : -1;
+			if ( fabsf( iy ) >= 0.4f )
+				dt = ( iy > 0.0f ) ? 1 : -1;
+			if ( !ds && !dt )
+			{
+				if ( fabsf( ix ) >= fabsf( iy ) )
+					ds = ( ix >= 0.0f ) ? 1 : -1;
+				else
+					dt = ( iy >= 0.0f ) ? 1 : -1;
+			}
+
+			const int d = CreaseStableSteps( src, width, height, s, t, ds, dt, maxStep, gate );
+			if ( d <= 0 )
+				continue;
+			const int ss = s + ds * d;
+			const int tt = t + dt * d;
+			if ( ss < 0 || tt < 0 || ss >= width || tt >= height )
+				continue;
+
+			const Vector &v = src[ss + tt * width];
+			const float lv = EdgeLuxelLuma( v );
+			if ( EdgeLuxelLuma( src[idx] ) < lv * gate )
+				grid[idx] = v;
+		}
+	}
+}
+
+// concave[b] / coplanar[b]: lightmap rectangle borders.
+// bit0=s0, bit1=sMax, bit2=t0, bit3=tMax.
+// diag: concave edges that cut across the luxel grid (not the rectangle).
+//
+// PairEdges only records neighbors with ndot >= smoothing_threshold (45°), so
+// 90° walls never appear in faceneighbor. Walk vertex-sharing faces, plus
+// any face whose verts land in the same 4-unit cell.
+static void ClassifyLightmapCreaseBorders( int facenum, int width, int height, bool concave[4], bool coplanar[4],
+	CreaseDiagSeg_t *diag, int *nDiag, int maxDiag )
+{
+	for ( int b = 0; b < 4; ++b )
+	{
+		concave[b] = false;
+		coplanar[b] = false;
+	}
+	if ( nDiag )
+		*nDiag = 0;
+	if ( facenum < 0 || facenum >= numfaces || width < 2 || height < 2 )
+		return;
+
+	dface_t *f = &g_pFaces[facenum];
+	if ( texinfo[f->texinfo].flags & TEX_SPECIAL || f->dispinfo != -1 )
+		return;
+
+	lightinfo_t lA;
+	InitLightinfo( &lA, facenum );
+	const Vector &nA = faceneighbor[facenum].facenormal;
+
+	Vector centroidA( 0, 0, 0 );
+	for ( int ea = 0; ea < f->numedges; ++ea )
+		centroidA += dvertexes[RadialEdgeVertex( f, ea )].point;
+	if ( f->numedges > 0 )
+		centroidA *= ( 1.0f / (float)f->numedges );
+	Vector2D centroidLS( 0, 0 );
+	WorldToLuxelSpace( &lA, centroidA, centroidLS );
+
+	int candidates[256];
+	int nCand = 0;
+	for ( int ea = 0; ea < f->numedges; ++ea )
+	{
+		const int v = RadialEdgeVertex( f, ea );
+		if ( v < 0 || v >= numvertexes || !vertexface[v] )
+			continue;
+		for ( int k = 0; k < vertexref[v]; ++k )
+		{
+			const int other = vertexface[v][k];
+			if ( other == facenum )
+				continue;
+			bool dup = false;
+			for ( int c = 0; c < nCand; ++c )
+			{
+				if ( candidates[c] == other )
+				{
+					dup = true;
+					break;
+				}
+			}
+			if ( !dup && nCand < (int)ARRAYSIZE( candidates ) )
+				candidates[nCand++] = other;
+		}
+	}
+
+	// Duplicated / unwelded verts still share a 4-unit cell.
+	EnsureCreaseVertexHash();
+	for ( int ea = 0; ea < f->numedges && nCand < (int)ARRAYSIZE( candidates ); ++ea )
+		CreaseAddNearFaces( dvertexes[RadialEdgeVertex( f, ea )].point, facenum, candidates, nCand, (int)ARRAYSIZE( candidates ) );
+
+	for ( int j = 0; j < nCand; ++j )
+	{
+		const int neighborFace = candidates[j];
+		dface_t *fB = &g_pFaces[neighborFace];
+		if ( texinfo[fB->texinfo].flags & TEX_SPECIAL || fB->dispinfo != -1 )
+			continue;
+
+		const Vector &nB = faceneighbor[neighborFace].facenormal;
+		const float ndot = DotProduct( nA, nB );
+		const bool isCoplanar = ndot >= STITCH_COPLANAR_DOT;
+		const bool isPerp = fabsf( ndot ) <= 0.35f;
+		if ( !isCoplanar && !isPerp )
+			continue;
+
+		for ( int ea = 0; ea < f->numedges; ++ea )
+		{
+			const Vector &a0 = dvertexes[RadialEdgeVertex( f, ea )].point;
+			const Vector &a1 = dvertexes[RadialEdgeVertex( f, ea + 1 )].point;
+			for ( int eb = 0; eb < fB->numedges; ++eb )
+			{
+				Vector overlap0, overlap1;
+				if ( !StitchEdgesOverlap( a0, a1,
+										  dvertexes[RadialEdgeVertex( fB, eb )].point,
+										  dvertexes[RadialEdgeVertex( fB, eb + 1 )].point,
+										  overlap0, overlap1 ) )
+					continue;
+
+				if ( isPerp )
+				{
+					// Source normals point into the room. Skip when this face sits
+					// behind the neighbor plane (convex / exterior corner).
+					if ( DotProduct( centroidA - overlap0, nB ) <= 0.0f )
+						continue;
+				}
+
+				Vector2D ls0, ls1;
+				WorldToLuxelSpace( &lA, overlap0, ls0 );
+				WorldToLuxelSpace( &lA, overlap1, ls1 );
+				if ( isPerp && diag && nDiag )
+					CreasePushDiag( diag, *nDiag, maxDiag, ls0, ls1, centroidLS );
+
+				const int mask = LuxelSegCreaseBorderMask( ls0, ls1, width, height );
+				if ( !mask )
+					continue;
+				for ( int b = 0; b < 4; ++b )
+				{
+					if ( !( mask & ( 1 << b ) ) )
+						continue;
+					if ( isCoplanar )
+						coplanar[b] = true;
+					if ( isPerp )
+						concave[b] = true;
+				}
+			}
+		}
+	}
+}
+
+// Luxel center sits in another brush, or inside a static-prop mesh that
+// intersects this face. A point on this face's own plane is nudged into the
+// room first so the owner brush is not classified as solid.
+static void BuildLuxelEmbedMask( const lightinfo_t &l, int width, int height, CUtlVector<unsigned char> &embedded )
+{
+	const int n = width * height;
+	embedded.SetCount( n );
+	memset( embedded.Base(), 0, n );
+
+	CUtlVector<Vector> origins;
+	CUtlVector<Vector> dirs;
+	CUtlVector<float> tmins;
+	CUtlVector<float> tmaxs;
+	CUtlVector<int> rayMap;
+	origins.EnsureCapacity( n );
+	dirs.EnsureCapacity( n );
+	tmins.EnsureCapacity( n );
+	tmaxs.EnsureCapacity( n );
+	rayMap.EnsureCapacity( n );
+
+	const Vector &normal = l.facenormal;
+	for ( int t = 0; t < height; ++t )
+	{
+		for ( int s = 0; s < width; ++s )
+		{
+			const int idx = s + t * width;
+			Vector world;
+			LuxelSpaceToWorld( &l, (float)s, (float)t, world );
+			Vector nudged = world + normal * 0.5f;
+			const int leaf = PointLeafnum( nudged );
+			if ( leaf >= 0 && leaf < numleafs && ( dleafs[leaf].contents & CONTENTS_SOLID ) )
+			{
+				embedded[idx] = 1;
+				continue;
+			}
+
+			// Inside a prop the nearest hit along the normal is the shell's
+			// backface. A prop in front of the face is a frontface hit.
+			origins.AddToTail( world + normal * 0.25f );
+			dirs.AddToTail( normal );
+			tmins.AddToTail( 0.0f );
+			tmaxs.AddToTail( 256.0f );
+			rayMap.AddToTail( idx );
+		}
+	}
+
+	const int nRays = rayMap.Count();
+	CUtlVector<float> outT;
+	CUtlVector<unsigned int> outFlags, outHit;
+	CUtlVector<Vector> outN;
+	if ( nRays > 0 )
+	{
+		outT.SetCount( nRays );
+		outFlags.SetCount( nRays );
+		outHit.SetCount( nRays );
+		outN.SetCount( nRays );
+		if ( PathTraceDXR_TraceClosest( origins.Base(), dirs.Base(), tmins.Base(), tmaxs.Base(),
+				outT.Base(), outFlags.Base(), outHit.Base(), nRays, outN.Base() ) )
+		{
+			for ( int i = 0; i < nRays; ++i )
+			{
+				if ( !outHit[i] || ( outFlags[i] & TRACE_ID_SKY ) )
+					continue;
+				if ( ( outFlags[i] & TRACE_ID_STATICPROP ) == 0 )
+					continue;
+				Vector hn = outN[i];
+				if ( hn.LengthSqr() < 1e-8f )
+					continue;
+				VectorNormalize( hn );
+				if ( DotProduct( hn, normal ) > 0.2f )
+					embedded[rayMap[i]] = 2;
+			}
+		}
+	}
+
+	// The visible dark band sits on the brush just outside the prop, so a
+	// ray along the normal never enters the mesh. Probe across the face and
+	// mark luxels that meet the prop within one and a half luxels.
+	float lenS = l.luxelToWorldSpace[0].Length();
+	float lenT = l.luxelToWorldSpace[1].Length();
+	float luxelLen = 0.5f * ( lenS + lenT );
+	if ( luxelLen < 1.0f )
+		luxelLen = 1.0f;
+	Vector axisS = l.luxelToWorldSpace[0];
+	Vector axisT = l.luxelToWorldSpace[1];
+	if ( lenS > 1e-6f )
+		axisS *= ( 1.0f / lenS );
+	else
+		axisS.Init( 1, 0, 0 );
+	if ( lenT > 1e-6f )
+		axisT *= ( 1.0f / lenT );
+	else
+		axisT.Init( 0, 1, 0 );
+	const float reach = luxelLen * 2.0f;
+
+	origins.RemoveAll();
+	dirs.RemoveAll();
+	tmins.RemoveAll();
+	tmaxs.RemoveAll();
+	rayMap.RemoveAll();
+
+	for ( int t = 0; t < height; ++t )
+	{
+		for ( int s = 0; s < width; ++s )
+		{
+			const int idx = s + t * width;
+			if ( embedded[idx] )
+				continue;
+			Vector world;
+			LuxelSpaceToWorld( &l, (float)s, (float)t, world );
+			Vector probe = world + normal * 0.5f;
+			const int leaf = PointLeafnum( probe );
+			if ( leaf >= 0 && StaticPropMgr()->IsPointInsideStaticProp( 0, leaf, probe ) )
+			{
+				embedded[idx] = 2;
+				continue;
+			}
+			for ( int a = 0; a < 8; ++a )
+			{
+				const float ang = (float)a * ( 2.0f * (float)M_PI / 8.0f );
+				Vector dir = axisS * cosf( ang ) + axisT * sinf( ang );
+				origins.AddToTail( probe );
+				dirs.AddToTail( dir );
+				tmins.AddToTail( 0.05f );
+				tmaxs.AddToTail( reach );
+				rayMap.AddToTail( idx );
+			}
+		}
+	}
+
+	const int nSide = rayMap.Count();
+	if ( nSide <= 0 )
+		return;
+
+	outT.SetCount( nSide );
+	outFlags.SetCount( nSide );
+	outHit.SetCount( nSide );
+	outN.SetCount( nSide );
+	if ( !PathTraceDXR_TraceClosest( origins.Base(), dirs.Base(), tmins.Base(), tmaxs.Base(),
+			outT.Base(), outFlags.Base(), outHit.Base(), nSide, outN.Base() ) )
+		return;
+
+	for ( int i = 0; i < nSide; ++i )
+	{
+		if ( !outHit[i] || ( outFlags[i] & TRACE_ID_SKY ) )
+			continue;
+		if ( ( outFlags[i] & TRACE_ID_STATICPROP ) == 0 )
+			continue;
+		if ( outT[i] > reach )
+			continue;
+		embedded[rayMap[i]] = 2;
+	}
+}
+
+static CUtlVector<CUtlVector<unsigned char>> g_LuxelEmbedMask;
+static bool g_LuxelEmbedMaskInit = false;
+
+static const unsigned char *LuxelEmbedMask( int facenum, int width, int height, const lightinfo_t &l )
+{
+	const int n = width * height;
+	if ( !g_LuxelEmbedMaskInit )
+	{
+		ThreadLock();
+		if ( !g_LuxelEmbedMaskInit )
+		{
+			g_LuxelEmbedMask.SetCount( numfaces );
+			g_LuxelEmbedMaskInit = true;
+		}
+		ThreadUnlock();
+	}
+	if ( facenum >= 0 && facenum < g_LuxelEmbedMask.Count() && g_LuxelEmbedMask[facenum].Count() == n )
+		return g_LuxelEmbedMask[facenum].Base();
+
+	CUtlVector<unsigned char> built;
+	BuildLuxelEmbedMask( l, width, height, built );
+
+	ThreadLock();
+	if ( facenum >= 0 && facenum < g_LuxelEmbedMask.Count() )
+	{
+		if ( g_LuxelEmbedMask[facenum].Count() != n )
+			g_LuxelEmbedMask[facenum] = built;
+		ThreadUnlock();
+		return g_LuxelEmbedMask[facenum].Base();
+	}
+	ThreadUnlock();
+	return NULL;
+}
+
+// Black texels inside an intersecting solid bilinear-filter onto the visible
+// face. Paint those texels, and the one straddling luxel, from the visible
+// side. A real shadow stays: it is not inside solid, and a light/shadow split
+// along the cut is left alone.
+static void HealIntersectingOcclusion( Vector *grid, int width, int height, int facenum )
+{
+	if ( !grid || facenum < 0 || facenum >= numfaces || width < 2 || height < 2 )
+		return;
+
+	dface_t *f = &g_pFaces[facenum];
+	if ( texinfo[f->texinfo].flags & TEX_SPECIAL || f->dispinfo != -1 )
+		return;
+
+	lightinfo_t l;
+	InitLightinfo( &l, facenum );
+
+	const unsigned char *embedSrc = LuxelEmbedMask( facenum, width, height, l );
+	if ( !embedSrc )
+		return;
+
+	const int n = width * height;
+	CUtlVector<char> embedded;
+	CUtlVector<char> propTouch;
+	embedded.SetCount( n );
+	propTouch.SetCount( n );
+	int nEmb = 0;
+	int nProp = 0;
+	for ( int i = 0; i < n; ++i )
+	{
+		embedded[i] = ( embedSrc[i] & 1 ) ? 1 : 0;
+		propTouch[i] = ( embedSrc[i] & 2 ) ? 1 : 0;
+		if ( embedded[i] )
+			++nEmb;
+		if ( propTouch[i] )
+			++nProp;
+	}
+	if ( ( !nEmb && !nProp ) || ( nEmb == n && !nProp ) )
+		return;
+
+	CUtlVector<Vector> src;
+	src.SetCount( n );
+	for ( int i = 0; i < n; ++i )
+		src[i] = grid[i];
+
+	const int kDx[4] = { 1, -1, 0, 0 };
+	const int kDy[4] = { 0, 0, 1, -1 };
+
+	// Straddling luxel: in the room, but one side is inside the other brush.
+	for ( int t = 0; t < height; ++t )
+	{
+		for ( int s = 0; s < width; ++s )
+		{
+			const int idx = s + t * width;
+			if ( embedded[idx] )
+				continue;
+
+			float refL = -1.0f;
+			Vector ref( 0, 0, 0 );
+			bool agree = true;
+			int nRef = 0;
+			bool touch = false;
+			for ( int k = 0; k < 4; ++k )
+			{
+				const int ns = s + kDx[k];
+				const int nt = t + kDy[k];
+				if ( ns < 0 || nt < 0 || ns >= width || nt >= height )
+					continue;
+				if ( !embedded[ns + nt * width] )
+					continue;
+				touch = true;
+
+				const int os = s - kDx[k];
+				const int ot = t - kDy[k];
+				if ( os < 0 || ot < 0 || os >= width || ot >= height )
+					continue;
+				if ( embedded[os + ot * width] )
+					continue;
+
+				const Vector &ov = src[os + ot * width];
+				const float ol = EdgeLuxelLuma( ov );
+				if ( !nRef )
+				{
+					refL = ol;
+					ref = ov;
+				}
+				else
+				{
+					const float rel = fabsf( ol - refL ) / max( max( ol, refL ), 1e-4f );
+					if ( rel > 0.35f )
+						agree = false;
+				}
+				++nRef;
+			}
+			if ( !touch || !agree || !nRef || refL <= 0.02f )
+				continue;
+			if ( EdgeLuxelLuma( src[idx] ) < refL * 0.90f && EdgeLuxelLuma( grid[idx] ) < refL )
+				grid[idx] = ref;
+		}
+	}
+
+	// One luxel of the buried side takes the visible neighbor, so the engine
+	// bilinear kernel does not read black.
+	for ( int t = 0; t < height; ++t )
+	{
+		for ( int s = 0; s < width; ++s )
+		{
+			const int idx = s + t * width;
+			if ( !embedded[idx] )
+				continue;
+
+			float minL = 1.0e9f;
+			float maxL = -1.0f;
+			Vector darker( 0, 0, 0 );
+			Vector anyV( 0, 0, 0 );
+			int nVis = 0;
+			for ( int k = 0; k < 4; ++k )
+			{
+				const int ns = s + kDx[k];
+				const int nt = t + kDy[k];
+				if ( ns < 0 || nt < 0 || ns >= width || nt >= height )
+					continue;
+				if ( embedded[ns + nt * width] )
+					continue;
+				const Vector &v = grid[ns + nt * width];
+				const float lv = EdgeLuxelLuma( v );
+				if ( !nVis || lv < minL )
+				{
+					minL = lv;
+					darker = v;
+				}
+				maxL = max( maxL, lv );
+				anyV = v;
+				++nVis;
+			}
+			if ( !nVis )
+				continue;
+
+			const bool agree = ( minL >= maxL * 0.65f );
+			const Vector &pick = agree ? anyV : darker;
+			if ( EdgeLuxelLuma( grid[idx] ) < EdgeLuxelLuma( pick ) )
+				grid[idx] = pick;
+		}
+	}
+
+	// Brush luxels that touch a prop. Copy the nearest luxel that does not,
+	// so the contact band matches the open face instead of the occluded sample.
+	if ( nProp )
+	{
+		for ( int t = 0; t < height; ++t )
+		{
+			for ( int s = 0; s < width; ++s )
+			{
+				const int idx = s + t * width;
+				if ( !propTouch[idx] )
+					continue;
+
+				int bestD = 99;
+				float bestL = -1.0f;
+				Vector best( 0, 0, 0 );
+				for ( int dy = -3; dy <= 3; ++dy )
+				{
+					const int nt = t + dy;
+					if ( nt < 0 || nt >= height )
+						continue;
+					for ( int dx = -3; dx <= 3; ++dx )
+					{
+						if ( !dx && !dy )
+							continue;
+						const int ns = s + dx;
+						if ( ns < 0 || ns >= width )
+							continue;
+						const int ni = ns + nt * width;
+						if ( propTouch[ni] || embedded[ni] )
+							continue;
+						const int d = max( abs( dx ), abs( dy ) );
+						const float lv = EdgeLuxelLuma( src[ni] );
+						if ( d < bestD || ( d == bestD && lv < bestL ) )
+						{
+							bestD = d;
+							bestL = lv;
+							best = src[ni];
+						}
+					}
+				}
+				if ( bestD <= 3 && bestL > 0.02f && EdgeLuxelLuma( grid[idx] ) < bestL * 0.92f )
+					grid[idx] = best;
+			}
+		}
+	}
+}
+
+// Outer luxels on a concave crease lose hemisphere energy. Each row copies
+// its own stable interior texel, so a light/shadow edge is not averaged.
+// The shared corner texel is one diagonal sample. Diagonal concave edges
+// fill luxels that landed mostly outside the face. Coplanar splits are not touched.
+void ReconstructLightmapEdgeLuxels( Vector *grid, int width, int height, int facenum, bool bConcaveOnly )
+{
+	if ( !grid || width < 2 || height < 2 )
+		return;
+
+	bool concave[4], coplanar[4];
+	CreaseDiagSeg_t diag[kCreaseMaxDiag];
+	int nDiag = 0;
+	ClassifyLightmapCreaseBorders( facenum, width, height, concave, coplanar, diag, &nDiag, kCreaseMaxDiag );
+
+	const int capS = min( 4, max( 1, ( width - 1 ) / 2 ) );
+	const int capT = min( 4, max( 1, ( height - 1 ) / 2 ) );
+
+	bool active[4];
+	float gate[4];
+	int maxStep[4];
+	bool any = nDiag > 0;
+	for ( int b = 0; b < 4; ++b )
+	{
+		active[b] = false;
+		gate[b] = 0.72f;
+		maxStep[b] = ( b < 2 ) ? capS : capT;
+		if ( coplanar[b] && !concave[b] )
+			continue;
+		if ( concave[b] )
+		{
+			active[b] = true;
+			gate[b] = 0.86f;
+		}
+		else if ( !bConcaveOnly )
+		{
+			active[b] = true;
+			gate[b] = 0.72f;
+			if ( maxStep[b] > 3 )
+				maxStep[b] = 3;
+		}
+		if ( active[b] )
+			any = true;
+	}
+	if ( !any )
+	{
+		HealIntersectingOcclusion( grid, width, height, facenum );
+		return;
+	}
+
+	const int n = width * height;
+	CUtlVector<Vector> src;
+	src.SetCount( n );
+	for ( int i = 0; i < n; ++i )
+		src[i] = grid[i];
+
+	const int sMax = width - 1;
+	const int tMax = height - 1;
+	// Both borders own this corner: keep it out of either edge walk and fill
+	// it with one diagonal sample so neither side's light is dragged across.
+	const bool cornerBoth[4] = {
+		active[0] && active[2],
+		active[1] && active[2],
+		active[0] && active[3],
+		active[1] && active[3],
+	};
+
+	for ( int b = 0; b < 4; ++b )
+	{
+		if ( !active[b] )
+			continue;
+		bool skipT0 = false, skipT1 = false, skipS0 = false, skipS1 = false;
+		if ( b == 0 )
+		{
+			skipT0 = cornerBoth[0];
+			skipT1 = cornerBoth[2];
+		}
+		else if ( b == 1 )
+		{
+			skipT0 = cornerBoth[1];
+			skipT1 = cornerBoth[3];
+		}
+		else if ( b == 2 )
+		{
+			skipS0 = cornerBoth[0];
+			skipS1 = cornerBoth[1];
+		}
+		else
+		{
+			skipS0 = cornerBoth[2];
+			skipS1 = cornerBoth[3];
+		}
+		ApplyCreaseBorder( grid, src.Base(), width, height, b, maxStep[b], gate[b],
+			skipT0, skipT1, skipS0, skipS1 );
+	}
+
+	struct CornerSpec
+	{
+		int b0, b1;
+		int s0, t0;
+		int ds, dt;
+	};
+	const CornerSpec corners[4] = {
+		{ 0, 2, 0,    0,    +1, +1 },
+		{ 1, 2, sMax, 0,    -1, +1 },
+		{ 0, 3, 0,    tMax, +1, -1 },
+		{ 1, 3, sMax, tMax, -1, -1 },
+	};
+	for ( int c = 0; c < 4; ++c )
+	{
+		if ( !cornerBoth[c] )
+			continue;
+		const int b0 = corners[c].b0;
+		const int b1 = corners[c].b1;
+		const float g = max( gate[b0], gate[b1] );
+		int mx = max( maxStep[b0], maxStep[b1] );
+		mx = min( mx, min( capS, capT ) );
+		ApplyCreaseCorner( grid, src.Base(), width, height,
+			corners[c].s0, corners[c].t0, corners[c].ds, corners[c].dt,
+			mx, g );
+	}
+
+	ApplyCreaseDiagonals( grid, src.Base(), width, height, diag, nDiag );
+	HealIntersectingOcclusion( grid, width, height, facenum );
+}
+
 // Bilinear sample of a face's lightmap (decoded to linear) from the snapshot buffer.
 static void StitchSampleLightmap( const byte *pSnapshot, const dface_t *f, int nLuxelsWide, int nLuxelsTall,
 								  int style, int bump, int bumpCount, float s, float t, Vector &out )
@@ -1112,6 +2279,50 @@ static void StitchSampleLightmap( const byte *pSnapshot, const dface_t *f, int n
 
 	out = c00 * ( ( 1.0f - fs ) * ( 1.0f - ft ) ) + c10 * ( fs * ( 1.0f - ft ) ) +
 		  c01 * ( ( 1.0f - fs ) * ft ) + c11 * ( fs * ft );
+}
+
+// Stitch can pull a wall-corner luxel back toward a darker coplanar neighbor.
+// Re-dilate concave borders only, so coplanar seam welds stay put.
+static void RehealConcaveCreasesAfterStitch()
+{
+	if ( !pdlightdata || !pdlightdata->Count() )
+		return;
+
+	for ( int facenum = 0; facenum < numfaces; ++facenum )
+	{
+		dface_t *f = &g_pFaces[facenum];
+		if ( texinfo[f->texinfo].flags & TEX_SPECIAL )
+			continue;
+		if ( f->lightofs < 0 || f->dispinfo != -1 )
+			continue;
+
+		facelight_t *fl = &facelight[facenum];
+		if ( !fl->numluxels )
+			continue;
+
+		const int width = f->m_LightmapTextureSizeInLuxels[0] + 1;
+		const int height = f->m_LightmapTextureSizeInLuxels[1] + 1;
+		if ( width < 2 || height < 2 || width * height != fl->numluxels )
+			continue;
+
+		const int bumpCount = ( texinfo[f->texinfo].flags & SURF_BUMPLIGHT ) ? ( NUM_BUMP_VECTS + 1 ) : 1;
+		const int n = width * height;
+		CUtlVector<Vector> grid;
+		grid.SetCount( n );
+
+		for ( int k = 0; k < MAXLIGHTMAPS && f->styles[k] != 255; ++k )
+		{
+			for ( int bump = 0; bump < bumpCount; ++bump )
+			{
+				byte *p = &(*pdlightdata)[f->lightofs + ( k * bumpCount + bump ) * n * 4];
+				for ( int i = 0; i < n; ++i )
+					ColorRGBExp32ToVector( *( ColorRGBExp32 * )( p + i * 4 ), grid[i] );
+				ReconstructLightmapEdgeLuxels( grid.Base(), width, height, facenum, true );
+				for ( int i = 0; i < n; ++i )
+					VectorToColorRGBExp32( grid[i], *( ColorRGBExp32 * )( p + i * 4 ) );
+			}
+		}
+	}
 }
 
 void StitchLightmapSeams( bool bPathTraceNarrow )
@@ -1298,7 +2509,25 @@ void StitchLightmapSeams( bool bPathTraceNarrow )
 						StitchSampleLightmap( snapshot.Base(), fB, wB, hB, nstyle, b, bumpCountB,
 											  coordB.x, coordB.y, colorB );
 
-						Vector stitched = colorA + ( colorB - colorA ) * blend;
+						const float la = EdgeLuxelLuma( colorA );
+						const float lb = EdgeLuxelLuma( colorB );
+						const float maxL = max( la, lb );
+						float stitchBlend = blend;
+						if ( maxL > 1e-3f )
+						{
+							const float rel = fabsf( la - lb ) / maxL;
+							if ( rel > 0.50f )
+								stitchBlend = 0.0f;
+							else if ( rel > 0.35f )
+							{
+								const float gate = clamp( ( 0.50f - rel ) / 0.15f, 0.0f, 1.0f );
+								stitchBlend *= gate * gate;
+							}
+						}
+
+						Vector stitched = colorA;
+						if ( stitchBlend > 0.0f )
+							stitched = colorA + ( colorB - colorA ) * stitchBlend;
 						VectorToColorRGBExp32( stitched, *(ColorRGBExp32 *)&(*pdlightdata)[ofsA] );
 					}
 				}
@@ -1307,6 +2536,8 @@ void StitchLightmapSeams( bool bPathTraceNarrow )
 			}
 		}
 	}
+
+	RehealConcaveCreasesAfterStitch();
 
 	if ( bPathTraceNarrow )
 		Msg( "Stitched %d pathtrace seam luxel(s) (narrow band, %d chart seam pair(s))\n", nStitchedLuxels, nChartSeams );

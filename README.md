@@ -424,7 +424,7 @@ Ballpark: 2700 incandescent, **3000** halogen / warm LED, 4000 cool white, 5600 
 
 Instead of Valve's fixed 30 random cone rays:
 
-- Low-discrepancy spiral
+- 2D Sobol in the cone (same sequence family as Optuna's QMCSampler)
 - Count scales with angle (about 9 at 2°, about 40 at 50°)
 - Stops early when fully lit or fully shadowed
 
@@ -445,6 +445,10 @@ After `FinalLightFace`, luxels near overlapping edges of coplanar faces blend to
 ### Edge pull (on; `-noedgepull` off)
 
 Pulls edge samples inward (`-edgepull [N]`, default **0.5** luxels) so thin walls and jambs don't go black.
+
+### Crease dilation (on)
+
+The last luxel on a concave edge is often much darker than the rest of the face. Each row is filled from its own stable interior luxel, so a shadow crossing that edge stays on its own side. The corner texel is a single diagonal sample. Diagonal concave edges (stairs) fill luxels that sit mostly outside the face. Where a face runs through another brush, or a lightmapped prop cuts through it, luxels inside that solid and the brush luxels that sit against the prop are filled from the open face so the cut is not a dark stripe. Prop lightmaps get the same fill where a texel sits inside a brush. Coplanar splits stay with seam stitching. After stitching, only concave borders are dilated again so a seam blend cannot put the dark corner luxel back.
 
 ---
 
@@ -493,7 +497,7 @@ Needs a DXR GPU. Easiest path: `-config full` with the path-trace flags uncommen
 
 ### Static props
 
-With `-StaticPropLighting`, the GPU baker lights prop lightmap texels and prop vertices. Vertices use **8×8** per-triangle charts packed into a **64×64**-cell atlas (`-pt_prop_vertgrid`, default **4**; `0` = one sample per vert). Charts are hole-filled and can be denoised (`-pt_denoise`). Each vertex takes the closest sample from every adjacent triangle and averages them. Override with `-pt_prop_samples` / `-pt_prop_bounces`. Classic prop path: 4-wide SSE direct + optional GPU bounce cull.
+With `-StaticPropLighting`, the GPU baker lights prop lightmap texels and prop vertices. Prop lightmaps use the same path as brush luxels: world spp and bounces, `-pt_aa`, adaptive extra samples, the same crease bias, and `-pt_denoise` per UV island. Bounce off a prop uses that model's `$basetexture` albedo. Vertices stay cheaper: **8×8** per-triangle charts packed into a **64×64**-cell atlas (`-pt_prop_vertgrid`, default **4**; `0` = one sample per vert). Charts are hole-filled and can be denoised (`-pt_denoise`). Each vertex takes the closest sample from every adjacent triangle and averages them. Override vertex quality with `-pt_prop_samples` / `-pt_prop_bounces`. Classic prop path: 4-wide SSE direct + optional GPU bounce cull.
 
 ### Detail props
 

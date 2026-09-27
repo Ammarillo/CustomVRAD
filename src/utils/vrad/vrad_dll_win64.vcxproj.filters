@@ -77,6 +77,9 @@
     <ClInclude Include="ao.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="qmc_sobol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="absorb.h">
       <Filter>Header Files</Filter>
     </ClInclude>

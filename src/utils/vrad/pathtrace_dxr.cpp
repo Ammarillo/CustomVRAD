@@ -8,7 +8,9 @@
 
 #include "vrad.h"
 #include "oklab.h"
+#include "qmc_sobol.h"
 #include "lightmap.h"
+#include "radial.h"
 #include "pathtrace_dxr.h"
 #include "bake_volume.h"
 #include "pathtrace_dxr_device.h"
@@ -60,6 +62,8 @@ int		g_nPathTracePropSamples = 0;	// 0 = auto (max(8, world_spp/4))
 int		g_nPathTracePropBounces = -1;	// -1 = auto (match world); 0 = direct+sky
 int		g_nPathTracePropVertGrid = 4;	// 0=per-vert; >0=8x8 tri atlas + closest gather
 bool	g_bPathTraceSpectral = true;	// hero-wavelength Smits+CIE (default on)
+bool	g_bPathTraceAdaptive = true;	// extra spp where luminance CV stays high
+int		g_nPathTraceAdaptiveMax = 0;	// 0 = extra cap equals base spp
 float	g_flPtLightRadius = 0.0f;	// soft disk for light/light_spot (0 = hard)
 float	g_flPtLightPenumbra = 1.0f;	// CHSS growth scale
 int		g_nPtSoftSamples = 16;		// max soft visibility rays per NEE
@@ -161,18 +165,18 @@ static void PtSoftSunDir( const Vector &axis, float sinExtent, int i, int nSoft,
 	Vector t1, t2;
 	PtOrthonormalBasis( axis, t1, t2 );
 	const float cosThetaMax = sqrtf( fmaxf( 0.0f, 1.0f - sinExtent * sinExtent ) );
-	// Stratified + Cranley-Patterson rotate so every luxel gets a unique soft pattern
-	// (fixed dirs everywhere created hard penumbra "steps"/blocks).
-	const float uRot = PtHash( seed + 17u );
-	const float phiRot = PtHash( seed + 91u ) * 2.0f * (float)M_PI;
-	float u;
 	if ( nSoft <= 1 )
-		u = 0.0f;
-	else
-		u = ( (float)i + uRot ) / (float)nSoft;
+	{
+		out = axis;
+		VectorNormalize( out );
+		return;
+	}
+	// Sobol cone + Cranley-Patterson rotate so neighboring luxels don't share a pattern.
+	const float u = QmcSobolRot( (unsigned int)i, 0, PtHash( seed + 17u ) );
+	const float v = QmcSobolRot( (unsigned int)i, 1, PtHash( seed + 91u ) );
 	const float cosTheta = 1.0f - u * ( 1.0f - cosThetaMax );
 	const float sinTheta = sqrtf( fmaxf( 0.0f, 1.0f - cosTheta * cosTheta ) );
-	const float phi = (float)i * 2.3999632f + phiRot;
+	const float phi = v * 2.0f * (float)M_PI;
 	out = axis * cosTheta + ( t1 * cosf( phi ) + t2 * sinf( phi ) ) * sinTheta;
 	VectorNormalize( out );
 }
@@ -184,10 +188,12 @@ static void PtSoftSphereOffset( float radius, int i, unsigned int seed, Vector &
 		offsetOut.Init();
 		return;
 	}
-	const float u = PtHash( seed + (unsigned int)i * 13u + 3u );
+	const float u = QmcSobolRot( (unsigned int)i, 0, PtHash( seed + 3u ) );
+	const float v = QmcSobolRot( (unsigned int)i, 1, PtHash( seed + 7u ) );
+	const float w = QmcSobolRot( (unsigned int)i, 2, PtHash( seed + 11u ) );
 	const float r = radius * cbrtf( u );
-	const float z = 1.0f - 2.0f * PtHash( seed + (unsigned int)i * 29u + 7u );
-	const float phi = PtHash( seed + (unsigned int)i * 47u + 11u ) * 2.0f * (float)M_PI;
+	const float z = 1.0f - 2.0f * v;
+	const float phi = w * 2.0f * (float)M_PI;
 	const float sinTheta = sqrtf( fmaxf( 0.0f, 1.0f - z * z ) );
 	offsetOut.x = r * sinTheta * cosf( phi );
 	offsetOut.y = r * sinTheta * sinf( phi );
@@ -518,9 +524,10 @@ static void PtSoftDiskOffset( const Vector &normal, float radius, int i, unsigne
 	}
 	Vector t1, t2;
 	PtOrthonormalBasis( normal, t1, t2 );
-	const float u = PtHash( seed + (unsigned int)i * 19u + 5u );
+	const float u = QmcSobolRot( (unsigned int)i, 0, PtHash( seed + 5u ) );
+	const float v = QmcSobolRot( (unsigned int)i, 1, PtHash( seed + 13u ) );
 	const float r = radius * sqrtf( u );
-	const float phi = PtHash( seed + (unsigned int)i * 41u + 13u ) * 2.0f * (float)M_PI;
+	const float phi = v * 2.0f * (float)M_PI;
 	offsetOut = t1 * ( r * cosf( phi ) ) + t2 * ( r * sinf( phi ) );
 }
 
@@ -536,6 +543,27 @@ static Vector PtClampFirefly( const Vector &v, float maxComp )
 static float PtLuma( const Vector &v )
 {
 	return 0.2126f * v.x + 0.7152f * v.y + 0.0722f * v.z;
+}
+
+static void PtWelfordChunk( float L, float &meanL, float &m2, int &nChunks )
+{
+	++nChunks;
+	const float d = L - meanL;
+	meanL += d / (float)nChunks;
+	m2 += d * (L - meanL);
+}
+
+// Path CV estimated from equal-size chunk means (Tamstorf/Jensen-style).
+static bool PtLuxelNeedsMoreSpp( float meanL, float m2, int nChunks, int chunkSpp, int nSpp, int sppCap )
+{
+	if ( nSpp >= sppCap || nChunks < 2 || chunkSpp < 1 )
+		return false;
+	if ( meanL < 1e-8f )
+		return false;
+	const float varChunk = m2 / (float)( nChunks - 1 );
+	const float varPath = max( 0.0f, varChunk * (float)chunkSpp );
+	const float cv = sqrtf( varPath ) / max( meanL, 1e-5f );
+	return cv > 0.30f;
 }
 
 // Fast albedo: bound cluster walk (adaptivechop maps can have huge patch lists).
@@ -635,7 +663,10 @@ static float PtVisibility( const Vector &from, const Vector &to )
 	return max( T.x, max( T.y, T.z ) );
 }
 
-// Place luxel origin in front of nearby side walls (floor/wall corners, jambs).
+// Place luxel origin in the open room, not in a concave crease.
+// Lifting along the receiving normal is not enough: a floor sample next to a
+// wall is still in the contact shadow. Also push away from each nearby side
+// wall so hemisphere/NEE rays don't immediately hit the adjacent occluder.
 static Vector PtLuxelOriginInFront( const Vector &samplePos, const Vector &faceNormal, float luxelWorld )
 {
 	const float baseBias = max( 1.0f, max( g_flPtOccludeBias * 0.4f, luxelWorld * 0.35f ) );
@@ -643,8 +674,13 @@ static Vector PtLuxelOriginInFront( const Vector &samplePos, const Vector &faceN
 
 	Vector t1, t2;
 	PtOrthonormalBasis( faceNormal, t1, t2 );
-	const float probe = max( g_flPtOccludeBias, luxelWorld * 1.25f );
-	float extra = 0.0f;
+	const float probe = max( g_flPtOccludeBias * 2.0f, luxelWorld * 1.5f );
+	const float wantDist = max( g_flPtOccludeBias + luxelWorld * 0.40f, luxelWorld * 0.75f );
+	float extraN = 0.0f;
+
+	Vector wallN[8];
+	float wallT[8];
+	int nWalls = 0;
 
 	for ( int i = 0; i < 8; ++i )
 	{
@@ -664,13 +700,62 @@ static Vector PtLuxelOriginInFront( const Vector &samplePos, const Vector &faceN
 		// Side occluder ~= wall meeting this face (hit normal perp face normal).
 		if ( fabsf( DotProduct( hitN[0], faceNormal ) ) > 0.55f )
 			continue;
-		extra = max( extra, ( probe - t[0] ) * 0.5f + 0.5f );
+
+		Vector n = hitN[0];
+		if ( n.LengthSqr() < 1e-8f )
+			continue;
+		VectorNormalize( n );
+		// Inward (into-room) wall normal: oppose the probe direction.
+		if ( DotProduct( n, dir ) > 0.0f )
+			n = -n;
+
+		extraN = max( extraN, ( probe - t[0] ) * 0.35f + 0.35f );
+
+		int slot = -1;
+		for ( int w = 0; w < nWalls; ++w )
+		{
+			if ( DotProduct( wallN[w], n ) > 0.85f )
+			{
+				slot = w;
+				break;
+			}
+		}
+		if ( slot < 0 )
+		{
+			if ( nWalls >= 8 )
+				continue;
+			slot = nWalls++;
+			wallT[slot] = t[0];
+			wallN[slot] = n;
+		}
+		else if ( t[0] < wallT[slot] )
+		{
+			wallT[slot] = t[0];
+			wallN[slot] = n;
+		}
 	}
 
+	Vector planar( 0, 0, 0 );
+	for ( int w = 0; w < nWalls; ++w )
+	{
+		const float need = wantDist - wallT[w];
+		if ( need > 0.0f )
+			planar += wallN[w] * need;
+	}
+	const float maxPlanar = max( wantDist, luxelWorld * 1.25f );
+	const float pLen = planar.Length();
+	if ( pLen > maxPlanar && pLen > 1e-6f )
+		planar *= ( maxPlanar / pLen );
+
 	const float maxExtra = max( probe, luxelWorld * 2.0f );
-	if ( extra > maxExtra )
-		extra = maxExtra;
-	return pos + faceNormal * extra;
+	if ( extraN > maxExtra )
+		extraN = maxExtra;
+	return pos + faceNormal * extraN + planar;
+}
+
+void PathTraceDXR_LuxelOriginInFront( const Vector &samplePos, const Vector &faceNormal, float luxelWorld, Vector &outPos )
+{
+	outPos = PtLuxelOriginInFront( samplePos, faceNormal, luxelWorld );
 }
 
 enum
@@ -806,42 +891,29 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 
 		Vector axis = -dl->light.normal;
 		VectorNormalize( axis );
-		if ( DotProduct( normal, axis ) <= 0.0f )
-			break;
 
 		float sinExt = 0.0f;
 		int nSoft = 1;
 		if ( bSoft && dl->m_flSunAngularExtent > 0.0f )
 		{
 			sinExt = dl->m_flSunAngularExtent;
-			// Treat angular size as light "radius" at unit distance; probe along axis.
-			float tHit = (float)MAX_TRACE_LENGTH;
-			Vector Tprobe;
-			const bool blocked = PtProbeOccluder( pos, axis, g_flPtOccludeBias, (float)MAX_TRACE_LENGTH,
-												  &tHit, true, &Tprobe );
-			const bool hardBlocked = blocked || ( Tprobe.x + Tprobe.y + Tprobe.z < 1e-4f );
-			// Equivalent world size at a reference distance so PCSS formula is dimensionally ok.
-			const float refDist = max( tHit, 64.0f );
-			const float lightSize = sinExt * refDist;
-			nSoft = PtEstimatePenumbraSamples( lightSize, refDist, tHit, hardBlocked, g_flPtLightPenumbra );
-			// Also never exceed legacy soft-sun budget for huge extents.
-			const int legacy = PtSoftSunCount( sinExt );
-			if ( nSoft > legacy )
-				nSoft = legacy;
+			nSoft = PtSoftSunCount( sinExt );
+			const int cap = PtSoftSampleCap();
+			if ( nSoft > cap )
+				nSoft = cap;
 		}
+		// Finite sun wraps past 90°: cull only when the whole disk is below the horizon.
+		if ( DotProduct( normal, axis ) <= -sinExt )
+			break;
 
-		const float cosThetaMax = sqrtf( fmaxf( 0.0f, 1.0f - sinExt * sinExt ) );
-		const float sunSolidAngle = max( 1e-6f, 2.0f * (float)M_PI * ( 1.0f - cosThetaMax ) );
-		const float pdfLight = 1.0f / sunSolidAngle;
-
+		// No MIS vs cosine BSDF: sky misses add ambient, not the sun disk.
 		Vector visAccum( 0, 0, 0 );
-		float ndlAccum = 0.0f;
-		float misAccum = 0.0f;
+		Vector contrib( 0, 0, 0 );
 		float nVis = 0.0f;
 		for ( int s = 0; s < nSoft; ++s )
 		{
 			Vector dir;
-			PtSoftSunDir( axis, sinExt, s, nSoft, seed + (unsigned int)s * 97u, dir );
+			PtSoftSunDir( axis, sinExt, s, nSoft, seed, dir );
 			const float ndlS = DotProduct( normal, dir );
 			if ( ndlS <= 0.0f )
 				continue;
@@ -853,23 +925,20 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 			if ( blocked || ( T.x + T.y + T.z < 1e-6f ) )
 				continue;
 
-			const float pdfBsdf = ndlS * invPi;
-			const float mis = PtMisWeight( pdfLight, pdfBsdf );
 			visAccum += T;
-			ndlAccum += ndlS;
-			misAccum += mis;
+			contrib.x += ndlS * T.x;
+			contrib.y += ndlS * T.y;
+			contrib.z += ndlS * T.z;
 			nVis += 1.0f;
 		}
 		if ( nVis > 0.0f )
 		{
-			const Vector vis = visAccum * ( 1.0f / (float)nSoft );
-			const float ndlSoft = ndlAccum / nVis;
-			const float mis = misAccum / nVis;
-			sum.x += dl->light.intensity.x * ( ndlSoft * vis.x * wEnv * absScale * mis );
-			sum.y += dl->light.intensity.y * ( ndlSoft * vis.y * wEnv * absScale * mis );
-			sum.z += dl->light.intensity.z * ( ndlSoft * vis.z * wEnv * absScale * mis );
+			const float inv = 1.0f / (float)nSoft;
+			sum.x += dl->light.intensity.x * ( contrib.x * inv * wEnv * absScale );
+			sum.y += dl->light.intensity.y * ( contrib.y * inv * wEnv * absScale );
+			sum.z += dl->light.intensity.z * ( contrib.z * inv * wEnv * absScale );
 			if ( pSunAmt )
-				*pSunAmt += ( ( vis.x + vis.y + vis.z ) * ( 1.0f / 3.0f ) ) * wEnv;
+				*pSunAmt += ( ( visAccum.x + visAccum.y + visAccum.z ) * ( 1.0f / 3.0f ) ) * inv * wEnv;
 		}
 		break;
 	}
@@ -908,7 +977,7 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 			Vector offset( 0, 0, 0 );
 			// Always keep sample 0 at the center so large faces still contribute.
 			if ( s > 0 && softRadius > 0.5f )
-				PtSoftDiskOffset( dl->light.normal, softRadius, s, seed + (unsigned int)s * 31u, offset );
+				PtSoftDiskOffset( dl->light.normal, softRadius, s, seed, offset );
 			// Push well off the emitter plane so DXR shadow rays don't self-hit.
 			Vector lightPos = dl->light.origin + offset + dl->light.normal * 1.0f;
 
@@ -978,7 +1047,7 @@ static Vector PtEvalOneDirectLight( directlight_t *dl, const Vector &pos, const 
 			Vector offset;
 			offset.Init();
 			if ( radius > 0.0f && ns > 1 )
-				PtSoftDiskOffset( diskN, radius, s, seed + (unsigned int)s * 53u, offset );
+				PtSoftDiskOffset( diskN, radius, s, seed, offset );
 
 			Vector lightPos = dl->light.origin + offset;
 
@@ -1460,7 +1529,7 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 			throughput *= ( 1.0f / max( q, 1e-3f ) );
 		}
 
-		pos = hitPos + hitNormal * 0.5f;
+		pos = hitPos + hitNormal * 1.0f;
 		normal = hitNormal;
 		bInMedium = false;
 		skipFace = -1;
@@ -1484,13 +1553,20 @@ static void PtBakeAtPosition( const Vector &pos, const Vector &normal, float lux
 	const unsigned int seed = PtWorldSeed( pos - normal * 1.0f, luxelWorld, ni );
 
 	const int sppBase = g_ptSpp;
-	int sppMax = sppBase * 4;
+	int extraCap = g_nPathTraceAdaptiveMax;
+	if ( extraCap <= 0 )
+		extraCap = sppBase;
+	if ( extraCap > 4096 )
+		extraCap = 4096;
+	int sppMax = sppBase + extraCap;
+	if ( !g_bPathTraceAdaptive )
+		sppMax = sppBase;
 	if ( do_fast )
-		sppMax = sppBase * 2;
+		sppMax = min( sppMax, max( sppBase, sppBase * 2 ) );
 	if ( sppMax < sppBase )
 		sppMax = sppBase;
-	if ( sppMax > 64 )
-		sppMax = 64;
+	if ( sppMax > 4096 )
+		sppMax = 4096;
 
 	Vector sum( 0, 0, 0 );
 	float sunSum = 0.0f;
@@ -1556,6 +1632,9 @@ static std::atomic<int> g_ptFaceProgress{ 0 };
 static std::atomic<int> g_ptFacesBaked{ 0 };
 static std::atomic<int> g_ptLuxelsBaked{ 0 };
 static std::atomic<int> g_ptLuxelsInFlight{ 0 };	// luxels finished (running total across all faces)
+static std::atomic<int> g_ptAdaptiveLuxels{ 0 };
+static std::atomic<int> g_ptAdaptiveJobs{ 0 };
+static std::atomic<long long> g_ptAdaptiveExtraSpp{ 0 };
 static std::atomic<long long> g_ptLastReportMs{ 0 };
 static int g_ptFaceTotal = 0;
 static int g_ptLuxelTotalEst = 0;		// pre-pass estimate of bakeable luxels
@@ -1636,12 +1715,104 @@ static void PtAntialiasHighContrast( Vector *grid, const float *wgt, int width, 
 					continue;
 
 				const Vector avg = sum * ( 1.0f / wsum );
+				// One-sided AA: soften shadow-side stair-steps into light, but never
+				// pull darkness outward onto already-lit luxels (bilinear leak).
+				if ( PtLuma( avg ) < lc * 0.92f )
+					continue;
+
 				out[ci] = grid[ci] + ( avg - grid[ci] ) * ( aa * 0.65f );
 			}
 		}
 
 		for ( int i = 0; i < n; ++i )
 			grid[i] = out[i];
+	}
+}
+
+// Clamp AA / leak filters to a reference image (post-denoise, or post-heal if
+// denoise is off). Do not pass the raw noisy bake here: a 6% brighten revert
+// and 12% darken floor undoes OIDN / OptiX on typical Monte Carlo noise.
+static void PtRestoreLitLuxelsAfterFilter( Vector *grid, const float *wgt, const Vector *preFilter,
+	int width, int height, float minPreLuma = 0.04f, float maxDarken = 0.88f )
+{
+	if ( !grid || !wgt || !preFilter || width < 1 || height < 1 )
+		return;
+
+	const int n = width * height;
+	for ( int i = 0; i < n; ++i )
+	{
+		if ( wgt[i] <= 0.0f )
+			continue;
+
+		const float pre = PtLuma( preFilter[i] );
+		const float post = PtLuma( grid[i] );
+
+		if ( pre > 0.01f && post > pre * 1.06f )
+		{
+			grid[i] = preFilter[i];
+			continue;
+		}
+
+		if ( pre < minPreLuma )
+			continue;
+
+		if ( post >= pre * maxDarken )
+			continue;
+
+		grid[i] = preFilter[i] * maxDarken + grid[i] * ( 1.0f - maxDarken );
+	}
+}
+
+static void PtSuppressLuxelOutliers( Vector *grid, const float *wgt, int width, int height )
+{
+	if ( !grid || !wgt || width < 2 || height < 2 )
+		return;
+
+	for ( int t = 0; t < height; ++t )
+	{
+		for ( int s = 0; s < width; ++s )
+		{
+			const int idx = s + t * width;
+			if ( wgt[idx] <= 0.0f )
+				continue;
+
+			std::vector<float> neighL;
+			for ( int dt = -1; dt <= 1; ++dt )
+			{
+				const int nt = t + dt;
+				if ( nt < 0 || nt >= height )
+					continue;
+				for ( int ds = -1; ds <= 1; ++ds )
+				{
+					if ( !ds && !dt )
+						continue;
+					const int ns = s + ds;
+					if ( ns < 0 || ns >= width )
+						continue;
+					const int nidx = ns + nt * width;
+					if ( wgt[nidx] <= 0.0f )
+						continue;
+					neighL.push_back( PtLuma( grid[nidx] ) );
+				}
+			}
+
+			if ( neighL.size() < 5 )
+				continue;
+
+			std::sort( neighL.begin(), neighL.end() );
+			const float med = neighL[neighL.size() / 2];
+			float maxN = 0.0f;
+			for ( size_t k = 0; k < neighL.size(); ++k )
+				maxN = max( maxN, neighL[k] );
+
+			const float L = PtLuma( grid[idx] );
+
+			if ( med > 0.02f && L > med * 3.0f && L > maxN * 2.0f )
+			{
+				const float scale = ( med * 1.05f ) / max( L, 1e-4f );
+				grid[idx] *= scale;
+			}
+		}
 	}
 }
 
@@ -1765,100 +1936,11 @@ static void PtDenoiseFaceSamples( facelight_t *fl, dface_t *f, int normalCount, 
 				break;
 		}
 
-		// Dilate "mostly hidden" / edge-bleed luxels: dark outliers relative to
-		// neighbors get replaced so they cannot smear into denoise or bilinear filter.
-		{
-			std::vector<unsigned char> bad( n, 0 );
-			std::vector<float> neighL;
-			neighL.reserve( 8 );
-			for ( int t = 0; t < height; ++t )
-			{
-				for ( int s = 0; s < width; ++s )
-				{
-					const int idx = s + t * width;
-					if ( wgt[idx] <= 0.0f )
-						continue;
-					neighL.clear();
-					float maxN = 0.0f;
-					for ( int dt = -1; dt <= 1; ++dt )
-					{
-						int nt = t + dt;
-						if ( nt < 0 || nt >= height )
-							continue;
-						for ( int ds = -1; ds <= 1; ++ds )
-						{
-							if ( !ds && !dt )
-								continue;
-							int ns = s + ds;
-							if ( ns < 0 || ns >= width )
-								continue;
-							int nidx = ns + nt * width;
-							if ( wgt[nidx] <= 0.0f )
-								continue;
-							float nl = PtLuma( grid[nidx] );
-							neighL.push_back( nl );
-							maxN = max( maxN, nl );
-						}
-					}
-					if ( neighL.size() < 3 )
-						continue;
-					// median
-					std::sort( neighL.begin(), neighL.end() );
-					float med = neighL[neighL.size() / 2];
-					float L = PtLuma( grid[idx] );
-					// Dark spike in a brighter neighborhood -> likely sample-in-solid / backface.
-					if ( maxN > 1e-3f && L < maxN * 0.28f && L < med * 0.55f )
-						bad[idx] = 1;
-				}
-			}
-			for ( int pass = 0; pass < 6; ++pass )
-			{
-				bool any = false;
-				tmp = grid;
-				for ( int t = 0; t < height; ++t )
-				{
-					for ( int s = 0; s < width; ++s )
-					{
-						const int idx = s + t * width;
-						if ( !bad[idx] || wgt[idx] <= 0.0f )
-							continue;
-						Vector sum( 0, 0, 0 );
-						float sw = 0.0f;
-						float vsum = 0.0f;
-						for ( int dt = -1; dt <= 1; ++dt )
-						{
-							int nt = t + dt;
-							if ( nt < 0 || nt >= height )
-								continue;
-							for ( int ds = -1; ds <= 1; ++ds )
-							{
-								if ( !ds && !dt )
-									continue;
-								int ns = s + ds;
-								if ( ns < 0 || ns >= width )
-									continue;
-								int nidx = ns + nt * width;
-								if ( wgt[nidx] <= 0.0f || bad[nidx] )
-									continue;
-								sum += grid[nidx];
-								vsum += varGrid[nidx];
-								sw += 1.0f;
-							}
-						}
-						if ( sw > 0.0f )
-						{
-							tmp[idx] = sum * ( 1.0f / sw );
-							varGrid[idx] = vsum / sw;
-							bad[idx] = 0; // healed
-							any = true;
-						}
-					}
-				}
-				grid.swap( tmp );
-				if ( !any )
-					break;
-			}
-		}
+		PtSuppressLuxelOutliers( grid.data(), wgt.data(), width, height );
+
+		const int facenum = (int)( f - g_pFaces );
+		// Drop crease energy-loss before denoise so it cannot spread.
+		ReconstructLightmapEdgeLuxels( grid.data(), width, height, facenum );
 
 		for ( int i = 0; i < n; ++i )
 		{
@@ -1868,7 +1950,9 @@ static void PtDenoiseFaceSamples( facelight_t *fl, dface_t *f, int normalCount, 
 		}
 
 		const float *varPtr = varSamples ? varGrid.data() : nullptr;
-		if ( bNetworkDenoise && bDenoise && width * height >= 32 )
+		// The OIDN wrapper pads tiny charts to a usable 16x16 footprint.
+		// Do not skip the narrow concave faces that need denoising most.
+		if ( bNetworkDenoise && bDenoise )
 		{
 			if ( PathTraceDenoise_DenoiseRGB( rgb.data(), width, height, varPtr ) )
 			{
@@ -1881,9 +1965,20 @@ static void PtDenoiseFaceSamples( facelight_t *fl, dface_t *f, int normalCount, 
 			}
 		}
 
+		// Clamp AA to the denoised (or healed) image, not the raw bake.
+		std::vector<Vector> postDenoise( grid.begin(), grid.end() );
+
 		// Soften remaining luxel stair-steps on hard shadow edges.
 		if ( bNetworkDenoise )
 			PtAntialiasHighContrast( grid.data(), wgt.data(), width, height );
+
+		if ( bNetworkDenoise )
+			PtRestoreLitLuxelsAfterFilter( grid.data(), wgt.data(), postDenoise.data(), width, height );
+		CompressBilinearShadowLeak( grid.data(), width, height );
+
+		// After denoise: restore energy on the last edge/corner luxel so
+		// bilinear filtering cannot paint a dark AO band into the face.
+		ReconstructLightmapEdgeLuxels( grid.data(), width, height, facenum );
 
 		for ( int i = 0; i < fl->numsamples; ++i )
 		{
@@ -2261,8 +2356,7 @@ static void PtDenoiseCoplanarIslands()
 				rgb[(size_t)i * 3u + 2] = grid[i].z;
 			}
 
-			if ( nPix >= 32 )
-				PathTraceDenoise_DenoiseRGB( rgb.data(), width, height, nullptr );
+			PathTraceDenoise_DenoiseRGB( rgb.data(), width, height, nullptr );
 
 			for ( int i = 0; i < nPix; ++i )
 			{
@@ -2270,7 +2364,11 @@ static void PtDenoiseCoplanarIslands()
 				grid[i].y = rgb[(size_t)i * 3u + 1];
 				grid[i].z = rgb[(size_t)i * 3u + 2];
 			}
+
+			std::vector<Vector> postIslandDenoise( grid.begin(), grid.end() );
 			PtAntialiasHighContrast( grid.data(), wgt.data(), width, height );
+			PtRestoreLitLuxelsAfterFilter( grid.data(), wgt.data(), postIslandDenoise.data(), width, height );
+			CompressBilinearShadowLeak( grid.data(), width, height );
 
 			auto sampleBilinear = [&]( float fs, float ft ) -> Vector
 			{
@@ -2608,9 +2706,9 @@ static void PtFinishFaceLighting( int facenum, int normalCount, LightingValue_t 
 		varPtr = luxelVar.data();
 	}
 
-	const bool bDeferIsland = g_bPathTraceDenoise && PathTraceDenoise_IsReady()
-		&& g_PathTraceDenoiser != PT_DENOISER_SAKAI && f->dispinfo == -1;
-	PtDenoiseFaceSamples( fl, f, normalCount, false, varPtr, !bDeferIsland );
+	// Add CPU-split GI before denoise. GPU stores full radiance in fl->light and
+	// leaves pIndirect at zero; CPU PathLi writes noisy indirect here, so denoising
+	// first then adding GI made -pt_denoise a no-op on the CPU baker.
 	for ( int n = 0; n < normalCount; ++n )
 	{
 		for ( int i = 0; i < fl->numsamples; ++i )
@@ -2618,6 +2716,10 @@ static void PtFinishFaceLighting( int facenum, int normalCount, LightingValue_t 
 		free( pIndirect[n] );
 		pIndirect[n] = nullptr;
 	}
+
+	const bool bDeferIsland = g_bPathTraceDenoise && PathTraceDenoise_IsReady()
+		&& g_PathTraceDenoiser != PT_DENOISER_SAKAI && f->dispinfo == -1;
+	PtDenoiseFaceSamples( fl, f, normalCount, false, varPtr, !bDeferIsland );
 	BuildPatchLights( facenum );
 	FreeSampleWindings( fl );
 }
@@ -2940,7 +3042,7 @@ static void PtBuildTriAlbedo( std::vector<float> &rgb )
 	}
 	BounceAlbedo_EnsureCache();
 
-	int nTex = 0, nFlat = 0, nProp = 0, nFaced = 0;
+	int nTex = 0, nFlat = 0, nPropTex = 0, nPropFlat = 0, nFaced = 0;
 	for ( uint32_t i = 0; i < n; ++i )
 	{
 		Vector a, b, c;
@@ -2948,11 +3050,27 @@ static void PtBuildTriAlbedo( std::vector<float> &rgb )
 		if ( !PathTraceDXR_GetCapturedTri( i, a, b, c, &flags ) )
 			continue;
 
-		// Unique-model prop meshes are local-space; keep neutral albedo (shadow casters).
+		// Prop meshes are local-space, so face UV lookup does not apply.
+		// Textured albedo is sampled from the studio $basetexture at register time.
 		if ( flags & TRACE_ID_STATICPROP )
 		{
-			rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 0.40f;
-			++nProp;
+			Vector propAlb;
+			if ( PathTraceDXR_GetCapturedTriAlbedo( i, propAlb ) )
+			{
+				rgb[i * 3 + 0] = propAlb.x;
+				rgb[i * 3 + 1] = propAlb.y;
+				rgb[i * 3 + 2] = propAlb.z;
+				++nPropTex;
+				if ( propAlb.x != propAlb.y || propAlb.y != propAlb.z )
+					++nTex;
+				else
+					++nFlat;
+			}
+			else
+			{
+				rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 0.40f;
+				++nPropFlat;
+			}
 			continue;
 		}
 
@@ -3030,8 +3148,8 @@ static void PtBuildTriAlbedo( std::vector<float> &rgb )
 		else
 			++nFlat;
 	}
-	Msg( "[PathTrace-DXR] Tri albedo: %d textured, %d flat/grey, %d prop-model (neutral), %d face-tagged.\n",
-		 nTex, nFlat, nProp, nFaced );
+	Msg( "[PathTrace-DXR] Tri albedo: %d textured, %d flat/grey, %d prop textured, %d prop neutral, %d face-tagged.\n",
+		 nTex, nFlat, nPropTex, nPropFlat, nFaced );
 }
 
 // Per-triangle $vrad_filter GPU meta + Texture2DArray of unique filter images.
@@ -3270,15 +3388,49 @@ static bool PathTraceBakeWorldFacesGPU()
 		if ( !jobs.empty() )
 		{
 			const int sppTotal = max( 1, g_ptSpp );
-			const int chunk = max( 1, min( sppChunk, sppTotal ) );
+			int chunk = max( 1, min( sppChunk, sppTotal ) );
+			int extraMax = 0;
+			if ( g_bPathTraceAdaptive && !do_fast )
+			{
+				extraMax = g_nPathTraceAdaptiveMax;
+				if ( extraMax <= 0 )
+					extraMax = sppTotal;
+				if ( extraMax > 4096 )
+					extraMax = 4096;
+				// Need >=2 chunks so per-luxel CV is defined.
+				if ( chunk >= sppTotal && sppTotal >= 2 )
+					chunk = max( 1, sppTotal / 2 );
+			}
+			const int sppCap = min( 4096, sppTotal + extraMax );
 
 			acc.resize( jobs.size() );
 			std::vector<PtGpuBakeResult> temp( jobs.size() );
+			std::vector<int> nSpp( jobs.size(), 0 );
+			std::vector<float> meanL( jobs.size(), 0.0f );
+			std::vector<float> m2( jobs.size(), 0.0f );
+			std::vector<int> nChunks( jobs.size(), 0 );
+			std::vector<unsigned char> gotExtra( jobs.size(), 0 );
 			for ( size_t i = 0; i < acc.size(); ++i )
 			{
 				acc[i].radiance[0] = acc[i].radiance[1] = acc[i].radiance[2] = 0.0f;
 				acc[i].sunAmt = 0.0f;
 			}
+
+			auto addChunk = [&]( const PtGpuBakeResult *src, const int *remap, int nJobs, int n ) -> void
+			{
+				const float w = (float)n;
+				for ( int j = 0; j < nJobs; ++j )
+				{
+					const int i = remap ? remap[j] : j;
+					acc[i].radiance[0] += src[j].radiance[0] * w;
+					acc[i].radiance[1] += src[j].radiance[1] * w;
+					acc[i].radiance[2] += src[j].radiance[2] * w;
+					acc[i].sunAmt += src[j].sunAmt * w;
+					nSpp[i] += n;
+					const Vector rgb( src[j].radiance[0], src[j].radiance[1], src[j].radiance[2] );
+					PtWelfordChunk( PtLuma( rgb ), meanL[i], m2[i], nChunks[i] );
+				}
+			};
 
 			for ( int off = 0; off < sppTotal; off += chunk )
 			{
@@ -3286,19 +3438,57 @@ static bool PathTraceBakeWorldFacesGPU()
 				PathTraceDXR_GpuBakeConfigurePass( (uint32_t)n, (uint32_t)off );
 				if ( !PathTraceDXR_GpuBakeLuxels( jobs.data(), (uint32_t)jobs.size(), temp.data() ) )
 					return false;
-				// GPU returns mean over n samples - weight by n for the overall mean.
-				const float w = (float)n;
-				for ( size_t i = 0; i < acc.size(); ++i )
+				addChunk( temp.data(), nullptr, (int)jobs.size(), n );
+			}
+
+			if ( extraMax > 0 )
+			{
+				std::vector<PtGpuBakeLuxel> extraJobs;
+				std::vector<int> extraMap;
+				std::vector<PtGpuBakeResult> extraTemp;
+				extraJobs.reserve( jobs.size() / 4 + 8 );
+				extraMap.reserve( jobs.size() / 4 + 8 );
+				g_ptAdaptiveJobs.fetch_add( (int)jobs.size(), std::memory_order_relaxed );
+
+				int off = sppTotal;
+				while ( off < sppCap )
 				{
-					acc[i].radiance[0] += temp[i].radiance[0] * w;
-					acc[i].radiance[1] += temp[i].radiance[1] * w;
-					acc[i].radiance[2] += temp[i].radiance[2] * w;
-					acc[i].sunAmt += temp[i].sunAmt * w;
+					extraJobs.clear();
+					extraMap.clear();
+					const int probe = min( chunk, sppCap - off );
+					for ( size_t i = 0; i < jobs.size(); ++i )
+					{
+						if ( PtLuxelNeedsMoreSpp( meanL[i], m2[i], nChunks[i], chunk, nSpp[i], sppCap ) )
+						{
+							extraMap.push_back( (int)i );
+							extraJobs.push_back( jobs[i] );
+						}
+					}
+					if ( extraJobs.empty() )
+						break;
+
+					extraTemp.resize( extraJobs.size() );
+					PathTraceDXR_GpuBakeConfigurePass( (uint32_t)probe, (uint32_t)off );
+					if ( !PathTraceDXR_GpuBakeLuxels( extraJobs.data(), (uint32_t)extraJobs.size(), extraTemp.data() ) )
+						return false;
+					addChunk( extraTemp.data(), extraMap.data(), (int)extraJobs.size(), probe );
+					for ( int idx : extraMap )
+					{
+						if ( !gotExtra[idx] )
+						{
+							gotExtra[idx] = 1;
+							g_ptAdaptiveLuxels.fetch_add( 1, std::memory_order_relaxed );
+						}
+					}
+					g_ptAdaptiveExtraSpp.fetch_add( (long long)extraJobs.size() * (long long)probe,
+													 std::memory_order_relaxed );
+					off += probe;
 				}
 			}
-			const float inv = 1.0f / (float)sppTotal;
+
 			for ( size_t i = 0; i < acc.size(); ++i )
 			{
+				const float inv = 1.0f / (float)max( nSpp[i], 1 );
 				acc[i].radiance[0] *= inv;
 				acc[i].radiance[1] *= inv;
 				acc[i].radiance[2] *= inv;
@@ -3367,8 +3557,12 @@ static bool PathTraceBakeWorldFacesGPU()
 		return true;
 	};
 
-	Msg( "[PathTrace-DXR] GPU baking world lightmaps (%d spp, %d bounces, hard NEE)...\n",
-		 g_ptSpp, g_ptBounces );
+	g_ptAdaptiveLuxels = 0;
+	g_ptAdaptiveJobs = 0;
+	g_ptAdaptiveExtraSpp = 0;
+
+	Msg( "[PathTrace-DXR] GPU baking world lightmaps (%d spp, %d bounces, hard NEE%s)...\n",
+		 g_ptSpp, g_ptBounces, ( g_bPathTraceAdaptive && !do_fast ) ? ", adaptive" : "" );
 
 	for ( int facenum = 0; facenum < numfaces; ++facenum )
 	{
@@ -3449,6 +3643,7 @@ static bool PathTraceBakeWorldFacesGPU()
 				job.faceNum = facenum;
 				job.aaN = aaN;
 				job.skipPropIndex = -1;
+				job.sampleScale = 1;
 				jobs.push_back( job );
 			}
 		}
@@ -3494,6 +3689,15 @@ static bool PathTraceBakeWorldFacesGPU()
 	}
 	PtReportProgress( true );
 	PathTraceDXR_ReportGpuBakeDarkStats( "world lightmaps" );
+	if ( g_bPathTraceAdaptive && !do_fast )
+	{
+		const int nJobs = g_ptAdaptiveJobs.load();
+		const int nExtra = g_ptAdaptiveLuxels.load();
+		const long long extraSpp = g_ptAdaptiveExtraSpp.load();
+		const double avg = ( nExtra > 0 ) ? ( (double)extraSpp / (double)nExtra ) : 0.0;
+		Msg( "[PathTrace-DXR] Adaptive sampling: %d / %d luxels got extra spp (avg +%.0f, %.1f%% of luxels)\n",
+			 nExtra, nJobs, avg, ( nJobs > 0 ) ? ( 100.0 * nExtra / (double)nJobs ) : 0.0 );
+	}
 	return true;
 }
 
@@ -3817,6 +4021,11 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 	if ( tagOverride && tagOverride[0] )
 		tag = tagOverride;
 
+	// Prop lightmaps share the world adaptive schedule. Vertex samples stay fixed-spp.
+	const bool bAdaptiveLm = bLightmapQuality && g_bPathTraceAdaptive && !do_fast;
+	int extraMax = 0;
+	int sppCap = spp;
+
 	const bool bNewSession = !PathTraceDXR_GpuBakeIsActive();
 	if ( bNewSession )
 	{
@@ -3826,9 +4035,18 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 			return false;
 		}
 		const unsigned showTotal = progressTotal > 0 ? progressTotal : nSamples;
-		Msg( "[PathTrace-DXR] GPU baking %s: %u samples (%d spp, %d bounces, pt_lights=%d%s)...\n",
-			 tag, showTotal, spp, bounces, lightSamples,
-			 bLightmapQuality ? "" : ", hard NEE" );
+		if ( bLightmapQuality )
+		{
+			Msg( "[PathTrace-DXR] GPU baking %s: %u samples (%d spp, %d bounces, pt_lights=%d, AA %dx%d%s)...\n",
+				 tag, showTotal, spp, bounces, lightSamples,
+				 g_nPathTraceLuxelAA, g_nPathTraceLuxelAA,
+				 bAdaptiveLm ? ", adaptive" : "" );
+		}
+		else
+		{
+			Msg( "[PathTrace-DXR] GPU baking %s: %u samples (%d spp, %d bounces, pt_lights=%d, hard NEE)...\n",
+				 tag, showTotal, spp, bounces, lightSamples );
+		}
 		fflush( stdout );
 	}
 
@@ -3836,6 +4054,17 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 	int sppChunk = ( spp > 32 ) ? 16 : max( 1, spp );
 	if ( spp >= 512 ) { kBatch = 16384; sppChunk = 8; }
 	if ( spp >= 1024 ) { kBatch = 8192; sppChunk = 4; }
+	if ( bAdaptiveLm )
+	{
+		extraMax = g_nPathTraceAdaptiveMax;
+		if ( extraMax <= 0 )
+			extraMax = spp;
+		if ( extraMax > 4096 )
+			extraMax = 4096;
+		sppCap = min( 4096, spp + extraMax );
+		if ( sppChunk >= spp && spp >= 2 )
+			sppChunk = max( 1, spp / 2 );
+	}
 
 	std::vector<PtGpuBakeResult> temp( (size_t)kBatch );
 	std::vector<PtGpuBakeResult> pass( (size_t)kBatch );
@@ -3888,6 +4117,19 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 		PtProgressLine( finish, line );
 	};
 
+	std::vector<int> nSpp, nChunks, extraMap;
+	std::vector<float> meanL, m2;
+	std::vector<PtGpuBakeLuxel> extraJobs;
+	if ( bAdaptiveLm )
+	{
+		nSpp.assign( (size_t)kBatch, 0 );
+		nChunks.assign( (size_t)kBatch, 0 );
+		meanL.assign( (size_t)kBatch, 0.0f );
+		m2.assign( (size_t)kBatch, 0.0f );
+		extraJobs.reserve( (size_t)kBatch / 4 + 8 );
+		extraMap.reserve( (size_t)kBatch / 4 + 8 );
+	}
+
 	bool ok = true;
 	for ( unsigned base = 0; base < nSamples && ok && !g_bInterrupt; base += (unsigned)kBatch )
 	{
@@ -3896,6 +4138,13 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 		{
 			temp[i].radiance[0] = temp[i].radiance[1] = temp[i].radiance[2] = 0.0f;
 			temp[i].sunAmt = 0.0f;
+			if ( bAdaptiveLm )
+			{
+				nSpp[i] = 0;
+				nChunks[i] = 0;
+				meanL[i] = 0.0f;
+				m2[i] = 0.0f;
+			}
 		}
 		for ( int so = 0; so < spp && ok; so += sppChunk )
 		{
@@ -3913,6 +4162,12 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 				temp[i].radiance[1] += pass[i].radiance[1] * w;
 				temp[i].radiance[2] += pass[i].radiance[2] * w;
 				temp[i].sunAmt += pass[i].sunAmt * w;
+				if ( bAdaptiveLm )
+				{
+					nSpp[i] += nPass;
+					const Vector rgb( pass[i].radiance[0], pass[i].radiance[1], pass[i].radiance[2] );
+					PtWelfordChunk( PtLuma( rgb ), meanL[i], m2[i], nChunks[i] );
+				}
 			}
 			{
 				const double sppFrac = (double)( so + nPass ) / (double)spp;
@@ -3920,9 +4175,52 @@ bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamp
 				reportProp( min( approxDone, nSamples ), false );
 			}
 		}
-		const float inv = 1.0f / (float)spp;
+
+		if ( ok && bAdaptiveLm )
+		{
+			int off = spp;
+			while ( off < sppCap && ok && !g_bInterrupt )
+			{
+				extraJobs.clear();
+				extraMap.clear();
+				const int probe = min( sppChunk, sppCap - off );
+				for ( unsigned i = 0; i < n; ++i )
+				{
+					if ( PtLuxelNeedsMoreSpp( meanL[i], m2[i], nChunks[i], sppChunk, nSpp[i], sppCap ) )
+					{
+						extraMap.push_back( (int)i );
+						extraJobs.push_back( samples[base + i] );
+					}
+				}
+				if ( extraJobs.empty() )
+					break;
+
+				PathTraceDXR_GpuBakeConfigurePass( (uint32_t)probe, (uint32_t)off );
+				if ( !PathTraceDXR_GpuBakeLuxels( extraJobs.data(), (uint32_t)extraJobs.size(), pass.data() ) )
+				{
+					ok = false;
+					break;
+				}
+				const float w = (float)probe;
+				for ( size_t j = 0; j < extraJobs.size(); ++j )
+				{
+					const int i = extraMap[j];
+					temp[i].radiance[0] += pass[j].radiance[0] * w;
+					temp[i].radiance[1] += pass[j].radiance[1] * w;
+					temp[i].radiance[2] += pass[j].radiance[2] * w;
+					temp[i].sunAmt += pass[j].sunAmt * w;
+					nSpp[i] += probe;
+					const Vector rgb( pass[j].radiance[0], pass[j].radiance[1], pass[j].radiance[2] );
+					PtWelfordChunk( PtLuma( rgb ), meanL[i], m2[i], nChunks[i] );
+				}
+				off += probe;
+			}
+		}
+
 		for ( unsigned i = 0; i < n; ++i )
 		{
+			const int taken = bAdaptiveLm ? max( nSpp[i], 1 ) : spp;
+			const float inv = 1.0f / (float)taken;
 			outResults[base + i].radiance[0] = temp[i].radiance[0] * inv;
 			outResults[base + i].radiance[1] = temp[i].radiance[1] * inv;
 			outResults[base + i].radiance[2] = temp[i].radiance[2] * inv;

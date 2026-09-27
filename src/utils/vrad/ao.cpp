@@ -32,6 +32,9 @@ static const float kAOSpikeGap = 0.18f;
 static const float kAOSpikeSoft = 0.35f;
 // Ambient obscurance power: vis = (t/R)^k on hit (1 = linear Landis, 2 = stronger near contacts).
 static const float kAOObscurancePower = 1.0f;
+// Never multiply lighting to 0 in a crease. Linear vis=t/R hits 0 on contact and
+// bilinear-filters into a black AO band along every 90° corner.
+static const float kAOMinVis = 0.45f;
 
 struct AOVolumeInfo_t
 {
@@ -526,9 +529,9 @@ static inline float AOObscuranceFromHitT( float hitT, float rayLen )
 	if ( hitT >= rayLen * 0.999f )
 		return 1.0f; // miss / hit at far plane
 	float u = clamp( hitT / rayLen, 0.0f, 1.0f );
-	if ( kAOObscurancePower == 1.0f )
-		return u;
-	return powf( u, kAOObscurancePower );
+	if ( kAOObscurancePower != 1.0f )
+		u = powf( u, kAOObscurancePower );
+	return kAOMinVis + ( 1.0f - kAOMinVis ) * u;
 }
 
 static void TraceAORays4( const Vector *starts, const Vector *ends, const float *weights,

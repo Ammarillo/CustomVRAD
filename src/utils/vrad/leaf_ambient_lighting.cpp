@@ -136,14 +136,75 @@ void AddEmitSurfaceLights( const Vector &vStart, Vector lightBoxColor[6] )
 }
 
 
+// Prop hits occlude sky. Do not light them with classic vertex gather:
+// that intensity is ~255× lightmap units and the engine also adds worldlights
+// to dynamic models. Cubes only store incoming radiance from world lightmaps.
+static bool RayHitsCover( const Vector &vStart, const Vector &vEnd )
+{
+	FourRays rays;
+	rays.origin.DuplicateVector( vStart );
+	FourVectors stop;
+	stop.DuplicateVector( vEnd );
+	rays.direction = stop;
+	rays.direction -= rays.origin;
+	fltx4 len = rays.direction.length();
+	rays.direction *= ReciprocalSIMD( len );
+
+	RayTracingResult result;
+	g_RtEnv.Trace4Rays( rays, Four_Zeros, len, &result, -1, NULL );
+	const int tri = result.HitIds[0];
+	if ( tri < 0 || tri >= g_RtEnv.OptimizedTriangleList.Count() )
+		return false;
+	if ( SubFloat( result.HitDistance, 0 ) >= SubFloat( len, 0 ) )
+		return false;
+
+	const int id = g_RtEnv.OptimizedTriangleList[tri].m_Data.m_IntersectData.m_nTriangleID;
+	if ( id & TRACE_ID_SKY )
+		return false;
+	return true;
+}
+
+static bool ClosestRayHitIsStaticProp( const Vector &vStart, const Vector &vEnd )
+{
+	FourRays rays;
+	rays.origin.DuplicateVector( vStart );
+	FourVectors stop;
+	stop.DuplicateVector( vEnd );
+	rays.direction = stop;
+	rays.direction -= rays.origin;
+	fltx4 len = rays.direction.length();
+	rays.direction *= ReciprocalSIMD( len );
+
+	RayTracingResult result;
+	g_RtEnv.Trace4Rays( rays, Four_Zeros, len, &result, -1, NULL );
+	const int tri = result.HitIds[0];
+	if ( tri < 0 || tri >= g_RtEnv.OptimizedTriangleList.Count() )
+		return false;
+	if ( SubFloat( result.HitDistance, 0 ) >= SubFloat( len, 0 ) )
+		return false;
+
+	const int id = g_RtEnv.OptimizedTriangleList[tri].m_Data.m_IntersectData.m_nTriangleID;
+	return ( id & TRACE_ID_STATICPROP ) != 0;
+}
+
+static bool ProbeIsOutdoors( const Vector &pos )
+{
+	int open = 0;
+	for ( int i = 0; i < 6; ++i )
+	{
+		Vector end = pos + (const Vector &)g_BoxDirections[i] * ( COORD_EXTENT * 1.74f );
+		if ( !RayHitsCover( pos, end ) )
+			++open;
+	}
+	return open >= 3;
+}
+
 void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vector lightBoxColor[6] )
 {
-	// Figure out the color that rays hit when shot out from this position.
 	Vector radcolor[NUMVERTEXNORMALS];
 	float tanTheta = tan(VERTEXNORMAL_CONE_INNER_ANGLE);
 	bool sampled[NUMVERTEXNORMALS];
 
-	// volume-blended sky ambient at this sample point (light_env_vol aware)
 	Vector vSkyAmbient;
 	ComputeSkyAmbientAtPos( vStart, vSkyAmbient );
 
@@ -152,26 +213,23 @@ void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vect
 		radcolor[i].Init();
 		sampled[i] = false;
 
-		// -fastambient: every other sphere direction (~2x faster leaf cubes).
 		if ( g_bFastAmbient && ( i & 1 ) )
 			continue;
 
 		Vector vEnd = vStart + g_anorms[i] * (COORD_EXTENT * 1.74);
-
-		// Now that we've got a ray, see what surface we've hit
-		Vector lightStyleColors[MAX_LIGHTSTYLES];
-		lightStyleColors[0].Init();	// We only care about light style 0 here.
-		CalcRayAmbientLighting( iThread, vStart, vEnd, tanTheta, lightStyleColors, &vSkyAmbient );
-
-		radcolor[i] = lightStyleColors[0];
+		if ( !ClosestRayHitIsStaticProp( vStart, vEnd ) )
+		{
+			Vector lightStyleColors[MAX_LIGHTSTYLES];
+			lightStyleColors[0].Init();
+			CalcRayAmbientLighting( iThread, vStart, vEnd, tanTheta, lightStyleColors, &vSkyAmbient );
+			radcolor[i] = lightStyleColors[0];
+		}
 		sampled[i] = true;
 	}
 
-	// accumulate samples into radiant box
 	for ( int j = 6; --j >= 0; )
 	{
 		float t = 0;
-
 		lightBoxColor[j].Init();
 
 		for (int i = 0; i < NUMVERTEXNORMALS; i++)
@@ -190,8 +248,6 @@ void ComputeAmbientFromSphericalSamples( int iThread, const Vector &vStart, Vect
 			lightBoxColor[j] *= 1/t;
 	}
 
-	// Now add direct light from the emit_surface lights. These go in the ambient cube because
-	// there are a ton of them and they are often so dim that they get filtered out by r_worldlightmin.
 	AddEmitSurfaceLights( vStart, lightBoxColor );
 }
 
@@ -219,70 +275,61 @@ class CLeafSampler
 public:
 	CLeafSampler( int iThread ) : m_iThread(iThread) {}
 
+	bool IsValidSamplePosition( int leafIndex, const CUtlVector<dplane_t> &leafPlanes, const Vector &samplePosition )
+	{
+		for ( int j = leafPlanes.Count(); --j >= 0; )
+		{
+			const float d = DotProduct( leafPlanes[j].normal, samplePosition ) - leafPlanes[j].dist;
+			if ( d < DIST_EPSILON )
+				return false;
+		}
+
+		dleaf_t *pLeaf = dleafs + leafIndex;
+		for ( int j = 0; j < 6; ++j )
+		{
+			Vector end = samplePosition;
+			const int axis = j % 3;
+			end[axis] = ( j < 3 ) ? pLeaf->mins[axis] : pLeaf->maxs[axis];
+			float t;
+			Vector normal;
+			CastRayInLeaf( m_iThread, samplePosition, end, leafIndex, &t, &normal );
+			if ( t == 0.0f )
+				return false; // inside a detail brush
+			if ( t != 1.0f && DotProduct( end - samplePosition, normal ) > 0.0f )
+				return false; // behind a displacement
+		}
+
+		return !StaticPropMgr()->IsPointInsideStaticProp( m_iThread, leafIndex, samplePosition );
+	}
+
 	// Generate a random point in the leaf's bounding volume
 	// reject any points that aren't actually in the leaf
-	// do a couple of tracing heuristics to eliminate points that are inside detail brushes 
-	// or underneath displacement surfaces in the leaf
-	// return once we have a valid point, use the center if one can't be computed quickly
-	void GenerateLeafSamplePosition( int leafIndex, const CUtlVector<dplane_t> &leafPlanes, Vector &samplePosition )
+	// and reject points embedded in BSP, displacement, or static-prop geometry.
+	bool GenerateLeafSamplePosition( int leafIndex, const CUtlVector<dplane_t> &leafPlanes, Vector &samplePosition, bool rejectOutdoors )
 	{
 		dleaf_t *pLeaf = dleafs + leafIndex;
 
 		float dx = pLeaf->maxs[0] - pLeaf->mins[0];
 		float dy = pLeaf->maxs[1] - pLeaf->mins[1];
 		float dz = pLeaf->maxs[2] - pLeaf->mins[2];
-		bool bValid = false;
-		for ( int i = 0; i < 1000 && !bValid; i++ )
+		for ( int i = 0; i < 1000; ++i )
 		{
 			samplePosition.x = pLeaf->mins[0] + m_random.RandomFloat(0, dx);
 			samplePosition.y = pLeaf->mins[1] + m_random.RandomFloat(0, dy);
 			samplePosition.z = pLeaf->mins[2] + m_random.RandomFloat(0, dz);
-			bValid = true;
-
-			for ( int j = leafPlanes.Count(); --j >= 0 && bValid; )
-			{
-				float d = DotProduct(leafPlanes[j].normal, samplePosition) - leafPlanes[j].dist;
-				if ( d < DIST_EPSILON )
-				{
-					// not inside the leaf, try again 
-					bValid = false;
-					break;
-				}
-			}
-			if ( !bValid )
+			if ( !IsValidSamplePosition( leafIndex, leafPlanes, samplePosition ) )
 				continue;
+			if ( rejectOutdoors && ProbeIsOutdoors( samplePosition ) )
+				continue;
+			return true;
+		}
 
-			for ( int j = 0; j < 6; j++ )
-			{
-				Vector start = samplePosition;
-				int axis = j%3;
-				start[axis] = (j<3) ? pLeaf->mins[axis] : pLeaf->maxs[axis];
-				float t;
-				Vector normal;
-				CastRayInLeaf( m_iThread, samplePosition, start, leafIndex, &t, &normal );
-				if ( t == 0.0f )
-				{
-					// inside a func_detail, try again.
-					bValid = false;
-					break;
-				}
-				if ( t != 1.0f )
-				{
-					Vector delta = start - samplePosition;
-					if ( DotProduct(delta, normal) > 0 )
-					{
-						// hit backside of displacement, try again.
-						bValid = false;
-						break;
-					}
-				}
-			}
-		}
-		if ( !bValid )
-		{
-			// didn't generate a valid sample point, just use the center of the leaf bbox
-			samplePosition = ( Vector( pLeaf->mins[0], pLeaf->mins[1], pLeaf->mins[2] ) + Vector( pLeaf->maxs[0], pLeaf->maxs[1], pLeaf->maxs[2] ) ) * 0.5f;
-		}
+		if ( rejectOutdoors )
+			return false;
+
+		samplePosition = ( Vector( pLeaf->mins[0], pLeaf->mins[1], pLeaf->mins[2] ) +
+						   Vector( pLeaf->maxs[0], pLeaf->maxs[1], pLeaf->maxs[2] ) ) * 0.5f;
+		return IsValidSamplePosition( leafIndex, leafPlanes, samplePosition );
 	}
 
 private:
@@ -538,46 +585,85 @@ static byte Fixed8Fraction( float t, float tMin, float tMax )
 
 CUtlVector< CUtlVector<ambientsample_t> > g_LeafAmbientSamples;
 
-void ComputeAmbientForLeaf( int iThread, int leafID, CUtlVector<ambientsample_t> &list )
+static int LeafAmbientCandidateCount( int leafID )
+{
+	int xSize = ( dleafs[leafID].maxs[0] - dleafs[leafID].mins[0] ) / 32;
+	int ySize = ( dleafs[leafID].maxs[1] - dleafs[leafID].mins[1] ) / 32;
+	int zSize = ( dleafs[leafID].maxs[2] - dleafs[leafID].mins[2] ) / 64;
+	xSize = max( xSize, 1 );
+	ySize = max( ySize, 1 );
+	zSize = max( zSize, 1 );
+	if ( g_bFastAmbient )
+		return 1;
+	const int64 volumeCount = (int64)xSize * (int64)ySize * (int64)zSize;
+	return (int)clamp( volumeCount, (int64)1, (int64)128 );
+}
+
+static void GenerateAmbientPositionsForLeaf( int iThread, int leafID, CUtlVector<Vector> &positions )
 {
 	CUtlVector<dplane_t> leafPlanes;
 	CLeafSampler sampler( iThread );
 
 	GetLeafBoundaryPlanes( leafPlanes, leafID );
-	list.RemoveAll();
-	// this heuristic tries to generate at least one sample per volume (chosen to be similar to the size of a player) in the space
-	int xSize = (dleafs[leafID].maxs[0] - dleafs[leafID].mins[0]) / 32;
-	int ySize = (dleafs[leafID].maxs[1] - dleafs[leafID].mins[1]) / 32;
-	int zSize = (dleafs[leafID].maxs[2] - dleafs[leafID].mins[2]) / 64;
-	xSize = max(xSize,1);
-	ySize = max(xSize,1);
-	zSize = max(xSize,1);
-	// generate update 128 candidate samples, always at least one sample
-	int volumeCount = xSize * ySize * zSize;
-	if ( g_bFastAmbient )
-	{
-		// save compute time, only do one sample
-		volumeCount = 1;
-	}
-	int sampleCount = clamp( volumeCount, 1, 128 );
+	positions.RemoveAll();
 	if ( dleafs[leafID].contents & CONTENTS_SOLID )
-	{
-		// don't generate any samples in solid leaves
-		// NOTE: We copy the nearest non-solid leaf sample pointers into this leaf at the end
 		return;
-	}
-	Vector cube[6];
-	for ( int i = 0; i < sampleCount; i++ )
+
+	const int sampleCount = LeafAmbientCandidateCount( leafID );
+
+	// Prefer points around prop surfaces. This keeps probes near actual rooms
+	// and walkable geometry even when VBSP produced one enormous empty leaf.
+	CUtlVector<Vector> guided;
+	const int guidedBudget = ( sampleCount > 1 ) ? max( 1, sampleCount * 3 / 4 ) : sampleCount;
+	const int guidedAttempts = min( 128, max( guidedBudget, guidedBudget * 4 ) );
+	StaticPropMgr()->AddAmbientSamplePositions( leafID, guided, guidedAttempts );
+	for ( int i = 0; i < guided.Count() && positions.Count() < guidedBudget; ++i )
 	{
-		// compute each candidate sample and add to the list
-		Vector samplePosition;
-		sampler.GenerateLeafSamplePosition( leafID, leafPlanes, samplePosition );
-		ComputeAmbientFromSphericalSamples( iThread, samplePosition, cube );
-		// note this will remove the least valuable sample once the limit is reached
-		AddSampleToList( list, samplePosition, cube );
+		if ( !sampler.IsValidSamplePosition( leafID, leafPlanes, guided[i] ) )
+			continue;
+		if ( ProbeIsOutdoors( guided[i] ) )
+			continue;
+		bool duplicate = false;
+		for ( int j = 0; j < positions.Count(); ++j )
+		{
+			if ( ( positions[j] - guided[i] ).LengthSqr() < 1.0f )
+			{
+				duplicate = true;
+				break;
+			}
+		}
+		if ( !duplicate )
+			positions.AddToTail( guided[i] );
 	}
 
-	// remove any samples that can be reconstructed with the remaining data
+	while ( positions.Count() < sampleCount )
+	{
+		Vector samplePosition;
+		const bool rejectOutdoors = true;
+		if ( !sampler.GenerateLeafSamplePosition( leafID, leafPlanes, samplePosition, rejectOutdoors ) )
+			break;
+		positions.AddToTail( samplePosition );
+	}
+	while ( positions.Count() < 1 )
+	{
+		Vector samplePosition;
+		if ( !sampler.GenerateLeafSamplePosition( leafID, leafPlanes, samplePosition, false ) )
+			break;
+		positions.AddToTail( samplePosition );
+	}
+}
+
+static void ComputeAmbientForLeaf( int iThread, int leafID, CUtlVector<ambientsample_t> &list )
+{
+	CUtlVector<Vector> positions;
+	GenerateAmbientPositionsForLeaf( iThread, leafID, positions );
+	list.RemoveAll();
+	Vector cube[6];
+	for ( int i = 0; i < positions.Count(); ++i )
+	{
+		ComputeAmbientFromSphericalSamples( iThread, positions[i], cube );
+		AddSampleToList( list, positions[i], cube );
+	}
 	CompressAmbientSampleList( list );
 }
 

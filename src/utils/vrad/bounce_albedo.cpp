@@ -470,28 +470,13 @@ static inline float SrgbByteToLinear( unsigned char b )
 	return ( u <= 0.04045f ) ? ( u / 12.92f ) : powf( ( u + 0.055f ) / 1.055f, 2.4f );
 }
 
-bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLinearRGB )
+static bool SampleAlbedoAtPixel( BounceAlbedoTexture_t *pTex, int u, int v, Vector &outLinearRGB )
 {
-	if ( facenum < 0 || facenum >= numfaces )
-		return false;
-
-	dface_t *f = &g_pFaces[facenum];
-	texinfo_t *tx = &texinfo[f->texinfo];
-	BounceAlbedoTexture_t *pTex = GetAlbedoForTexdata( tx->texdata );
 	if ( !pTex || pTex->width <= 0 || pTex->height <= 0 || !pTex->rgba.Base() )
 		return false;
 
-	float s = worldPos.x * tx->textureVecsTexelsPerWorldUnits[0][0]
-		+ worldPos.y * tx->textureVecsTexelsPerWorldUnits[0][1]
-		+ worldPos.z * tx->textureVecsTexelsPerWorldUnits[0][2]
-		+ tx->textureVecsTexelsPerWorldUnits[0][3];
-	float t = worldPos.x * tx->textureVecsTexelsPerWorldUnits[1][0]
-		+ worldPos.y * tx->textureVecsTexelsPerWorldUnits[1][1]
-		+ worldPos.z * tx->textureVecsTexelsPerWorldUnits[1][2]
-		+ tx->textureVecsTexelsPerWorldUnits[1][3];
-
-	int u = WrapOrClamp( (int)floorf( s ), pTex->width, pTex->clampU );
-	int v = WrapOrClamp( (int)floorf( t ), pTex->height, pTex->clampV );
+	u = WrapOrClamp( u, pTex->width, pTex->clampU );
+	v = WrapOrClamp( v, pTex->height, pTex->clampV );
 
 	const int nOff = ( v * pTex->width + u ) * 4;
 	if ( nOff < 0 || ( nOff + 3 ) >= pTex->width * pTex->height * 4 )
@@ -505,4 +490,39 @@ bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLi
 	outLinearRGB.z = SrgbByteToLinear( p[2] );
 	BounceAlbedo_SanitizeCompressionChroma( outLinearRGB );
 	return true;
+}
+
+bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLinearRGB )
+{
+	if ( facenum < 0 || facenum >= numfaces )
+		return false;
+
+	dface_t *f = &g_pFaces[facenum];
+	texinfo_t *tx = &texinfo[f->texinfo];
+	BounceAlbedoTexture_t *pTex = GetAlbedoForTexdata( tx->texdata );
+
+	float s = worldPos.x * tx->textureVecsTexelsPerWorldUnits[0][0]
+		+ worldPos.y * tx->textureVecsTexelsPerWorldUnits[0][1]
+		+ worldPos.z * tx->textureVecsTexelsPerWorldUnits[0][2]
+		+ tx->textureVecsTexelsPerWorldUnits[0][3];
+	float t = worldPos.x * tx->textureVecsTexelsPerWorldUnits[1][0]
+		+ worldPos.y * tx->textureVecsTexelsPerWorldUnits[1][1]
+		+ worldPos.z * tx->textureVecsTexelsPerWorldUnits[1][2]
+		+ tx->textureVecsTexelsPerWorldUnits[1][3];
+
+	return SampleAlbedoAtPixel( pTex, (int)floorf( s ), (int)floorf( t ), outLinearRGB );
+}
+
+bool BounceAlbedo_SampleMaterialUV( const char *pMaterialName, float u, float v, Vector &outLinearRGB )
+{
+	if ( !pMaterialName || !pMaterialName[0] )
+		return false;
+
+	BounceAlbedoTexture_t *pTex = FindOrLoadAlbedoForMaterial( pMaterialName );
+	if ( !pTex || pTex->width <= 0 || pTex->height <= 0 )
+		return false;
+
+	const int iu = (int)floorf( u * (float)pTex->width );
+	const int iv = (int)floorf( v * (float)pTex->height );
+	return SampleAlbedoAtPixel( pTex, iu, iv, outLinearRGB );
 }

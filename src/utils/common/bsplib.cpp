@@ -944,14 +944,23 @@ int GetNextFilename( IZip *pak, int id, char *pBuffer, int bufferSize, int &file
 //-----------------------------------------------------------------------------
 // Convert four-CC code to a handle	+ back
 //-----------------------------------------------------------------------------
+static GameLumpId_t GameLumpIdAliases( GameLumpId_t id )
+{
+	// FourCC lump ids are compared as ints; disk order can differ from the 'abcd' literal on LE hosts.
+	return (GameLumpId_t)LittleLong( (int)id );
+}
+
 GameLumpHandle_t CGameLump::GetGameLumpHandle( GameLumpId_t id )
 {
 	// NOTE: I'm also expecting game lump id's to be four-CC codes
 	Assert( id > HEADER_LUMPS );
 
+	const GameLumpId_t alias = GameLumpIdAliases( id );
+
 	FOR_EACH_LL(m_GameLumps, i)
 	{
-		if (m_GameLumps[i].m_Id == id)
+		const GameLumpId_t lumpId = m_GameLumps[i].m_Id;
+		if ( lumpId == id || lumpId == alias )
 			return i;
 	}
 

@@ -11,6 +11,10 @@
 // Returns false if no basetexture could be loaded (caller keeps flat reflectivity).
 bool BounceAlbedo_SampleFace( int facenum, const Vector &worldPos, Vector &outLinearRGB );
 
+// Sample a studio/material $basetexture at UV (tiled or clamped like the VTF).
+// Used for static-prop bounce so props reflect their albedo the same way brushes do.
+bool BounceAlbedo_SampleMaterialUV( const char *pMaterialName, float u, float v, Vector &outLinearRGB );
+
 // Soft-kill DXT/JPEG chroma on near-greys (uses -texbounce_clean threshold).
 void BounceAlbedo_SanitizeCompressionChroma( Vector &linRGB );
 

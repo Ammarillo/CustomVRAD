@@ -683,6 +683,12 @@ public:
 	virtual void Shutdown() = 0;
 	virtual void ComputeLighting( int iThread ) = 0;
 	virtual void AddPolysForRayTrace() = 0;
+
+	// Add positions just outside static-prop bounds which touch this leaf.
+	// Leaf ambient lighting uses these before random volume samples so prop-built
+	// rooms still receive useful probes when the BSP leaf itself is very large.
+	virtual void AddAmbientSamplePositions( int leafIndex, CUtlVector<Vector> &positions, int maxPositions ) const = 0;
+	virtual bool IsPointInsideStaticProp( int iThread, int leafIndex, const Vector &position ) const = 0;
 };
 
 //extern PropTested_t s_PropTested[MAX_TOOL_THREADS+1];

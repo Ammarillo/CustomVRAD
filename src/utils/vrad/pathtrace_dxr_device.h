@@ -81,7 +81,7 @@ struct PtGpuBakeLuxel
 	int			faceNum;
 	int			aaN;		// 1..5
 	int			skipPropIndex;	// -1 = allow self-shadow; >=0 skip TRACE_ID_STATICPROP|id
-	int			pad1;
+	int			sampleScale;	// paths per nominal spp sample (world narrow-chart convergence)
 };
 
 struct PtGpuBakeResult

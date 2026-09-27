@@ -985,6 +985,7 @@ static void PackDetailBakeLuxel( PtGpuBakeLuxel &job, const Vector &pos, const V
 	job.faceNum = -1;
 	job.aaN = 1;
 	job.skipPropIndex = -1;
+	job.sampleScale = 1;
 }
 
 // Grass sprites are billboards. Shading with the host displacement normal
@@ -1011,15 +1012,21 @@ static void DetailVegetationNormal( const Vector &surfN, Vector &out )
 	}
 }
 
-// Style-0 linear luxel on the host ground (no extra albedo multiply).
-static bool SampleHostLuxelLinear( int iThread, const Vector &origin, Vector &out )
+// Planted origin + host surface normal (ignore hull/sprite centre — that
+// sample sits inside the clump or up in a ceiling, so NEE/host rays go black).
+static void DetailPlantFrame( const DetailObjectLump_t &prop, Vector &origin, Vector &normal )
+{
+	VectorCopy( prop.m_Origin, origin );
+	AngleVectors( prop.m_Angles, NULL, NULL, &normal );
+	if ( !normal.IsValid() || normal.LengthSqr() < 1e-8f )
+		normal.Init( 0, 0, 1 );
+	else
+		normal.NormalizeInPlace();
+}
+
+static bool SampleHostLuxelFromRay( int iThread, const Vector &start, const Vector &end, Vector &out )
 {
 	out.Init();
-	Vector start = origin;
-	start.z += 16.0f;
-	Vector end = origin;
-	end.z -= 80.0f;
-
 	Ray_t ray;
 	ray.Init( start, end, vec3_origin, vec3_origin );
 	CLightSurface surfEnum( iThread );
@@ -1047,6 +1054,20 @@ static bool SampleHostLuxelLinear( int iThread, const Vector &origin, Vector &ou
 	return out.LengthSqr() > 0.0f;
 }
 
+// Style-0 linear luxel on the host ground (no extra albedo multiply).
+static bool SampleHostLuxelLinear( int iThread, const Vector &origin, const Vector &normal, Vector &out )
+{
+	Vector n = normal;
+	if ( n.LengthSqr() < 1e-8f )
+		n.Init( 0, 0, 1 );
+	else
+		n.NormalizeInPlace();
+
+	if ( SampleHostLuxelFromRay( iThread, origin + n * 16.0f, origin - n * 96.0f, out ) )
+		return true;
+	return SampleHostLuxelFromRay( iThread, origin + Vector( 0, 0, 16 ), origin - Vector( 0, 0, 80 ), out );
+}
+
 static Vector *s_pDetailGpuCol = NULL;
 static int *s_pDetailJobProp = NULL;
 static DetailObjectLump_t *s_pDetailFloorProps = NULL;
@@ -1054,9 +1075,9 @@ static DetailObjectLump_t *s_pDetailFloorProps = NULL;
 static void ThreadFloorDetailGpu( int iThread, int j )
 {
 	Vector origin, surfN;
-	ComputeWorldCenter( s_pDetailFloorProps[s_pDetailJobProp[j]], origin, surfN );
+	DetailPlantFrame( s_pDetailFloorProps[s_pDetailJobProp[j]], origin, surfN );
 	Vector host;
-	if ( !SampleHostLuxelLinear( iThread, origin, host ) )
+	if ( !SampleHostLuxelLinear( iThread, origin, surfN, host ) )
 		return;
 	if ( host.x > s_pDetailGpuCol[j].x ) s_pDetailGpuCol[j].x = host.x;
 	if ( host.y > s_pDetailGpuCol[j].y ) s_pDetailGpuCol[j].y = host.y;
@@ -1080,17 +1101,16 @@ static bool ComputeDetailPropLightingPathTraceGPU( DetailObjectLump_t *pProps, i
 	for ( int i = 0; i < count; ++i )
 	{
 		Vector origin, surfN;
-		ComputeWorldCenter( pProps[i], origin, surfN );
+		DetailPlantFrame( pProps[i], origin, surfN );
 		if ( !origin.IsValid() || !surfN.IsValid() )
 			continue;
 
 		Vector nShade;
 		DetailVegetationNormal( surfN, nShade );
 
-		// Sprite centre is already off the mesh. Lift in world Z so a bowl
-		// normal cannot slide the sample into the opposite hillside.
-		Vector pos = origin;
-		pos.z += 2.0f;
+		// Sit just off the host face (along the shade normal, not hull Z) so
+		// NEE clears OccludeBias without sliding into a wall or ceiling.
+		const Vector pos = origin + nShade * 6.0f;
 
 		PtGpuBakeLuxel job;
 		PackDetailBakeLuxel( job, pos, nShade, i );
@@ -1123,10 +1143,37 @@ static bool ComputeDetailPropLightingPathTraceGPU( DetailObjectLump_t *pProps, i
 	s_pDetailFloorProps = NULL;
 
 	const bool bStyles = DetailHasStyledLights();
+	int nDark = 0;
+	int nModel = 0;
+	double lumSum = 0.0;
 	for ( int j = 0; j < jobs.Count(); ++j )
 	{
 		DetailObjectLump_t &prop = pProps[jobProp[j]];
 		Vector c = gpuCol[j];
+		if ( !c.IsValid() )
+			c.Init();
+		c.x = max( c.x, 0.0f );
+		c.y = max( c.y, 0.0f );
+		c.z = max( c.z, 0.0f );
+
+		float lum = c.x * 0.2126f + c.y * 0.7152f + c.z * 0.0722f;
+		if ( lum < 1.0f )
+		{
+			Vector amb[MAX_LIGHTSTYLES];
+			memset( amb, 0, sizeof( amb ) );
+			ComputeAmbientLighting( THREADINDEX_MAIN, prop, amb );
+			if ( amb[0].x > c.x ) c.x = amb[0].x;
+			if ( amb[0].y > c.y ) c.y = amb[0].y;
+			if ( amb[0].z > c.z ) c.z = amb[0].z;
+			lum = c.x * 0.2126f + c.y * 0.7152f + c.z * 0.0722f;
+		}
+
+		lumSum += lum;
+		if ( lum < 1.0f )
+			++nDark;
+		if ( prop.m_Type == DETAIL_PROP_TYPE_MODEL )
+			++nModel;
+
 		VectorToColorRGBExp32( c, prop.m_Lighting );
 		prop.m_LightStyleCount = 0;
 
@@ -1139,6 +1186,14 @@ static bool ComputeDetailPropLightingPathTraceGPU( DetailObjectLump_t *pProps, i
 		s.direct[0].Init();
 		VectorCopy( c, s.amb[0] );
 		CommitDetailLighting( prop, s, true );
+	}
+
+	Msg( "[PathTrace-DXR] detail lighting: %d samples, avg lin %.1f, near-black %d\n",
+		 jobs.Count(), jobs.Count() ? lumSum / (double)jobs.Count() : 0.0, nDark );
+	if ( nModel > 0 )
+	{
+		Msg( "[PathTrace-DXR] %d studio detail models: use UnlitGeneric (VertexLitGeneric is black in-engine).\n",
+			 nModel );
 	}
 
 	for ( int i = 0; i < count; ++i )
@@ -1216,6 +1271,8 @@ static void UnserializeSpriteDict( CUtlBuffer& buf )
 static int UnserializeDetailProps( DetailObjectLump_t*& pProps )
 {
 	GameLumpHandle_t handle = g_GameLumps.GetGameLumpHandle( GAMELUMP_DETAIL_PROPS );
+	if ( handle == g_GameLumps.InvalidGameLump() )
+		return 0;
 
 	if (g_GameLumps.GetGameLumpVersion(handle) != GAMELUMP_DETAIL_PROPS_VERSION)
 		return 0;

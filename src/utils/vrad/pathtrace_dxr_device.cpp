@@ -48,6 +48,7 @@ struct PtHostTri
 {
 	Vector	a, b, c;
 	uint32	flags;	// TRACE_ID_*
+	Vector	albedo;	// linear RGB; x < 0 = unset
 };
 
 static std::vector<PtHostTri>	g_ptTris;
@@ -60,6 +61,7 @@ struct PtPropModelMesh
 	uint32 nTris = 0;
 	std::vector<Vector> verts; // nTris * 3, local space
 	std::vector<int> shadowMats; // nTris, -1 = opaque
+	std::vector<Vector> albedo; // nTris linear RGB; x < 0 = unset
 };
 struct PtPropInstanceRec
 {
@@ -79,7 +81,7 @@ void PathTraceDXR_ClearPropInstances()
 }
 
 void PathTraceDXR_RegisterPropModel( int modelIdx, const Vector *verts, int nTris,
-									 const int *shadowMatIndices )
+									 const int *shadowMatIndices, const Vector *triAlbedo )
 {
 	if ( !verts || nTris <= 0 )
 		return;
@@ -93,10 +95,16 @@ void PathTraceDXR_RegisterPropModel( int modelIdx, const Vector *verts, int nTri
 	m.nTris = (uint32)nTris;
 	m.verts.assign( verts, verts + nTris * 3 );
 	m.shadowMats.assign( (size_t)nTris, -1 );
+	m.albedo.assign( (size_t)nTris, Vector( -1.0f, -1.0f, -1.0f ) );
 	if ( shadowMatIndices )
 	{
 		for ( int i = 0; i < nTris; ++i )
 			m.shadowMats[i] = shadowMatIndices[i];
+	}
+	if ( triAlbedo )
+	{
+		for ( int i = 0; i < nTris; ++i )
+			m.albedo[i] = triAlbedo[i];
 	}
 	g_ptPropModels.push_back( std::move( m ) );
 }
@@ -148,6 +156,7 @@ void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv )
 		h.b = tri.Vertex( 1 );
 		h.c = tri.Vertex( 2 );
 		h.flags = (uint32)tri.m_Data.m_GeometryData.m_nTriangleID;
+		h.albedo.Init( -1.0f, -1.0f, -1.0f );
 		if ( bInstanced && ( h.flags & TRACE_ID_STATICPROP ) )
 			continue; // unique-model BLASes + TLAS instances
 		g_ptTris.push_back( h );
@@ -169,6 +178,10 @@ void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv )
 				h.b = m.verts[t * 3 + 1];
 				h.c = m.verts[t * 3 + 2];
 				h.flags = TRACE_ID_STATICPROP;
+				if ( t < m.albedo.size() )
+					h.albedo = m.albedo[t];
+				else
+					h.albedo.Init( -1.0f, -1.0f, -1.0f );
 				g_ptTris.push_back( h );
 				g_ptShadowMats.push_back( ( t < m.shadowMats.size() ) ? m.shadowMats[t] : -1 );
 			}

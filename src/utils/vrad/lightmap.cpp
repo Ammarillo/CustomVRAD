@@ -8,6 +8,7 @@
 
 #include "vrad.h"
 #include "vrad_gpu.h"
+#include "qmc_sobol.h"
 #include <vector>
 #include "lightmap.h"
 #include "radial.h"
@@ -2470,20 +2471,10 @@ void ExportDirectLightsToWorldLights()
 
 // ---------------------------------------------------------------------------
 // Soft sun (SunSpreadAngle) cone sampling.
-// Low-discrepancy directions (van der Corput radius + golden-angle spiral)
-// give smooth penumbras with no random speckle, and any prefix of the
-// sequence is evenly spread over the cone - so a short probe pass can
-// early-out luxels that are fully lit or fully shadowed.
+// 2D Sobol in the cone (Joe-Kuo / scipy qmc.Sobol). Point 0 is the exact sun
+// direction; later points fill the disk jointly so prefixes stay even — a
+// short probe can early-out luxels that are fully lit or fully shadowed.
 // ---------------------------------------------------------------------------
-static inline float SoftSunRadicalInverse( unsigned int i )
-{
-	i = ( i << 16 ) | ( i >> 16 );
-	i = ( ( i & 0x00ff00ffu ) << 8 ) | ( ( i & 0xff00ff00u ) >> 8 );
-	i = ( ( i & 0x0f0f0f0fu ) << 4 ) | ( ( i & 0xf0f0f0f0u ) >> 4 );
-	i = ( ( i & 0x33333333u ) << 2 ) | ( ( i & 0xccccccccu ) >> 2 );
-	i = ( ( i & 0x55555555u ) << 1 ) | ( ( i & 0xaaaaaaaau ) >> 1 );
-	return (float)( i * 2.3283064365386963e-10 );
-}
 
 // Scale ray count with spread angle: small penumbras need far fewer rays.
 static int SoftSunSampleCount( float flSinExtent, bool bFast )
@@ -2507,19 +2498,18 @@ static int SoftSunSampleCount( float flSinExtent, bool bFast )
 static void SoftSunSampleDelta( const Vector &axis, const Vector &t1, const Vector &t2,
 								float cosThetaMax, int i, Vector &deltaOut )
 {
-	// Sample 0 is the exact sun direction; later samples fill the cone evenly.
-	const float u = ( i == 0 ) ? 0.0f : SoftSunRadicalInverse( (unsigned int)i );
+	const float u = QmcSobol( (unsigned int)i, 0 );
+	const float v = QmcSobol( (unsigned int)i, 1 );
 	const float cosTheta = 1.0f - u * ( 1.0f - cosThetaMax );
 	const float sinTheta = sqrtf( fmaxf( 0.0f, 1.0f - cosTheta * cosTheta ) );
-	const float phi = (float)i * 2.3999632f;	// golden angle
+	const float phi = v * 2.0f * (float)M_PI;
 	Vector dir = axis * cosTheta + ( t1 * cosf( phi ) + t2 * sinf( phi ) ) * sinTheta;
 	VectorScale( dir, MAX_TRACE_LENGTH, deltaOut );
 }
 
 // ---------------------------------------------------------------------------
-// Soft volume point light (light_volume): low-discrepancy sample points
-// uniformly inside a sphere of Radius. Sample 0 is the center; the rest
-// fill the ball so soft shadows look like soft-sun penumbras.
+// Soft volume point light (light_volume): 3D Sobol points uniformly inside
+// a sphere of Radius. Sample 0 is the center; the rest fill the ball.
 // ---------------------------------------------------------------------------
 static int SoftVolumeSampleCount( float flRadius, bool bFast )
 {
@@ -2546,12 +2536,11 @@ static void SoftVolumeSampleOffset( float flRadius, int i, Vector &offsetOut )
 		offsetOut.Init();
 		return;
 	}
-	// Radius via cube-root of radical inverse -> uniform volume density.
-	const float u = SoftSunRadicalInverse( (unsigned int)i );
+	// Cube-root radius -> uniform volume density; Sobol (u,v,w) jointly.
+	const float u = QmcSobol( (unsigned int)i, 0 );
 	const float r = flRadius * cbrtf( u );
-	// Direction: golden-angle spiral on the unit sphere.
-	const float z = 1.0f - 2.0f * SoftSunRadicalInverse( (unsigned int)( i * 2 + 1 ) );
-	const float phi = (float)i * 2.3999632f;
+	const float z = 1.0f - 2.0f * QmcSobol( (unsigned int)i, 1 );
+	const float phi = QmcSobol( (unsigned int)i, 2 ) * 2.0f * (float)M_PI;
 	const float sinTheta = sqrtf( fmaxf( 0.0f, 1.0f - z * z ) );
 	offsetOut.x = r * sinTheta * cosf( phi );
 	offsetOut.y = r * sinTheta * sinf( phi );

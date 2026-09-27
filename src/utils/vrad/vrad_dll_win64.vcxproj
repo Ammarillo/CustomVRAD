@@ -250,6 +250,7 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClInclude Include="disp_vrad.h" />
     <ClInclude Include="vrad_gpu.h" />
     <ClInclude Include="ao.h" />
+    <ClInclude Include="qmc_sobol.h" />
     <ClInclude Include="absorb.h" />
     <ClInclude Include="water_medium.h" />
     <ClInclude Include="fog_volume.h" />

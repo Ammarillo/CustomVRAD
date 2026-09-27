@@ -296,16 +296,11 @@ At every vertex the integrator evaluates (or samples) lights:
         contribution; avoids double-counting).
 \end{itemize}
 
-\paragraph{Sun MIS.}
-For sun solid angle $\Omega=2\pi(1-\cos\theta_{\max})$,
-\begin{equation}
-  p_{\mathrm{light}}=\frac{1}{\Omega},
-  \qquad
-  w_{\mathrm{light}}
-  =
-  \frac{p_{\mathrm{light}}^{2}}
-       {p_{\mathrm{light}}^{2}+p_{\mathrm{bsdf}}^{2}}.
-\end{equation}
+\paragraph{Sun NEE.}
+The cosine BSDF path never samples the sun disk (sky misses add ambient only),
+so sun next-event estimation is unweighted. A finite disk wraps past $90^\circ$:
+a receiver is culled only when $\vect{n}\cdot\vect{\omega}_{\mathrm{sun}}\le -\sin\alpha$.
+The cone is always fully sampled (no CHSS / prefix early-out).
 
 \paragraph{Point / spot attenuation.}
 \begin{equation}
@@ -328,11 +323,8 @@ $s(t)=t^{3}(6t^{2}-15t+10)$.
 \label{sec:chss}
 
 Local lights may use a soft disk of radius $r$ (\flag{-pt\_lightradius}, or
-entity \ent{light\_volume} \code{Radius}). The sun uses an angular cap
-(\flag{-softsun} / entity \code{SunSpreadAngle}).
-
-Adaptive sample count (CHSS-style) from a probe blocker distance $t_{\mathrm{hit}}$
-and light distance $d$:
+entity \ent{light\_volume} \code{Radius}). Adaptive sample count (CHSS-style)
+from a probe blocker distance $t_{\mathrm{hit}}$ and light distance $d$:
 \begin{equation}
   w_{\mathrm{pen}}
   =
@@ -348,7 +340,11 @@ and light distance $d$:
 \end{equation}
 where $s_p=\texttt{-pt\_lightpenumbra}$ (default~$1$) and
 $n_{\max}=\texttt{-pt\_softsamples}$ (default~$16$, clamp $1$--$64$).
-Unoccluded lights use a cheap angular estimate, capped at four rays.
+Unoccluded local lights use a cheap angular estimate, capped at four rays.
+
+The sun does \emph{not} use CHSS. A center-ray probe would hard-cut the outer
+penumbra (axis visible, disk limb still occluded). Sun uses the angular Sobol
+cone count in \S\ref{sec:softsun}; every cone sample is traced.
 
 \flag{-pt\_softmode}~\code{direct} (default) enables soft sampling only at the
 luxel; \code{all} enables it at every path vertex.
@@ -380,7 +376,10 @@ Hue-preserving max-channel clamp with cap $C_{\max}=2500$:
 After PathLi accumulation the baker:
 \begin{enumerate}[leftmargin=1.6em]
   \item Fills chart holes / invalid samples.
-  \item Dilates suspicious dark edge outliers (sample-in-solid).
+  \item Dilates dark outer luxels on concave creases from each row's own stable
+        interior sample, without blending across a light/shadow edge. Diagonal
+        concave edges (stairs) get the same lift where a luxel sits mostly
+        outside the face. Coplanar splits are left for seam stitching.
   \item Optionally denoises (\cref{sec:denoise}).
   \item Always applies two FXAA-like $3\times3$ high-contrast evening passes
         (blend starts near $25\%$ relative luminance jump, full near $55\%$,
@@ -649,7 +648,7 @@ Local overrides for \code{BounceBoost}, \code{BounceChroma}, and
 
 \subsection{\ent{light\_volume}}
 
-Soft sphere point light: low-discrepancy samples inside radius $R$ (default~$16$).
+Soft sphere point light: 3D Sobol samples inside radius $R$ (default~$16$).
 Sample count scales with $R$ ($\sim\!16$ at default, cap~$40$; reduced with
 \flag{-fast}). Early-out when fully lit/shadowed. Exported as a hard point light
 at the centre (softness is bake-only). Optional \code{LightTemperature} as in
@@ -811,9 +810,10 @@ With \flag{-gpu}, AO can use batched OpenCL occlusion.
 Replaces stock's fixed $30$ random cone rays:
 
 \begin{itemize}[leftmargin=1.4em]
-  \item Low-discrepancy golden-angle spiral in the sun cone.
+  \item 2D Sobol samples in the sun cone (Joe--Kuo; same net as \texttt{scipy.stats.qmc.Sobol}).
   \item Adaptive count $\sim\!9$ at $2^\circ$ up to $\sim\!40$ at $50^\circ$.
-  \item Early-out after a short probe when fully lit or fully shadowed.
+  \item Classic radiosity may early-out a prefix when fully lit or fully shadowed;
+        pathtrace always traces the full cone.
 \end{itemize}
 $0^\circ$ $=$ hard sun. Typical soft look: $0.5^\circ$--$3^\circ$.
 
@@ -961,11 +961,16 @@ Opt-in via \flag{-pt\_denoise}; select backend with \flag{-pt\_denoiser}.
 
 Intel Open Image Denoise \code{RTLightmap} model on CPU (\texttt{hdr} on).
 One thread-local filter per bake worker (pinned to avoid oversubscription).
-Charts smaller than $16^{2}$ are edge-clamp padded.
-After world faces finish, coplanar connected faces that share a lightmap
-frame are packed into one island image and denoised together so OIDN sees
-neighbour context across VBSP splits. Displacements and oversized islands
-($>2048$ on a side) stay per-face. Sakai remains per-face (needs variance).
+The network needs both lightmap sides $\ge 16$ luxels (it edge-clamp-pads
+anything thinner, which hallucinates a green/pink tint on ramps and trim).
+Smaller faces are traced on a virtual luxel grid (up to $4\times$), denoised
+there, then box-filtered back to the BSP lightmap. If the virtual grid is
+still too thin, luminance is kept and chromaticity is replaced with the
+chart mean. After world faces finish, coplanar connected faces that share a
+lightmap frame are packed into one island image and denoised together so
+OIDN sees neighbour context across VBSP splits.
+Displacements and oversized islands ($>2048$ on a side) stay per-face.
+Sakai remains per-face (needs variance).
 
 \subsection{OptiX}
 
@@ -1004,7 +1009,11 @@ skip the BSP lightmap walk.
 Under \flag{-pathtrace} $+$ \flag{-StaticPropLighting}:
 
 \begin{itemize}[leftmargin=1.4em]
-  \item \textbf{Prop lightmap texels} --- same spp / bounces / NEE as world.
+  \item \textbf{Prop lightmap texels} --- same integrator as world luxels:
+        spp, bounces, NEE, \flag{-pt\_aa} footprint, adaptive extra spp,
+        crease bias, and per-island denoise. Bounce hits on props use the
+        studio \vmt{basetexture} albedo (neutral grey only when the texture
+        is missing). Vertex lighting stays on the cheaper path below.
   \item \textbf{Vertex lighting} --- with \flag{-pt\_prop\_vertgrid}~$G>0$
         (default~$4$): each LOD0 triangle gets an $8\times8$ chart packed into a
         $64\times64$-cell atlas page ($512\times512$), inset by $1$ texel
@@ -1030,6 +1039,29 @@ Default on (inset $0.5$ luxels; range $0$--$2$ via \flag{-edgepull}).
 For chart width $W$, sample coordinate $s$ is clamped to $[i,\,W-1-i]$
 (similarly $t$). Moves edge samples off adjacent solids --- thin walls, jambs,
 floor/wall scallops. \flag{-noedgepull} restores stock positions.
+
+\subsection{Crease dilation}
+
+After the bake, and again after seam stitching, outer luxels on a concave
+corner are replaced when they are a sharp luminance drop below that row's
+first stable interior texel. The search walks inward (up to four luxels,
+stopping at the face midline) and stops when the next texel has already left
+the dark band, so a shadow edge is not filled from the lit side. Where both
+borders meet, the corner texel is one diagonal sample, kept only when it
+matches the adjacent edges. A border that is not a coplanar split gets a
+stricter one-to-three luxel version of the same test, which catches
+$90^{\circ}$ edges whose neighbor face was not welded to this one. Concave
+edges that cut across the luxel grid (stairs and other non-axis cuts) fill
+luxels sitting on or just outside that edge from the interior plateau.
+Where a lightmap runs through another brush, or a static prop mesh cuts
+through the face, luxels inside that solid are black. The brush luxels that
+sit against the prop, about two luxels out, are filled from the open face so
+the cut is not a dark stripe. Prop lightmaps do the same where a
+texel lies inside a brush, before denoise can smear that black across the
+chart. A real shadow is left in place.
+Coplanar VBSP splits are not rewritten here; \code{StitchLightmapSeams} welds
+those. The post-stitch pass only re-dilates concave borders, so a seam blend
+cannot put the dark corner luxel back.
 
 \subsection{Seam stitching}
 
