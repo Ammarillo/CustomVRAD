@@ -274,6 +274,7 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClInclude Include="vrad_emit.h" />
     <ClInclude Include="vrad_emit_area.h" />
     <ClInclude Include="vrad_filter.h" />
+    <ClInclude Include="vrad_brdf.h" />
     <ClInclude Include="..\..\public\map_utils.h" />
     <ClInclude Include="radial.h" />
     <ClInclude Include="..\..\public\bitmap\tgawriter.h" />
@@ -394,6 +395,7 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClCompile Include="vrad_emit.cpp" />
     <ClCompile Include="vrad_emit_area.cpp" />
     <ClCompile Include="vrad_filter.cpp" />
+    <ClCompile Include="vrad_brdf.cpp" />
     <ClCompile Include="absorb.cpp" />
     <ClCompile Include="bake_volume.cpp" />
     <ClCompile Include="water_medium.cpp" />
@@ -428,6 +430,7 @@ xcopy /Y /D "$(ProjectDir)..\..\..\thirdparty\oidn\bin\tbbbind*.dll" "$(ProjectD
     <ClCompile Include="VRadDisps.cpp" />
     <ClCompile Include="vraddll.cpp" />
     <ClCompile Include="VRadStaticProps.cpp" />
+    <ClCompile Include="prop_uv_split.cpp" />
     <ClCompile Include="..\..\public\zip_utils.cpp" />
     <ClCompile Include="..\common\bsplib.cpp" />
     <ClCompile Include="..\..\public\builddisp.cpp" />

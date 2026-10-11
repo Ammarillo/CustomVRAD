@@ -1741,29 +1741,43 @@ static void ParseLightSpot( entity_t* e, directlight_t* dl )
 			{
 				if ( !Q_stricmp( pMode, "fit" ) || !Q_stricmp( pMode, "1" ) )
 					dl->m_nProjFrameMode = (int)PROJ_FRAME_FIT;
+				else if ( !Q_stricmp( pMode, "hdri" ) || !Q_stricmp( pMode, "2" ) )
+					dl->m_nProjFrameMode = (int)PROJ_FRAME_HDRI;
+				else if ( !Q_stricmp( pMode, "6side" ) || !Q_stricmp( pMode, "6 side" )
+					|| !Q_stricmp( pMode, "6-side" ) || !Q_stricmp( pMode, "3" ) )
+					dl->m_nProjFrameMode = (int)PROJ_FRAME_SIXFACE;
 				else if ( !Q_stricmp( pMode, "fill" ) || !Q_stricmp( pMode, "0" ) )
 					dl->m_nProjFrameMode = (int)PROJ_FRAME_FILL;
 			}
 
+			const char *iesNote = dl->m_pIes ? " - IES used as angular mask" : "";
 			const ProjKind_t kind = Proj_Kind( dl->m_pProj );
 			if ( kind == PROJ_CUBE )
 			{
 				Msg( "light_spot at (%.0f %.0f %.0f): ProjectedTexture '%s' (cubemap, omnidirectional)%s\n",
-					 dest.x, dest.y, dest.z, pProj,
-					 dl->m_pIes ? " - IES used as angular mask" : "" );
+					 dest.x, dest.y, dest.z, pProj, iesNote );
 			}
 			else if ( kind == PROJ_SPHERE )
 			{
 				Msg( "light_spot at (%.0f %.0f %.0f): ProjectedTexture '%s' (2D envmap/matcap, omnidirectional)%s\n",
-					 dest.x, dest.y, dest.z, pProj,
-					 dl->m_pIes ? " - IES used as angular mask" : "" );
+					 dest.x, dest.y, dest.z, pProj, iesNote );
+			}
+			else if ( dl->m_nProjFrameMode == (int)PROJ_FRAME_HDRI )
+			{
+				Msg( "light_spot at (%.0f %.0f %.0f): ProjectedTexture '%s' (2D HDRI equirect, omnidirectional)%s\n",
+					 dest.x, dest.y, dest.z, pProj, iesNote );
+			}
+			else if ( dl->m_nProjFrameMode == (int)PROJ_FRAME_SIXFACE )
+			{
+				Msg( "light_spot at (%.0f %.0f %.0f): ProjectedTexture '%s' (2D six-face, 90 deg, omnidirectional)%s\n",
+					 dest.x, dest.y, dest.z, pProj, iesNote );
 			}
 			else
 			{
 				Msg( "light_spot at (%.0f %.0f %.0f): ProjectedTexture '%s' (2D planar, %s)%s\n",
 					 dest.x, dest.y, dest.z, pProj,
 					 ( dl->m_nProjFrameMode == (int)PROJ_FRAME_FIT ) ? "fit" : "fill",
-					 dl->m_pIes ? " - IES used as angular mask" : "" );
+					 iesNote );
 			}
 		}
 		else
@@ -1990,6 +2004,26 @@ static void ParseLightEnvironment( entity_t* e, directlight_t* dl )
 
 	ParseLightGeneric( e, dl );
 
+	// VBSP assigns style 32+ to any named light. Path tracing only bakes style 0,
+	// so a named sun was dropped entirely while its ambient light (style 0) remained.
+	// Bake the sun as style 0: direct and bounce stay in the lightmap. The name
+	// does not toggle that baked sunlight.
+	if ( dl->light.style != 0 )
+	{
+		const char *pName = ValueForKey( e, "targetname" );
+		if ( pName && pName[0] )
+		{
+			Msg( "light_environment '%s' is named (style %d). Baking sun as style 0 so direct light and bounce stay on.\n",
+				 pName, dl->light.style );
+		}
+		else
+		{
+			Msg( "light_environment style %d: baking sun as style 0 so direct light and bounce stay on.\n",
+				 dl->light.style );
+		}
+		dl->light.style = 0;
+	}
+
 	float sunExtent = ParseSunSpreadExtent( e );
 	if ( ValueForKeyWithDefault( e, "SunSpreadAngle" ) )
 	{
@@ -2066,6 +2100,7 @@ static void ParseLightEnvironmentVolume( entity_t* e )
 
 	directlight_t *pSky = AllocDLight( dest, false );
 	ParseLightGeneric( e, pSky );
+	pSky->light.style = 0;
 	pSky->light.type = emit_skylight;
 	pSky->m_nEnvId = envId;
 	pSky->m_flSunAngularExtent = ParseSunSpreadExtent( e );

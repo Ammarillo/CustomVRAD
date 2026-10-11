@@ -202,7 +202,7 @@ vertices with no cache hit are still baked so they cannot go black.
 \label{sec:pathtrace}
 %═══════════════════════════════════════════════════════════════════════════════
 
-The path tracer is a unidirectional Lambertian integrator with next-event
+The path tracer is a unidirectional integrator with next-event
 estimation (NEE) at every path vertex. It is implemented twice:
 
 \begin{itemize}[leftmargin=1.4em]
@@ -231,17 +231,18 @@ Under \flag{-uw\_volume}, medium free-flight events may intervene between
 surface vertices (\cref{sec:underwater}).
 
 \paragraph{BSDF.}
-Surfaces are Lambertian,
+The receiving luxel is always Lambertian (the lightmap stores irradiance).
+A hit surface with no \vmt{vrad\_roughness} / \vmt{vrad\_metalness} keys is Lambertian too:
 \begin{equation}
   f_r(\omega_i,\omega_o)=\frac{\rho}{\pi},
   \qquad
-  p_{\mathrm{bsdf}}(\omega)=\frac{\cos\theta}{\pi}.
+  p_{\mathrm{bsdf}}(\omega)=\frac{\cos\theta}{\pi},
+  \qquad
+  \beta_{k+1} = \beta_k\,\rho_k.
 \end{equation}
-After a non-sky hit the throughput update simplifies to
-\begin{equation}
-  \beta_{k+1} = \beta_k\,\rho_k
-  \qquad\text{(albedo clamped channelwise to $[0,1]$).}
-\end{equation}
+Albedo is clamped channelwise to $[0,1]$. An authored surface uses the lobe split in
+\cref{sec:brdf}. Roughness~$1$ and metalness~$0$ take the equation above, so an
+explicit default does not change an old bake.
 
 \paragraph{Russian roulette.}
 Starting at bounce index $k\ge 1$,
@@ -365,8 +366,9 @@ Hue-preserving max-channel clamp with cap $C_{\max}=2500$:
 
 \begin{itemize}[leftmargin=1.4em]
   \item \flag{-pt\_samples}~$S$: spp per luxel (quality-derived if unset;
-        clamp $1$--$4096$). GPU uses fixed $S$; CPU may adaptively raise spp
-        (up to $4\times$, cap~$64$) when coefficient of variation is high.
+        clamp $1$--$4096$). \flag{-pt\_adaptive} adds samples only while the
+        relative standard error of mean luminance stays above $5\%$, capped by
+        \flag{-pt\_adaptive\_max}.
   \item \flag{-pt\_aa}~$A$: deterministic $A\times A$ footprint grid over the
         luxel ($A\in[1,5]$, default~$3$). Spatial AA, not a multiplicative spp loop.
 \end{itemize}
@@ -545,6 +547,58 @@ and \code{lightscale}. Pathtrace builds a fan-triangulated mesh and uses area
 NEE; \flag{-pt\_emit\_samples}~$0$ evaluates all triangles (default~$64$
 power samples). Classic mode aggregates to a softened area proxy plus a later
 self-illumination pass.
+
+\subsection{Roughness and metalness (\vmt{vrad\_roughness*} / \vmt{vrad\_metalness*})}
+\label{sec:brdf}
+
+Compile-time only. Missing keys leave the Lambertian bounce unchanged.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  Key & Default & Role \\
+  \midrule
+  \vmt{vrad\_roughness} & $1$ & $0$ mirror, $1$ fully rough \\
+  \vmt{vrad\_roughnessmap} & unset & Linear R channel, same $0$--$1$ \\
+  \vmt{vrad\_metalness} & $1$ if omitted & $0$ dielectric, $1$ metal \\
+  \vmt{vrad\_metalnessmap} & unset & Linear R channel \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\vmt{vrad\_metallic} and \vmt{vrad\_metallicmap} are aliases. A map replaces the
+scalar per texel; if both are set the scalar multiplies the map. Map-only
+authoring uses multiplier~$1$. A material that sets roughness and omits
+metalness uses $m=1$. Explicit $0$ is a dielectric. No keys at all stays
+Lambertian.
+
+Specular reflectance at normal incidence and the two lobes are
+\begin{align*}
+  F_0 &= \mathrm{lerp}(0.04,\,\rho,\,m), \\
+  g &= 1-r, \\
+  E_{\mathrm{sharp}} &= F_0\, g, \\
+  E_{\mathrm{wide}} &= \rho(1-m)(1-0.04\,g) + F_0(1-g)\,m.
+\end{align*}
+$r$ is roughness and $m$ is metalness.
+
+An authored hit with a sharp lobe traces the mirror reflection when that ray
+does not hit geometry within $24$ units. A closer hit is the adjacent face of a
+seam; that sample takes the diffuse bounce with weight $E_{\mathrm{wide}}+E_{\mathrm{sharp}}$
+so the edge matches its neighbors. Direct lights still connect through the
+triangle, scaled by gloss $1-r$. Below roughness $0.08$ the ray must land inside
+that triangle. Above $0.08$ a miss uses the closest point only while the
+half-vector there stays inside the GGX lobe, so the beam widens around the
+mirror direction. Roughness $1$ has $E_{\mathrm{sharp}}=0$ and stays diffuse.
+
+Checks: dielectric $r{=}1$ is $\rho$ (legacy). Dielectric $r{=}0$ is $0.96\rho$
+diffuse plus $0.04$ mirror. Metal $r{=}1$ is colored Lambert. Metal $r{=}0$ is a
+tinted mirror. The luxel itself is never glossy.
+
+Classic radiosity writes $E_{\mathrm{wide}}$ into patch reflectivity (clamped to
+$0.99$) and cannot trace the sharp lobe, so a smooth metal stops diffuse-filling
+the room. Path tracing on the GPU samples maps on brushes (texinfo UV) and on
+static-prop meshes (studio UV). The CPU fallback samples brush faces only.
 
 \subsection{Colored glass filters (\vmt{vrad\_filter*})}
 \label{sec:filter}
@@ -869,12 +923,15 @@ The loader classifies the VTF:
   \toprule
   Kind & Detection & Domain \\
   \midrule
-  Planar (2D) & No cubemap / no usable six-face layout & Spot cone \\
+  Planar (2D) & No cubemap / no usable six-face layout & Spot cone, or full sphere \\
   Cubemap & Six faces (\code{IsCubeMap} / ENVMAP + face count) & Full sphere \\
   Spherical 2D & ENVMAP without six faces & Full sphere \\
   \bottomrule
 \end{tabular}
 \end{center}
+
+\code{ProjectedTextureMode} selects the planar mapping. Cubemap and spherical
+kinds ignore it.
 
 Spherical 2D maps use equirectangular sampling when width $\ge\tfrac{3}{2}$ height;
 otherwise an OpenGL-style spheremap / matcap projection. Cubemap VTFs (including
@@ -899,7 +956,27 @@ where $\vect{u}$ completes a right-handed basis. Texture coordinates are
 with framing factor $f=1$ for \code{ProjectedTextureMode=fill} (square sides on
 the cone; corners clipped) and $f=\sqrt{2}$ for \code{fit} (square inscribed in
 the cone). Samples with $(u,v)\notin[0,1]^{2}$ contribute zero (hard mask).
-Cubemap and spherical modes ignore the cone and evaluate over $4\pi$.
+Cubemap, spherical, HDRI, and six-face modes ignore the cone and evaluate over $4\pi$.
+
+\subsection{HDRI and six-face planar modes}
+
+\code{ProjectedTextureMode=hdri} samples the same 2D image as an
+equirectangular environment. With light-local components
+$x=\vect{\omega}\cdot\vect{r}$, $y=\vect{\omega}\cdot\vect{u}$,
+$z=\vect{\omega}\cdot\vect{b}$:
+\begin{equation}
+  u=\tfrac12+\frac{\operatorname{atan2}(x,z)}{2\pi},
+  \qquad
+  v=\frac{\arccos(y)}{\pi}.
+\end{equation}
+The top of the image ($v=0$) is light up; the center of the horizon
+($u=\tfrac12$, $v=\tfrac12$) is the beam. Longitude wraps, so the seam
+blends the first and last columns.
+
+\code{ProjectedTextureMode=6side} uses the cubemap face table below, but every
+face reads the single 2D image. Each face is the $90^{\circ}$ square of a
+cube ($\pm 45^{\circ}$ from its axis), and the full texture covers that square
+one-to-one. Entity angles rotate the six faces the same way as a cubemap.
 
 \subsection{Cubemap direction mapping}
 \label{sec:cubemap}
@@ -1011,9 +1088,25 @@ Under \flag{-pathtrace} $+$ \flag{-StaticPropLighting}:
 \begin{itemize}[leftmargin=1.4em]
   \item \textbf{Prop lightmap texels} --- same integrator as world luxels:
         spp, bounces, NEE, \flag{-pt\_aa} footprint, adaptive extra spp,
-        crease bias, and per-island denoise. Bounce hits on props use the
-        studio \vmt{basetexture} albedo (neutral grey only when the texture
-        is missing). Vertex lighting stays on the cheaper path below.
+        crease bias, and per-island denoise (including charts under 16
+        texels; the denoiser pads those). The $3\times3$ encode filter, gutter
+        dilate, and denoise flood do not cross onto a neighboring chart when
+        the texels are more than three luxels apart in world space or their
+        normals differ by more than about $60^{\circ}$, so a shared edge luxel
+        cannot smear one face's light onto the next. A triangle that misses
+        the grid, or whose sample is inside the mesh, is baked on its own
+        surface. The denoise pad is filled completely before the denoiser
+        runs, so a chart of only a few texels is not pulled black by empty
+        padding. Crease-bias probes ignore the
+        shading prop, so the mesh is not treated as a side wall. Direct
+        shadow rays ignore that prop's same-facing hits out to about eight
+        luxels, which is the tessellation speckle a flat brush face does not
+        have; an opposite-facing overhang still shadows, and anything farther
+        still shadows. Indirect rays only skip the immediate facet. Each
+        island then gets the same bright-spike clamp and high-contrast AA as
+        a brush face. Bounce hits on props use the studio \vmt{basetexture}
+        albedo (neutral grey only when the texture is missing). Vertex
+        lighting stays on the cheaper path below.
   \item \textbf{Vertex lighting} --- with \flag{-pt\_prop\_vertgrid}~$G>0$
         (default~$4$): each LOD0 triangle gets an $8\times8$ chart packed into a
         $64\times64$-cell atlas page ($512\times512$), inset by $1$ texel
@@ -1023,6 +1116,26 @@ Under \flag{-pathtrace} $+$ \flag{-StaticPropLighting}:
         Each vertex takes the closest valid sample from every adjacent
         triangle chart and averages those colours. Unlit verts inherit from
         nearest lit. $G=0$ $=$ old one-sample-per-vertex.
+  \item \textbf{One lightmap per material} --- the engine binds one lightmap
+        on a static prop. When a lightmapped model's default body uses more
+        than one material, the static-prop lump is rewritten as one prop per
+        material. Each prop points at a model packed in the BSP whose other
+        materials have no draw strips, and each gets its own
+        \texttt{texelslighting\_N.ppl}. Meshes of that material are rasterized
+        into the one image. The first instance keeps collision; the others
+        are non-solid.
+  \item \textbf{Overlapping UV islands} --- charts that cover the same
+        $[0,1]$ region cannot share that lightmap. Their overlap graph is
+        colored with as few colors as possible (exact when the graph has at
+        most 16 islands, DSATUR otherwise). Each color is one packed model.
+        Islands that only touch along a seam stay together. The same cut is
+        reused for every lightmapped instance of that model and material.
+        Higher LODs use that LOD's vertex buffer and keep the triangles that
+        sit on the matching LOD0 surface, so the mesh is still there when the
+        engine switches LOD. Collision stays
+        on the first instance. Each packed piece is path-traced only on the
+        texels and vertex-chart triangles it draws; the one-texel gutter of a
+        chart that already has samples is filled from that chart.
 \end{itemize}
 Override quality with \flag{-pt\_prop\_samples} /
 \flag{-pt\_prop\_bounces} (defaults: $\max(8,S/4)$ spp; bounces $=$ world).
@@ -1092,7 +1205,7 @@ displacements skipped. Disable with \flag{-nostitch}.
            \textbf{break}
   \EndIf
   \State $\beta\leftarrow\beta\cdot\rho_{\mathrm{hit}}$
-         \Comment{or spectral Reflect($\lambda$)}
+         \Comment{legacy Lambert, or $E_{\mathrm{wide}}$ / $E_{\mathrm{sharp}}$}
   \If{$k\ge 1$}
     \State Russian roulette on $\beta$
   \EndIf
@@ -1174,6 +1287,7 @@ displacements skipped. Disable with \flag{-nostitch}.
   \code{oklab.h} & Perceptual colour ops \\
   \code{vrad\_emit*.cpp} & Textured emission + area mesh \\
   \code{vrad\_filter.cpp} & Colored glass transmittance \\
+  \code{vrad\_brdf.cpp} & \vmt{vrad\_roughness} / \vmt{vrad\_metalness} bounce \\
   \code{vrad.cpp} / \code{vismat.cpp} & Classic radiosity loop \\
   \code{radial.cpp} & Bounce splat / weld \\
   \code{vrad\_gpu.*} & OpenCL BVH + gather \\

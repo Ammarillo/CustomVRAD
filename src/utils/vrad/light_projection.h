@@ -17,11 +17,14 @@ enum ProjKind_t
 	PROJ_SPHERE = 3,	// 2D spheremap / equirect / matcap tagged ENVMAP (omni)
 };
 
-// 2D planar framing relative to the outer cone.
+// How a planar 2D ProjectedTexture is mapped. Cubemaps and tagged spherical
+// maps ignore this and keep their own omnidirectional sampling.
 enum ProjFrameMode_t
 {
-	PROJ_FRAME_FILL = 0,	// square sides touch the cone (corners clipped)
-	PROJ_FRAME_FIT = 1,		// whole square inside the cone (corners on cone)
+	PROJ_FRAME_FILL = 0,		// square sides touch the cone (corners clipped)
+	PROJ_FRAME_FIT = 1,			// whole square inside the cone (corners on cone)
+	PROJ_FRAME_HDRI = 2,		// equirectangular full sphere (image up = light up)
+	PROJ_FRAME_SIXFACE = 3,		// same image on all 6 cube faces, 90° square each
 };
 
 struct ProjTex;
@@ -34,7 +37,8 @@ int Proj_GpuLayer( const ProjTex *p ); // after Proj_AssignGpuLayers / BuildGpuA
 bool Proj_IsEquirect( const ProjTex *p ); // spheremap uses latlong when wider than tall
 
 // RGB multiplier (1,1,1 if none). lightToSample = direction from light toward sample.
-// frameMode: FILL vs FIT (2D only; ignored for cubemaps).
+// frameMode applies to planar 2D only; cubemaps and spherical maps ignore it.
+// HDRI and six-face are omnidirectional (the outer cone is not a mask).
 Vector Proj_EvalRGB( const ProjTex *p, const Vector &beamDir, const Vector &rightDir,
 					 const Vector &upDir, float outerConeCos,
 					 const Vector &lightToSample, ProjFrameMode_t frameMode = PROJ_FRAME_FILL );
@@ -43,7 +47,8 @@ Vector Proj_EvalRGB( const ProjTex *p, const Vector &beamDir, const Vector &righ
 struct directlight_t;
 Vector Proj_EvalLightRGB( const directlight_t *dl, const Vector &lightToSample );
 
-// True when projection is omnidirectional (cubemap or 2D spheremap/equirect).
+// True when projection covers the full sphere (cubemap, spherical envmap,
+// or a planar map in HDRI / six-face mode). Those ignore the stock spot cone.
 bool Proj_IsOmniEnvmap( const directlight_t *dl );
 
 // Assign GPU layers for textures referenced by active lights; fill CPU-side

@@ -116,6 +116,9 @@
     <ClInclude Include="vrad_filter.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="vrad_brdf.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="lightmap.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -469,6 +472,9 @@
     <ClCompile Include="vrad_filter.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="vrad_brdf.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="absorb.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -548,6 +554,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="VRadStaticProps.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="prop_uv_split.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\..\public\zip_utils.cpp">

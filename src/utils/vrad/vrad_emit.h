@@ -14,6 +14,7 @@
 //   $vrad_emitmask        "path/to/mask"   - optional greyscale mask (R/luma)
 //   $vrad_emitmap         "path/to/color"  - optional emissive color map
 //   $vrad_emissivemap     ...              - alias for $vrad_emitmap
+//   $color                "[r g b]"         - tints emission (0-1 or 0-255); in-game + VRAD emit
 // If no emitmap: emission color comes from $basetexture (like -texbounce).
 
 bool VRadEmit_MaterialEmits( const char *pMaterialName );

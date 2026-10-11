@@ -48,8 +48,9 @@ void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv );
 bool PathTraceDXR_BakeWorldFaces();
 
 // GPU-bake static prop samples. bLightmapQuality=true -> same spp/bounces/NEE/AA/adaptive
-// as world luxels (prop lightmap texels). false -> cheaper vertex defaults
-// (-pt_prop_samples/bounces, hard NEE, no AA).
+// as world luxels (prop lightmap texels). Lightmap jobs also carry a near
+// self-skip (padU) so the prop's own tessellation does not speckle direct light.
+// false -> cheaper vertex defaults (-pt_prop_samples/bounces, hard NEE, no AA).
 // bEndSession=false keeps the GPU bake session open for additional chunks (same quality).
 // progressBase/progressTotal: overall stream progress (one \r line). total=0 -> no % (silent chunks).
 bool PathTraceDXR_BakePropSamples( const struct PtGpuBakeLuxel *samples, unsigned nSamples,
@@ -76,15 +77,25 @@ bool PathTraceDXR_CanBakeProps();
 void PathTraceDXR_ClearPropInstances();
 // shadowMatIndices: per-triangle index into shadow material DB (-1 = opaque). Optional.
 // triAlbedo: per-triangle linear RGB ($basetexture). x < 0 = unset (neutral grey).
+// triUV: nTris*6 floats (u0,v0,u1,v1,u2,v2), or null.
+// triMatNames: nTris material paths (studio texture name), or null.
 void PathTraceDXR_RegisterPropModel( int modelIdx, const class Vector *verts, int nTris,
 									 const int *shadowMatIndices = nullptr,
-									 const class Vector *triAlbedo = nullptr );
+									 const class Vector *triAlbedo = nullptr,
+									 const float *triUV = nullptr,
+									 const char **triMatNames = nullptr );
 
 // Place a luxel origin off the surface the same way world faces do (crease bias).
-void PathTraceDXR_LuxelOriginInFront( const class Vector &samplePos, const class Vector &faceNormal, float luxelWorld, class Vector &outPos );
+// skipTriId: triangle id to ignore while searching for a side wall (0 = none).
+// Prop lightmaps pass TRACE_ID_STATICPROP|prop so the mesh does not bias itself.
+void PathTraceDXR_LuxelOriginInFront( const class Vector &samplePos, const class Vector &faceNormal, float luxelWorld, class Vector &outPos, int skipTriId = 0 );
 
 // True when this captured triangle has a textured prop albedo (not the neutral fallback).
 bool PathTraceDXR_GetCapturedTriAlbedo( unsigned triIndex, class Vector &outLinearRGB );
+
+// Prop triangles store the studio material and mesh UVs. Null / false on world tris.
+const char *PathTraceDXR_CapturedTriMaterial( unsigned triIndex );
+bool PathTraceDXR_CapturedTriUV( unsigned triIndex, float outUv[6] );
 void PathTraceDXR_RegisterPropInstance( int propIndex, int modelIdx, const float xform[3][4] );
 
 void PathTraceDXR_Shutdown();

@@ -95,6 +95,13 @@ void InitMacroTexture( const char *pBSPFilename )
 		}
 	}
 
+	// Size the per-face table even when worldspawn is missing. ApplyMacroTextures
+	// indexes it for every lit luxel; an empty vector's base is NULL and that
+	// read faults (face index * pointer size).
+	g_FaceMacroTextures.SetSize( numfaces );
+	for ( int iFace = 0; iFace < numfaces; iFace++ )
+		g_FaceMacroTextures[iFace] = NULL;
+
 	if ( i == num_entities )
 	{
 		Warning( "MaskOnMacroTexture: can't find worldspawn" );
@@ -110,10 +117,8 @@ void InitMacroTexture( const char *pBSPFilename )
 
 	
 	// Now load the macro texture for each face.
-	g_FaceMacroTextures.SetSize( numfaces );
 	for ( int iFace=0; iFace < numfaces; iFace++ )
 	{
-		g_FaceMacroTextures[iFace] = NULL;
 
 		if ( iFace < g_FaceMacroTextureInfos.Count() )
 		{
@@ -158,7 +163,7 @@ void ApplyMacroTextures( int iFace, const Vector &vWorldPos, Vector &outLuxel )
 		outLuxel *= SampleMacroTexture( g_pGlobalMacroTextureData, vWorldPos );
 
 	// Now add the per-material macro texture.
-	if ( g_FaceMacroTextures[iFace] )
+	if ( iFace >= 0 && iFace < g_FaceMacroTextures.Count() && g_FaceMacroTextures[iFace] )
 		outLuxel *= SampleMacroTexture( g_FaceMacroTextures[iFace], vWorldPos );
 }
 

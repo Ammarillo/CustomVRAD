@@ -274,6 +274,7 @@
 
 @PointClass base(Targetname, Angles) iconsprite("editor/light_env.vmt") = light_environment :
 	"Special light used for lighting the entire map from the sky.\n" +
+	"A name does not turn off baked sunlight. PathRAD bakes a named sun as style 0, so direct light and bounce both stay in the lightmap (they will not toggle off).\n" +
 	"PathRAD LightTemperature / AmbientTemperature (K), 0 = use RGB.\n" +
 	"\n" +
 	"Typical sun:\n" +
@@ -333,7 +334,7 @@
 	"Spot light. PathRAD: set IES to an .ies photometric file to drive the beam shape. " +
 	"When IES is set, Inner/Outer cone and Focus are ignored for the bake (engine dynamic lighting still uses cones). " +
 	"Use IESBrightness for bake intensity (leave Brightness at 0 to disable engine dynamic light). " +
-	"ProjectedTexture: materials/ path to a planar VTF (framed to the outer cone) or cubemap / spherical envmap VTF; auto-detected. " +
+	"ProjectedTexture: materials/ path to a planar VTF (cone fill/fit, full-sphere HDRI, or 6 Side) or cubemap / spherical envmap VTF; auto-detected. " +
 	"If both IES and ProjectedTexture are set, IES acts as an angular mask on the projection. " +
 	"Editor: thin frustum = forward beam; yellow line appears when Target is set. " +
 	"Asymmetric IES/projection: rotate Yaw (or Roll) to spin around the beam.\n" +
@@ -350,7 +351,7 @@
 [
 	target(target_destination) : "Entity to point at" : : "The name of an entity in the map that the spotlight will point at. This will override the spotlight's angles."
 	_inner_cone(integer) : "Inner (bright) angle (ignored if IES set)" : 30 : "Inner spotlight cone degrees. Ignored for bake when IES is set."
-	_cone(integer) : "Outer (fading) angle (ignored if IES set)" : 45 : "Outer spotlight cone degrees. Ignored for bake when IES is set, except it still frames planar ProjectedTexture images. Still drives the editor cone preview."
+	_cone(integer) : "Outer (fading) angle (ignored if IES set)" : 45 : "Outer spotlight cone degrees. Ignored for bake when IES is set, except it still frames planar ProjectedTexture images in Fill/Fit. HDRI and 6 Side ignore the cone. Still drives the editor cone preview."
 	_exponent(integer) : "Focus (ignored if IES set)" : 1 : "Cone fringe exponent. Ignored for bake when IES is set."
 	_distance(integer) : "Maximum distance" : 0 : "This is the distance that light is allowed to cast, in inches."
 	pitch(angle_negative_pitch) : "Pitch" : -90
@@ -359,11 +360,13 @@
 	IESScale(float) : "IES Scale" : "1" : "Scales IES angular response (1 = peak matches bake brightness)."
 	IESBrightness(float) : "IES Brightness" : "-1" : "Bake brightness (same units as _light 4th). -1 = use stock Brightness. When >= 0, overrides stock brightness for the lightmap bake only - engine worldlights still use Brightness above (set that to 0 to disable dynamic light)."
 	IESMaxIntensity(float) : "IES Max Lightmap Intensity" : "0" : "Caps max RGB of this light's direct contribution per luxel sample (0 = off). Use to tame hot IES peaks without lowering overall brightness."
-	ProjectedTexture(string) : "Projected Texture" : "" : "Material path under materials/ (e.g. lights/gobos/logo). Planar VTF = framed to outer cone; cubemap = omnidirectional. Auto-detected. Bake-only. Multiplies light RGB; with IES, IES masks the projection."
-	ProjectedTextureMode(choices) : "2D Projection Mode" : "fill" : "How a planar ProjectedTexture is framed in the outer cone. Ignored for cubemaps / spherical maps." =
+	ProjectedTexture(string) : "Projected Texture" : "" : "Material path under materials/ (e.g. lights/gobos/logo). Planar VTF uses 2D Projection Mode (cone fill/fit, HDRI sphere, or 6 Side). Cubemap = omnidirectional. Auto-detected. Bake-only. Multiplies light RGB; with IES, IES masks the projection."
+	ProjectedTextureMode(choices) : "2D Projection Mode" : "fill" : "How a planar ProjectedTexture is projected. HDRI and 6 Side cover the full sphere and ignore the outer cone. Ignored for cubemaps / spherical maps." =
 	[
 		"fill" : "Fill - square sides touch the cone (corners clipped)"
 		"fit" : "Fit - whole square inside the cone (corners visible)"
+		"hdri" : "HDRI - equirectangular full sphere (image up = light up)"
+		"6side" : "6 Side - same image on all six faces, 90 degree square each"
 	]
 	LightTemperature(float) : "Color Temperature (K)" : "0" : "Optional blackbody CCT in Kelvin. 0 = keep Brightness RGB. When set, RGB is replaced; brightness (4th number) is kept. Also tints the exported engine worldlight.\n" +
 		"\n" +

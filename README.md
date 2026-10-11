@@ -209,12 +209,14 @@ vrad.exe -config full -underwater -game "C:\Program Files (x86)\Steam\steamapps\
 | `bake_volume` | Brush | Rebake only samples inside the brush; keep the rest from last compile. |
 | `light_spot` IES / projected VTF | Keys | Bake-only beam shape / gobo. Engine cone keys stay for dynamic light. |
 | `LightTemperature` / `AmbientTemperature` | Key | Kelvin on `light`, `light_spot`, `light_volume`, `light_environment`, and `light_env_vol`. Replaces RGB, keeps brightness. `0` = use the color pickers. |
+| Named `light_environment` | Bake | Still bakes direct sun and bounce. The name does not toggle that sunlight off. |
 | Soft sun | Bake | Cone of sun rays instead of a hard disk. |
 | `-pathtrace` | CLI | DXR path tracer (GPU RayQuery by default). |
 | `-pt_spectral` | CLI | Hero-wavelength color on GPU (default). `-pt_nospectral` = RGB. |
 | `-underwater` / `-uw_volume` | CLI | Water extinction, or full volume path tracing in water. |
 | `$vrad_emit*` | VMT | Textured emission. Path tracer treats it as an area light. |
 | `$vrad_filter*` | VMT | Colored glass (path tracer only). |
+| `$vrad_roughness*` / `$vrad_metalness*` | VMT | How the surface bounces. Scalar or a map. Compile only. |
 | `-gpu` | CLI | OpenCL bounce gather (classic path). |
 | `-config` | CLI | Load flags from a text file. |
 | Seam stitch / edge pull | Bake | On by default. Stitch split faces; pull edge samples inward. |
@@ -405,10 +407,19 @@ Material under `materials/`. Detected from the VTF:
 
 | Mode | Detection | Domain |
 | --- | --- | --- |
-| Planar 2D | Ordinary 2D VTF | Outer cone (`fill` / `fit`) |
+| Planar 2D | Ordinary 2D VTF | Outer cone (`fill` / `fit`), or full sphere (`hdri` / `6side`) |
 | Envmap / cubemap | Cubemap VTF | Full sphere; entity angles rotate it |
 
-Projected RGB multiplies intensity. With IES, the table is an angular mask. Cubemap UVs follow Direct3D / Source `CUBEMAP_FACE_*` (Z-up).
+`ProjectedTextureMode` applies to ordinary 2D VTFs. Cubemaps and tagged spherical maps ignore it.
+
+| `ProjectedTextureMode` | What it does |
+| --- | --- |
+| `fill` (default) | Square sides touch the outer cone; corners clipped |
+| `fit` | Whole square inside the outer cone |
+| `hdri` | Equirectangular full sphere. Image top is light up; the center of the horizon is the beam. Cone ignored |
+| `6side` | Same image on all six cube faces. Each face is a 90° square (1:1). Cone ignored |
+
+Projected RGB multiplies intensity. With IES, the table is an angular mask. Cubemap and 6 Side UVs follow Direct3D / Source `CUBEMAP_FACE_*` (Z-up).
 
 ### Color temperature (`LightTemperature`)
 
@@ -464,6 +475,7 @@ The last luxel on a concave edge is often much darker than the rest of the face.
 | `$vrad_emitdensity` | `1` | Finer patch chop |
 | `$vrad_emitmask` | unset | Greyscale mask |
 | `$vrad_emitmap` / `$vrad_emissivemap` | unset | Color map; else `$basetexture` |
+| `$color` | white | Tints sampled emit RGB (Unlit/Lightmapped `$color` syntax) |
 
 Path tracing: fan-triangulated area mesh (`-pt_emit_samples`, default **64**; `0` = all tris). Classic: `emit_surface` proxies + self-illum. Worldlights cap **65536**.
 
@@ -483,11 +495,51 @@ Path tracing only. Ordinary `$translucent` does **not** tint light unless `$vrad
 
 Stacked panes mix in Oklab (L multiply, a,b add); energy stays linear. Up to 64 filter hits; entrance/exit on the same sheet are merged within 12 units.
 
+### Roughness and metalness (`$vrad_roughness*` / `$vrad_metalness*`)
+
+Compile-time only. The game does not read these. Leave them off and the surface stays the old diffuse bounce.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `$vrad_roughness` | `1` | `0` = mirror, `1` = fully rough |
+| `$vrad_roughnessmap` | unset | Linear greyscale VTF, **R** channel. `0` = smooth, `1` = rough |
+| `$vrad_metalness` | `1` if omitted | `0` = paint / stone / plastic, `1` = metal |
+| `$vrad_metalnessmap` | unset | Linear greyscale VTF, **R** channel |
+| `$vrad_metallic` / `$vrad_metallicmap` | unset | Aliases of the metalness keys |
+
+A map replaces the scalar per texel. If you set both, the scalar multiplies the map. A map with no scalar uses the map as-is.
+
+Leaving metalness off on a material that sets roughness treats it as metal. A mirror is `$vrad_roughness 0` with metalness omitted or set to `1` (white albedo = chrome, colored albedo = gold, copper, and so on). Explicit `$vrad_metalness 0` is paint: roughness 0 keeps about 4% of the bounce in a sharp reflection and the rest diffuse. A rough metal still color-bleeds, but as a wide lobe instead of a mirror. Materials with none of these keys stay the old diffuse bounce.
+
+The luxel you are lighting stays diffuse. Source multiplies the lightmap by `$basetexture` in game. These keys change how **other** surfaces bounce light onto it.
+
+Path tracing (GPU) samples the maps on brushes and on static-prop meshes. Classic radiosity only keeps the diffuse part, so a smooth metal stops filling the room and a rough metal still does. The CPU path tracer applies the same split on brush faces.
+
+Glossy surfaces still reflect. A reflection that would hit the face beside the seam is replaced by the diffuse bounce, which is what was speckling the edge. Reflections that clear that seam stay. Direct lights (point, spot, sun, `emit_surface`, and `$vrad_emit`) also connect through the surface. Roughness `0` is sharp and counts only the triangle the ray lands in. Higher roughness widens that beam around the real reflection: a miss counts only while the bounce angle at that point is still in the lobe, so the ceiling and the far walls stay dark. Roughness `1` stays diffuse.
+
+```
+"LightmappedGeneric"
+{
+    "$basetexture" "metal/chrome"
+    "$vrad_roughness" "0"
+    "$vrad_metalness" "1"
+}
+```
+
+```
+"LightmappedGeneric"
+{
+    "$basetexture" "concrete/floor"
+    "$vrad_roughnessmap" "concrete/floor_rough"
+    "$vrad_metalness" "0"
+}
+```
+
 ---
 
 ## Path tracing (`-pathtrace` / `-dxr`)
 
-Unidirectional diffuse paths with next-event estimation at every bounce. Default backend: **GPU RayQuery** (`-pt_gpu`). `-pt_cpu` forces the SSE CPU path (RGB only; no spectral).
+Unidirectional paths with next-event estimation at every bounce. Materials without `$vrad_roughness` / `$vrad_metalness` stay diffuse. Authored materials split that bounce into a diffuse lobe and a glossy lobe. Default backend: **GPU RayQuery** (`-pt_gpu`). `-pt_cpu` forces the SSE CPU path (RGB only; no spectral).
 
 **Spectral (GPU default):** `-pt_spectral` — four wavelengths, Smits RGB↔spectrum, CIE 1931 → linear sRGB (white-balanced). Saturated red lights stay red. `-pt_nospectral` for linear RGB.
 
@@ -497,7 +549,13 @@ Needs a DXR GPU. Easiest path: `-config full` with the path-trace flags uncommen
 
 ### Static props
 
-With `-StaticPropLighting`, the GPU baker lights prop lightmap texels and prop vertices. Prop lightmaps use the same path as brush luxels: world spp and bounces, `-pt_aa`, adaptive extra samples, the same crease bias, and `-pt_denoise` per UV island. Bounce off a prop uses that model's `$basetexture` albedo. Vertices stay cheaper: **8×8** per-triangle charts packed into a **64×64**-cell atlas (`-pt_prop_vertgrid`, default **4**; `0` = one sample per vert). Charts are hole-filled and can be denoised (`-pt_denoise`). Each vertex takes the closest sample from every adjacent triangle and averages them. Override vertex quality with `-pt_prop_samples` / `-pt_prop_bounces`. Classic prop path: 4-wide SSE direct + optional GPU bounce cull.
+With `-StaticPropLighting`, the GPU baker lights prop lightmap texels and prop vertices. Prop lightmaps use the same path as brush luxels: world spp and bounces, `-pt_aa`, adaptive extra samples, the same crease bias, and `-pt_denoise` per UV island. The 3×3 encode filter, the gutter dilate, and that denoise stay on one surface: a neighboring chart is left alone when its texels are farther than a few luxels in world space or the normals differ by more than about 60°. That is what stops a colored light from bleeding across a rock edge where two islands share a luxel. A triangle that misses the luxel grid, or whose sample sits inside the mesh, is baked on its own surface instead of borrowing the neighbor chart, and a small chart's denoise pad is filled before the denoiser runs so the pad cannot turn the triangle black. Bounce off a prop uses that model's `$basetexture` albedo. Vertices stay cheaper: **8×8** per-triangle charts packed into a **64×64**-cell atlas (`-pt_prop_vertgrid`, default **4**; `0` = one sample per vert). Charts are hole-filled and can be denoised (`-pt_denoise`). Each vertex takes the closest sample from every adjacent triangle and averages them. Override vertex quality with `-pt_prop_samples` / `-pt_prop_bounces`. Classic prop path: 4-wide SSE direct + optional GPU bounce cull.
+
+A lightmapped prop whose default body uses more than one material is written into the BSP as one static prop per material. The engine binds a single lightmap on the whole prop, so each material gets its own instance and its own lightmap. The packed model draws only that material. The first instance keeps collision; the others are non-solid and sit on the same origin.
+
+A lightmapped prop whose UV islands cover the same 0–1 region is packed the same way, into as few extra models as possible. Islands that only share a seam stay on one model. Every other lightmapped copy of that model gets the same cut. Higher LODs keep the triangles that sit on that piece of the LOD0 mesh. The packed vtx drops the other islands (degenerate triangles); mdl and vvd stay the original mesh.
+
+After those splits VRAD prints the map totals: original static props and unique models, how many copies the splits added, and each split model with its piece count, how many times it was placed, and whether the cut was materials, UV islands, or both. Each piece is lit on its own texels only. The 1px gutter around a chart that already has samples is filled from that chart, and vertex lighting skips triangles the piece does not draw.
 
 ### Detail props
 

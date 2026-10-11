@@ -6,6 +6,7 @@
 
 #include "pathtrace_dxr.h"
 #include "pathtrace_dxr_device.h"
+#include "vrad_brdf.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -49,7 +50,12 @@ struct PtHostTri
 	Vector	a, b, c;
 	uint32	flags;	// TRACE_ID_*
 	Vector	albedo;	// linear RGB; x < 0 = unset
+	int		matName;	// index into g_ptMatNames, -1 = use face texdata
+	float	uv[6];		// mesh UVs when hasUv
+	bool	hasUv;
 };
+
+static std::vector<std::string> g_ptMatNames;
 
 static std::vector<PtHostTri>	g_ptTris;
 static bool						g_bPtCaptureDone = false;
@@ -62,6 +68,8 @@ struct PtPropModelMesh
 	std::vector<Vector> verts; // nTris * 3, local space
 	std::vector<int> shadowMats; // nTris, -1 = opaque
 	std::vector<Vector> albedo; // nTris linear RGB; x < 0 = unset
+	std::vector<float> uvs; // nTris * 6, empty if none
+	std::vector<int> matNames; // nTris index into g_ptMatNames, -1 = none
 };
 struct PtPropInstanceRec
 {
@@ -81,7 +89,8 @@ void PathTraceDXR_ClearPropInstances()
 }
 
 void PathTraceDXR_RegisterPropModel( int modelIdx, const Vector *verts, int nTris,
-									 const int *shadowMatIndices, const Vector *triAlbedo )
+									 const int *shadowMatIndices, const Vector *triAlbedo,
+									 const float *triUV, const char **triMatNames )
 {
 	if ( !verts || nTris <= 0 )
 		return;
@@ -96,6 +105,7 @@ void PathTraceDXR_RegisterPropModel( int modelIdx, const Vector *verts, int nTri
 	m.verts.assign( verts, verts + nTris * 3 );
 	m.shadowMats.assign( (size_t)nTris, -1 );
 	m.albedo.assign( (size_t)nTris, Vector( -1.0f, -1.0f, -1.0f ) );
+	m.matNames.assign( (size_t)nTris, -1 );
 	if ( shadowMatIndices )
 	{
 		for ( int i = 0; i < nTris; ++i )
@@ -105,6 +115,18 @@ void PathTraceDXR_RegisterPropModel( int modelIdx, const Vector *verts, int nTri
 	{
 		for ( int i = 0; i < nTris; ++i )
 			m.albedo[i] = triAlbedo[i];
+	}
+	if ( triUV )
+		m.uvs.assign( triUV, triUV + (size_t)nTris * 6u );
+	if ( triMatNames )
+	{
+		for ( int i = 0; i < nTris; ++i )
+		{
+			if ( !triMatNames[i] || !triMatNames[i][0] )
+				continue;
+			m.matNames[i] = (int)g_ptMatNames.size();
+			g_ptMatNames.push_back( triMatNames[i] );
+		}
 	}
 	g_ptPropModels.push_back( std::move( m ) );
 }
@@ -157,6 +179,9 @@ void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv )
 		h.c = tri.Vertex( 2 );
 		h.flags = (uint32)tri.m_Data.m_GeometryData.m_nTriangleID;
 		h.albedo.Init( -1.0f, -1.0f, -1.0f );
+		h.matName = -1;
+		h.hasUv = false;
+		memset( h.uv, 0, sizeof( h.uv ) );
 		if ( bInstanced && ( h.flags & TRACE_ID_STATICPROP ) )
 			continue; // unique-model BLASes + TLAS instances
 		g_ptTris.push_back( h );
@@ -178,10 +203,20 @@ void PathTraceDXR_CaptureScene( RayTracingEnvironment &rtEnv )
 				h.b = m.verts[t * 3 + 1];
 				h.c = m.verts[t * 3 + 2];
 				h.flags = TRACE_ID_STATICPROP;
+				h.matName = -1;
+				h.hasUv = false;
+				memset( h.uv, 0, sizeof( h.uv ) );
 				if ( t < m.albedo.size() )
 					h.albedo = m.albedo[t];
 				else
 					h.albedo.Init( -1.0f, -1.0f, -1.0f );
+				if ( t < m.matNames.size() )
+					h.matName = m.matNames[t];
+				if ( m.uvs.size() >= (size_t)( t + 1 ) * 6u )
+				{
+					memcpy( h.uv, &m.uvs[t * 6u], sizeof( h.uv ) );
+					h.hasUv = true;
+				}
 				g_ptTris.push_back( h );
 				g_ptShadowMats.push_back( ( t < m.shadowMats.size() ) ? m.shadowMats[t] : -1 );
 			}
@@ -566,6 +601,12 @@ bool PathTraceDXR_DeviceInit( int adapterIndex )
 	qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 	if ( FAILED( g_ptDev.device->CreateCommandQueue( &qd, IID_PPV_ARGS( &g_ptDev.queue ) ) ) )
 		return false;
+
+	// Keep the desktop compositor scheduled while the bake saturates the GPU.
+	// Priority is relative (-7..7); -7 is the lowest.
+	ComPtr<IDXGIDevice> dxgiDev;
+	if ( SUCCEEDED( g_ptDev.device.As( &dxgiDev ) ) )
+		dxgiDev->SetGPUThreadPriority( -7 );
 	if ( FAILED( g_ptDev.device->CreateCommandAllocator( D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS( &g_ptDev.alloc ) ) ) )
 		return false;
 	if ( FAILED( g_ptDev.device->CreateCommandList( 0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_ptDev.alloc.Get(), nullptr,
@@ -970,7 +1011,7 @@ bool PathTraceDXR_DeviceReady()
 static bool PathTraceDXR_TraceClosest_CPU( const Vector *origins, const Vector *dirs,
 										   const float *tmins, const float *tmaxs,
 										   float *outT, uint32 *outFlags, uint32 *outHit,
-										   Vector *outNormal, int nRays )
+										   Vector *outNormal, int nRays, int skipTriId )
 {
 	for ( int base = 0; base < nRays; base += 4 )
 	{
@@ -1024,7 +1065,8 @@ static bool PathTraceDXR_TraceClosest_CPU( const Vector *origins, const Vector *
 
 		fltx4 len = LoadUnalignedSIMD( tmaxLocal );
 		RayTracingResult rt_result;
-		g_RtEnv.Trace4Rays( myrays, Four_Zeros, len, &rt_result, TRACE_ID_STATICPROP | (unsigned)-1, nullptr );
+		const int skipId = skipTriId ? skipTriId : (int)( TRACE_ID_STATICPROP | (unsigned)-1 );
+		g_RtEnv.Trace4Rays( myrays, Four_Zeros, len, &rt_result, skipId, nullptr );
 
 		const int nTris = g_RtEnv.OptimizedTriangleList.Count();
 		for ( int i = 0; i < count; ++i )
@@ -1236,7 +1278,8 @@ static bool PathTraceDXR_TraceClosest_GPU( const Vector *origins, const Vector *
 
 
 bool PathTraceDXR_TraceClosest( const Vector *origins, const Vector *dirs, const float *tmins, const float *tmaxs,
-								float *outT, uint32 *outFlags, uint32 *outHit, int nRays, Vector *outNormal )
+								float *outT, uint32 *outFlags, uint32 *outHit, int nRays, Vector *outNormal, int skipTriId,
+								bool bForceCpu )
 {
 	if ( nRays <= 0 )
 		return false;
@@ -1246,12 +1289,13 @@ bool PathTraceDXR_TraceClosest( const Vector *origins, const Vector *dirs, const
 
 	// Large batches: DXR RayQuery (Frostbite/Bakery style). Tiny batches: SSE (avoids submit overhead).
 	// Instanced prop TLAS needs PrimBase remap in the RayQuery CS - keep SSE for that path.
-	if ( g_ptDev.ready && nRays >= (int)kPtGpuMinRays && !g_ptDev.useInstancedAS )
+	// bForceCpu: embed-mask / FinalLightFace must not take the GPU mutex.
+	if ( !bForceCpu && g_ptDev.ready && nRays >= (int)kPtGpuMinRays && !g_ptDev.useInstancedAS )
 	{
 		if ( PathTraceDXR_TraceClosest_GPU( origins, dirs, tmins, tmaxs, outT, outFlags, outHit, outNormal, nRays ) )
 			return true;
 	}
-	return PathTraceDXR_TraceClosest_CPU( origins, dirs, tmins, tmaxs, outT, outFlags, outHit, outNormal, nRays );
+	return PathTraceDXR_TraceClosest_CPU( origins, dirs, tmins, tmaxs, outT, outFlags, outHit, outNormal, nRays, skipTriId );
 }
 
 #include "pathtrace_dxr_gpu_bake.inl"

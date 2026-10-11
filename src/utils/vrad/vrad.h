@@ -116,11 +116,11 @@ struct directlight_t
 
 	// light_spot ProjectedTexture (bake-only). Auto 2D cookie or cubemap.
 	// When set with IES, IES is an angular mask multiplied onto the projection RGB.
-	// Cubemap mode is omnidirectional (spot cone ignored).
+	// Cubemap, spherical, HDRI, and six-face modes are omnidirectional (spot cone ignored).
 	const struct ProjTex *m_pProj;
 	Vector	m_vecProjRight;
 	Vector	m_vecProjUp;
-	int		m_nProjFrameMode;	// ProjFrameMode_t: FILL or FIT (2D)
+	int		m_nProjFrameMode;	// ProjFrameMode_t (planar 2D: fill/fit/hdri/six-face)
 
 	directlight_t(void)
 	{

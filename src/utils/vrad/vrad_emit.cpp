@@ -34,6 +34,7 @@ struct EmitMaterial_t
 	bool enabled;
 	float strength;		// lights.rad-style scaler
 	float density;		// 1 = default; higher = denser lights / finer chop
+	Vector colorTint;	// VMT $color (linear mult on sampled emit RGB)
 	EmitRGBATexture_t *pColor;	// emitmap or basetexture
 	EmitRGBATexture_t *pMask;	// optional
 	char colorName[MAX_PATH];
@@ -256,6 +257,29 @@ static float ParseFloatOrDefault( const char *p, float def )
 	return (float)atof( p );
 }
 
+static void ParseVmtColorTint( KeyValues *pVMT, Vector &outTint )
+{
+	outTint.Init( 1.0f, 1.0f, 1.0f );
+	if ( !pVMT )
+		return;
+	const char *pStr = pVMT->GetString( "$color", NULL );
+	if ( !pStr || !pStr[0] )
+		return;
+	float r = 1.0f, g = 1.0f, b = 1.0f;
+	if ( pStr[0] == '[' )
+		++pStr;
+	sscanf( pStr, "%f %f %f", &r, &g, &b );
+	if ( r > 1.0f || g > 1.0f || b > 1.0f )
+	{
+		r *= ( 1.0f / 255.0f );
+		g *= ( 1.0f / 255.0f );
+		b *= ( 1.0f / 255.0f );
+	}
+	outTint.x = clamp( r, 0.0f, 1.0f );
+	outTint.y = clamp( g, 0.0f, 1.0f );
+	outTint.z = clamp( b, 0.0f, 1.0f );
+}
+
 static bool ParseBoolish( const char *p )
 {
 	if ( !p || !p[0] )
@@ -354,6 +378,7 @@ static EmitMaterial_t *ParseEmitMaterial( const char *pMaterialName )
 	memset( pMat, 0, sizeof( *pMat ) );
 	pMat->strength = 0.0f;
 	pMat->density = 1.0f;
+	pMat->colorTint.Init( 1.0f, 1.0f, 1.0f );
 
 	if ( !Q_strnicmp( pLookup, "tools/", 6 ) ||
 		 !Q_strnicmp( pLookup, "skybox/", 7 ) )
@@ -392,6 +417,7 @@ static EmitMaterial_t *ParseEmitMaterial( const char *pMaterialName )
 			Q_strncpy( szMap, em, sizeof( szMap ) );
 		if ( bt && bt[0] )
 			Q_strncpy( szBase, bt, sizeof( szBase ) );
+		ParseVmtColorTint( pVMT, pMat->colorTint );
 		pVMT->deleteThis();
 	}
 
@@ -523,9 +549,9 @@ static bool SampleEmitAtPos( int facenum, const Vector &worldPos, Vector &outEmi
 		return false;
 
 	// Match lights.rad / LightForString: sRGB -> linear * 255, then * (strength/255) * lightscale
-	float r = powf( rgba[0] / 255.0f, 2.2f ) * 255.0f;
-	float g = powf( rgba[1] / 255.0f, 2.2f ) * 255.0f;
-	float b = powf( rgba[2] / 255.0f, 2.2f ) * 255.0f;
+	float r = powf( rgba[0] / 255.0f, 2.2f ) * 255.0f * pMat->colorTint.x;
+	float g = powf( rgba[1] / 255.0f, 2.2f ) * 255.0f * pMat->colorTint.y;
+	float b = powf( rgba[2] / 255.0f, 2.2f ) * 255.0f * pMat->colorTint.z;
 	const float scale = ( pMat->strength / 255.0f ) * mask * lightscale;
 	outEmit.x = r * scale;
 	outEmit.y = g * scale;

@@ -16,6 +16,7 @@
 #include "vmpi.h"
 #include "macro_texture.h"
 #include "bounce_albedo.h"
+#include "vrad_brdf.h"
 #include "bounce_vol.h"
 #include "oklab.h"
 #include "vmpi_tools_shared.h"
@@ -2374,6 +2375,9 @@ bool RadWorld_Go()
 
 	if ( !bPathTraced )
 	{
+		if ( g_bVRadGPURequested && !VRadGPU_IsActive() )
+			VRadGPU_InitAfterScene();
+
 		// build initial facelights
 #ifdef MPI
 		if (g_bUseMPI)
@@ -2436,6 +2440,7 @@ bool RadWorld_Go()
 
 			// Per-patch albedo from $basetexture (color bleed) before radiosity gather
 			RefineTexturedBounceReflectivity();
+			VRadBrdf_ApplyPatchReflectivity();
 
 			// spread light around
 			BounceLight ();
@@ -2462,6 +2467,9 @@ bool RadWorld_Go()
 					 VRadGPU_HasScene() ? " [GPU occlusion]" : " [CPU]",
 					 AO_ShouldApplyToLightmaps() ? "" : " (skipped on pathtrace GI — use -ao_force to override)" );
 			}
+			// Embed-mask traces used to run inside FinalLightFace via DXR.
+			// 32 workers serialized on the GPU mutex and the pacifier stayed at 0.
+			PrecomputeLuxelEmbedMasks();
 			RunThreadsOnIndividual (numfaces, true, FinalLightFace);
 
 			// Keep prior lighting on faces/luxels outside bake_volume, then stitch.
@@ -2518,6 +2526,38 @@ void InitDumpPatchesFiles()
 }
 
 extern IFileSystem *g_pOriginalPassThruFileSystem;
+
+// vvis++ keeps prim indices in a 65536-short static buffer. Maps with more
+// indices overflow that buffer into numfaces and the front of dfaces, and the
+// rewritten LUMP_FACES is a short run of zeros. VBSP mirrors the real faces
+// into LUMP_FACES_HDR, which sits past the overflow and survives vis.
+static void RestoreFacesClobberedByVis()
+{
+	if ( nummodels <= 0 || numfaces_hdr <= 0 || numfaces_hdr > MAX_MAP_FACES )
+		return;
+
+	int span = 0;
+	for ( int i = 0; i < nummodels; ++i )
+		span += dmodels[i].numfaces;
+
+	if ( span != numfaces_hdr || numfaces == span )
+		return;
+
+	int live = 0;
+	const int nCheck = ( span < 32 ) ? span : 32;
+	for ( int i = 0; i < nCheck; ++i )
+	{
+		if ( dfaces_hdr[i].numedges > 0 )
+			++live;
+	}
+	if ( live == 0 )
+		return;
+
+	Warning( "LUMP_FACES was truncated to %d faces (models reference %d). Restoring from LUMP_FACES_HDR.\n",
+		numfaces, span );
+	memcpy( dfaces, dfaces_hdr, (size_t)span * sizeof( dfaces[0] ) );
+	numfaces = span;
+}
 
 void VRAD_LoadBSP( char const *pFilename )
 {
@@ -2584,6 +2624,7 @@ void VRAD_LoadBSP( char const *pFilename )
 	VMPI_SetCurrentStage( "LoadBSPFile" );
 #endif
 	LoadBSPFile (source);
+	RestoreFacesClobberedByVis();
 
 	LoadLightmapCharts();
 
@@ -2703,8 +2744,13 @@ void VRAD_LoadBSP( char const *pFilename )
 	float end = Plat_FloatTime();
 	printf ( "Done (%.2f seconds)\n", end-start );
 
-	if ( g_bVRadGPURequested )
+	// OpenCL bounce gather is unused once -pathtrace owns world lighting. Building
+	// that second BVH and kernel on every compile keeps another full device live
+	// next to DXR and is what makes back-to-back bakes hitch the desktop harder.
+	if ( g_bVRadGPURequested && !PathTraceDXR_IsRequested() )
 		VRadGPU_InitAfterScene();
+	else if ( g_bVRadGPURequested )
+		Msg( "[VRAD-GPU] OpenCL bounce gather deferred (-pathtrace). Classic -gpu still runs if path trace falls back.\n" );
 
 #if 0  // To test only k-d build
 	exit(0);

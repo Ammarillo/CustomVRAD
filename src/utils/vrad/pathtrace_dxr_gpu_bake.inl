@@ -30,6 +30,9 @@ Texture2DArray<float4> ProjCubes : register(t24); // 6 faces per cubemap
 StructuredBuffer<float4> WaterVols : register(t25); // 5 x float4 per water body
 StructuredBuffer<float4> AlphaMeta : register(t26); // 3 x float4 per tri (texture shadows)
 Texture2DArray<float4> AlphaArray : register(t27);
+StructuredBuffer<float4> SurfMeta : register(t28); // 3 x float4 per tri (roughness / metalness)
+Texture2DArray<float4> SurfArray : register(t29); // R = roughness, G = metalness
+StructuredBuffer<float4> MirrorTris : register(t30); // 5 x float4 per smooth mirror tri
 RWStructuredBuffer<float4> OutRGB : register(u0);
 SamplerState g_ptLinearClamp : register(s0);
 
@@ -66,7 +69,7 @@ cbuffer CB : register(b0)
 	uint WaterVolCount;
 	uint WaterMode;		// 0=off, 1=Beer+Kd, 2=volume
 	uint UwMaxScatter;
-	uint WaterPad;
+	uint MirrorCount; // smooth mirror triangles (virtual-light connection)
 };
 
 #ifndef PT_ENABLE_VOLUMES
@@ -416,18 +419,31 @@ float3 CosineHemi( float3 n, float u1, float u2 )
 	return normalize( d );
 }
 
-bool ShouldSkipStaticProp( uint flags, int skipProp )
+// nearMode 0: drop every hit on skipProp (no-self-shadow).
+// nearMode 1: drop same-facing hits within nearSkip (tessellation speckle on
+//             lightmapped props). Opposite-facing overhangs still occlude.
+// nearMode 2: drop only hits closer than nearSkip (immediate facet acne).
+bool SkipPropHit( uint flags, int skipProp, float tHit, float nearSkip, float3 hitN, float3 shadeN, int nearMode )
 {
 	if ( skipProp < 0 )
 		return false;
 	if ( ( flags & TRACE_ID_STATICPROP ) == 0 )
 		return false;
-	return (int)( flags & 0x00FFFFFFu ) == skipProp;
+	if ( (int)( flags & 0x00FFFFFFu ) != skipProp )
+		return false;
+	if ( nearMode == 0 || nearSkip <= 0.0f )
+		return true;
+	if ( nearMode == 2 )
+		return tHit <= nearSkip;
+	if ( tHit <= 1.5f )
+		return true;
+	return tHit <= nearSkip && dot( hitN, shadeN ) > 0.5f;
 }
 
 // UseInstancedAS / PrimBase (t20): Phase-2 multi-BLAS (world + unique models). Flat AS uses identity.
 
 bool TraceClosest( float3 o, float3 d, float tmin, float tmax, int skipProp,
+				   float nearSkip, float3 shadeN, int nearMode,
 				   out float tHit, out uint flags, out uint prim, out float3 nHit, out float2 bary )
 {
 	tHit = -1;
@@ -479,13 +495,15 @@ bool TraceClosest( float3 o, float3 d, float tmin, float tmax, int skipProp,
 			float3 c = Verts[prim * 3 + 2];
 			nHit = normalize( cross( b - a, c - a ) );
 		}
-		if ( ShouldSkipStaticProp( flags, skipProp ) )
+		float3 faceN = nHit;
+		if ( dot( faceN, d ) > 0 )
+			faceN = -faceN;
+		if ( SkipPropHit( flags, skipProp, tHit, nearSkip, faceN, shadeN, nearMode ) )
 		{
 			curT = tHit + max( 0.15f, abs( tHit ) * 1e-5f + 1e-3f );
 			continue;
 		}
-		if ( dot( nHit, d ) > 0 )
-			nHit = -nHit;
+		nHit = faceN;
 		return true;
 	}
 	return false;
@@ -963,7 +981,7 @@ bool FilterIsSheetExit( float t, float3 faceN, float lastT, float3 lastN )
 
 // RGB transmittance (1 = clear). Stacked panes: photographic gel multiply T0*T1*...
 // seed: for stochastic alpha-tested foliage (Enderton-style).
-float3 VisRGB( float3 from, float3 to, int skipProp, uint seed )
+float3 VisRGB( float3 from, float3 to, int skipProp, uint seed, float nearSkip, float3 shadeN, int nearMode )
 {
 	float3 delta = to - from;
 	float dist = length( delta );
@@ -984,7 +1002,7 @@ float3 VisRGB( float3 from, float3 to, int skipProp, uint seed )
 		if ( tmax <= tmin + 1e-4f )
 			break;
 		float t; uint flags, prim; float3 nHit; float2 bary;
-		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, t, flags, prim, nHit, bary ) )
+		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, nearSkip, shadeN, nearMode, t, flags, prim, nHit, bary ) )
 			return T * WaterSegT( from, to );
 		if ( flags & TRACE_ID_SKY )
 			return T * WaterSegT( from, from + delta * t );
@@ -1030,13 +1048,13 @@ float3 VisRGB( float3 from, float3 to, int skipProp, uint seed )
 	return T * WaterSegT( from, to );
 }
 
-bool Occluded( float3 from, float3 to, int skipProp, uint seed )
+bool Occluded( float3 from, float3 to, int skipProp, uint seed, float nearSkip, float3 shadeN, int nearMode )
 {
-	float3 T = VisRGB( from, to, skipProp, seed );
+	float3 T = VisRGB( from, to, skipProp, seed, nearSkip, shadeN, nearMode );
 	return max( T.x, max( T.y, T.z ) ) < 1e-5f;
 }
 
-float3 SunVisRGB( float3 pos, float3 axis, int skipProp, uint seed )
+float3 SunVisRGB( float3 pos, float3 axis, int skipProp, uint seed, float nearSkip, float3 shadeN, int nearMode )
 {
 	float tmin = OccludeBias;
 	float3 T = 1;
@@ -1047,7 +1065,7 @@ float3 SunVisRGB( float3 pos, float3 axis, int skipProp, uint seed )
 	[loop] for ( int pass = 0; pass < MAX_FILTER_HITS + 1; ++pass )
 	{
 		float t; uint flags, prim; float3 nHit; float2 bary;
-		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, t, flags, prim, nHit, bary ) )
+		if ( !TraceClosest( pos, axis, tmin, MaxTrace, skipProp, nearSkip, shadeN, nearMode, t, flags, prim, nHit, bary ) )
 			return T * WaterKdScale( pos );
 		if ( flags & TRACE_ID_SKY )
 			return T * WaterKdScale( pos );
@@ -1092,9 +1110,9 @@ float3 SunVisRGB( float3 pos, float3 axis, int skipProp, uint seed )
 	return T * WaterKdScale( pos );
 }
 
-bool SunBlocked( float3 pos, float3 axis, int skipProp, uint seed )
+bool SunBlocked( float3 pos, float3 axis, int skipProp, uint seed, float nearSkip, float3 shadeN, int nearMode )
 {
-	float3 T = SunVisRGB( pos, axis, skipProp, seed );
+	float3 T = SunVisRGB( pos, axis, skipProp, seed, nearSkip, shadeN, nearMode );
 	return max( T.x, max( T.y, T.z ) ) < 1e-5f;
 }
 
@@ -1119,6 +1137,82 @@ float4 LC1( uint i ) { return LightsC[i * 2 + 1]; }
 float4 LE0( uint i ) { return LightsE[i * 3 + 0]; }
 float4 LE1( uint i ) { return LightsE[i * 3 + 1]; }
 float4 LE2( uint i ) { return LightsE[i * 3 + 2]; }
+)HLSL"
+R"HLSL(
+int WrapIndex( int x, int m )
+{
+	if ( m <= 0 )
+		return 0;
+	int r = x % m;
+	if ( r < 0 )
+		r += m;
+	return r;
+}
+
+float3 SampleCookiePoint( int ix, int iy, uint layer, uint w, uint h )
+{
+	float su = ( (float)ix + 0.5f ) / (float)max( w, 1u );
+	float sv = ( (float)iy + 0.5f ) / (float)max( h, 1u );
+	return ProjCookies.SampleLevel( g_ptLinearClamp, float3( su, sv, (float)layer ), 0 ).rgb;
+}
+
+// Equirectangular HDRI with longitude wrap (seam blends first and last columns).
+float3 SampleCookieEquirect( float u, float v, uint layer )
+{
+	uint w, h, nLayers;
+	ProjCookies.GetDimensions( w, h, nLayers );
+	if ( w < 1u ) w = 1u;
+	if ( h < 1u ) h = 1u;
+	u = frac( u );
+	v = saturate( v );
+	float xf = u * (float)w - 0.5f;
+	float yf = v * (float)( h - 1u );
+	int x0 = (int)floor( xf );
+	int y0 = (int)floor( yf );
+	float tx = xf - floor( xf );
+	float ty = yf - (float)y0;
+	int y1 = min( y0 + 1, (int)h - 1 );
+	if ( y0 < 0 ) y0 = 0;
+	if ( y0 > (int)h - 1 ) y0 = (int)h - 1;
+	int x1 = WrapIndex( x0 + 1, (int)w );
+	x0 = WrapIndex( x0, (int)w );
+	float3 c00 = SampleCookiePoint( x0, y0, layer, w, h );
+	float3 c10 = SampleCookiePoint( x1, y0, layer, w, h );
+	float3 c01 = SampleCookiePoint( x0, y1, layer, w, h );
+	float3 c11 = SampleCookiePoint( x1, y1, layer, w, h );
+	float3 c0 = lerp( c00, c10, tx );
+	float3 c1 = lerp( c01, c11, ty );
+	return lerp( c0, c1, ty );
+}
+
+// Same D3D face table as SampleProjCubeFace, one 2D image on every face (90° square).
+float3 SampleProjSixFace( float3 dir, uint layer )
+{
+	float3 d = normalize( dir );
+	float ax = abs( d.x ), ay = abs( d.y ), az = abs( d.z );
+	float sc, tc, ma;
+	if ( ax >= ay && ax >= az )
+	{
+		ma = ax;
+		if ( d.x > 0 ) { sc = -d.z; tc = -d.y; }
+		else           { sc =  d.z; tc = -d.y; }
+	}
+	else if ( ay >= ax && ay >= az )
+	{
+		ma = ay;
+		if ( d.y > 0 ) { sc =  d.x; tc =  d.z; }
+		else           { sc =  d.x; tc = -d.z; }
+	}
+	else
+	{
+		ma = az;
+		if ( d.z > 0 ) { sc =  d.x; tc = -d.y; }
+		else           { sc = -d.x; tc = -d.y; }
+	}
+	float u = saturate( 0.5f * ( sc / max( ma, 1e-8f ) + 1.0f ) );
+	float v = saturate( 0.5f * ( tc / max( ma, 1e-8f ) + 1.0f ) );
+	return ProjCookies.SampleLevel( g_ptLinearClamp, float3( u, v, (float)layer ), 0 ).rgb;
+}
 
 float3 SampleProjCubeFace( float3 dir, uint cubeIndex )
 {
@@ -1219,7 +1313,30 @@ float3 SampleProj( uint i, float3 lightToSample )
 		return SampleProjCubeFace( cubeDir, (uint)layer );
 	}
 
-	// 2D planar: FILL = sides on cone; FIT = corners on cone (*sqrt(2))
+	// 2D planar family. frame: 0=fill, 1=fit, 2=hdri, 3=six-face.
+	float frame = e2.y;
+	float3 localP;
+	localP.x = dot( dir, right );
+	localP.y = dot( dir, up );
+	localP.z = dot( dir, beam );
+	if ( frame > 2.5f )
+	{
+		// Same image on all six cube faces. Each face is a 90° square.
+		float3 cubeDir = float3( localP.x, localP.z, localP.y );
+		return SampleProjSixFace( cubeDir, (uint)layer );
+	}
+	if ( frame > 1.5f )
+	{
+		// Equirectangular HDRI: image up = light up, horizon center = beam.
+		float ll = dot( localP, localP );
+		if ( ll > 1e-12f )
+			localP *= rsqrt( ll );
+		float u = atan2( localP.x, localP.z ) * ( 0.5f / PI ) + 0.5f;
+		float v = acos( clamp( localP.y, -1.0f, 1.0f ) ) * ( 1.0f / PI );
+		return SampleCookieEquirect( u, v, (uint)layer );
+	}
+
+	// FILL = sides on cone; FIT = corners on cone (*sqrt(2))
 	float cosTheta = dot( dir, beam );
 	if ( cosTheta <= 1e-5f )
 		return float3( 0, 0, 0 );
@@ -1260,9 +1377,11 @@ float SpotCone( uint i, float3 lightToSample )
 	int iesLayer = LightsD[i].w;
 	float iesScale = LA1( i ).w;
 
-	// Cubemap ProjectedTexture: omnidirectional (ignore stock cone).
+	// Cubemap, spheremap, HDRI, and six-face: omnidirectional (ignore stock cone).
 	float projMode = LE1( i ).w;
-	if ( projMode > 1.5f )
+	float projFrame = LE2( i ).y;
+	bool projOmni = ( projMode > 1.5f ) || ( projMode > 0.5f && projMode < 1.5f && projFrame > 1.5f );
+	if ( projOmni )
 	{
 		if ( iesLayer >= 0 && iesScale > 0.0f )
 		{
@@ -1412,7 +1531,7 @@ void SoftSunDir( float3 axis, float sinExtent, uint i, uint nSoft, uint seed, ou
 }
 
 // Shadow that also returns hit distance (for PCSS). Skips $vrad_filter panes.
-bool OccludedT( float3 from, float3 to, int skipProp, uint seed, out float tHit )
+bool OccludedT( float3 from, float3 to, int skipProp, uint seed, out float tHit, float nearSkip, float3 shadeN, int nearMode )
 {
 	tHit = 0;
 	float3 delta = to - from;
@@ -1430,7 +1549,7 @@ bool OccludedT( float3 from, float3 to, int skipProp, uint seed, out float tHit 
 		if ( tmax <= tmin + 1e-4f )
 			return false;
 		float t; uint flags, prim; float3 nHit; float2 bary;
-		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, t, flags, prim, nHit, bary ) )
+		if ( !TraceClosest( from, delta, tmin, tmax, skipProp, nearSkip, shadeN, nearMode, t, flags, prim, nHit, bary ) )
 			return false;
 		if ( flags & TRACE_ID_SKY )
 			return false;
@@ -1462,13 +1581,148 @@ bool OccludedT( float3 from, float3 to, int skipProp, uint seed, out float tHit 
 	return false;
 }
 
-float3 EvalLight( uint i, float3 pos, float3 normal, uint seed, int faceNum, int skipProp, bool allowSoft, inout float sunAmt, float lambda )
+// GGX shape without Fresnel. Throughput already carries specular color.
+// Matches VRadBrdf_GgxShape. specRough < 0 leaves Lambert NEE unchanged.
+float GgxShape( float3 n, float3 wo, float3 wi, float roughness )
+{
+	float ndotl = dot( n, wi );
+	float ndotv = dot( n, wo );
+	if ( ndotl <= 1e-4 || ndotv <= 1e-4 )
+		return 0.0;
+	// Near-mirrors use SampleMirrorLights. A tiny GGX peak misses point lights.
+	if ( roughness < 0.08 )
+		return 0.0;
+	float r = clamp( roughness, 0.02, 1.0 );
+	float alpha = r * r;
+	float a2 = alpha * alpha;
+	float3 H = wo + wi;
+	float hLen = length( H );
+	if ( hLen < 1e-6 )
+		return 0.0;
+	H /= hLen;
+	float ndoth = saturate( dot( n, H ) );
+	float d = ndoth * ndoth * ( a2 - 1.0 ) + 1.0;
+	float D = a2 / ( 3.14159265 * d * d + 1e-7 );
+	float k = ( r + 1.0 ) * ( r + 1.0 ) / 8.0;
+	float G1v = ndotv / ( ndotv * ( 1.0 - k ) + k );
+	float G1l = ndotl / ( ndotl * ( 1.0 - k ) + k );
+	return ( 3.14159265 * D * G1v * G1l ) / ( 4.0 * ndotl * ndotv + 1e-4 );
+}
+
+float3 SampleGlossDir( float3 n, float3 incoming, float roughness, float u1, float u2 )
+{
+	// incoming points at the surface. VNDF uses the outward view direction (Heitz, JCGT 2018).
+	float3 wo = -incoming;
+	float wol = length( wo );
+	if ( wol > 1e-6 )
+		wo /= wol;
+	float3 mirror = 2.0 * dot( n, wo ) * n - wo;
+	float ml = length( mirror );
+	if ( ml > 1e-6 )
+		mirror /= ml;
+	if ( roughness < 0.08 )
+		return mirror;
+
+	float r = saturate( roughness );
+	float alpha = max( r * r, 1e-4 );
+	float3 t, b;
+	Orthonormal( n, t, b );
+	float wox = dot( wo, t );
+	float woy = dot( wo, b );
+	float woz = max( dot( wo, n ), 0.0 );
+	float3 Vh = float3( alpha * wox, alpha * woy, woz );
+	float vhl = length( Vh );
+	if ( vhl < 1e-6 )
+		return mirror;
+	Vh /= vhl;
+
+	float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+	float3 T1 = ( lensq > 1e-7 ) ? float3( -Vh.y, Vh.x, 0.0 ) / sqrt( lensq ) : float3( 1, 0, 0 );
+	float3 T2 = cross( Vh, T1 );
+	float ru = sqrt( max( u1, 0.0 ) );
+	float phi = 6.2831853 * u2;
+	float t1 = ru * cos( phi );
+	float t2 = ru * sin( phi );
+	float s = 0.5 * ( 1.0 + Vh.z );
+	t2 = ( 1.0 - s ) * sqrt( max( 0.0, 1.0 - t1 * t1 ) ) + s * t2;
+	float nz = sqrt( max( 0.0, 1.0 - t1 * t1 - t2 * t2 ) );
+	float3 Nh = T1 * t1 + T2 * t2 + Vh * nz;
+	float nhl = length( Nh );
+	if ( nhl < 1e-6 )
+		return mirror;
+	Nh /= nhl;
+	float3 Ne = float3( alpha * Nh.x, alpha * Nh.y, max( Nh.z, 0.0 ) );
+	float nel = length( Ne );
+	if ( nel < 1e-6 )
+		return mirror;
+	Ne /= nel;
+	float3 H = t * Ne.x + b * Ne.y + n * Ne.z;
+	float hl = length( H );
+	if ( hl < 1e-6 )
+		return mirror;
+	H /= hl;
+	float3 R = 2.0 * dot( wo, H ) * H - wo;
+	if ( dot( R, n ) <= 0.0 )
+		return mirror;
+	return normalize( R );
+}
+
+// flags: bit0 authored, bit1 roughness map, bit2 metalness map, bit3 clampU, bit4 clampV
+float2 SampleBrdfRM( uint prim, float2 bary )
+{
+	if ( prim >= TriCount )
+		return float2( 1, 0 );
+	float4 m0 = SurfMeta[prim * 3u];
+	uint f = (uint)( m0.w + 0.5 );
+	if ( ( f & 1u ) == 0 )
+		return float2( 1, 0 );
+	float rough = m0.x;
+	float metal = m0.y;
+	if ( m0.z >= 0.0 && ( ( f & 6u ) != 0 ) )
+	{
+		float4 m1 = SurfMeta[prim * 3u + 1u];
+		float4 m2 = SurfMeta[prim * 3u + 2u];
+		float w0 = 1.0 - bary.x - bary.y;
+		float2 uv = w0 * m1.xy + bary.x * m1.zw + bary.y * m2.xy;
+		if ( ( f & 8u ) == 0 ) uv.x = frac( uv.x ); else uv.x = saturate( uv.x );
+		if ( ( f & 16u ) == 0 ) uv.y = frac( uv.y ); else uv.y = saturate( uv.y );
+		float4 tex = SurfArray.SampleLevel( g_ptLinearClamp, float3( uv, m0.z ), 0 );
+		if ( ( f & 2u ) != 0 ) rough = tex.r * m0.x;
+		if ( ( f & 4u ) != 0 ) metal = tex.g * m0.y;
+	}
+	return float2( saturate( rough ), saturate( metal ) );
+}
+
+void BrdfLobes( float3 albedo, float rough, float metal, out float3 wide, out float3 sharp, out float pSpec, out float legacy )
+{
+	wide = albedo;
+	sharp = 0;
+	pSpec = 0;
+	legacy = 1.0;
+	rough = saturate( rough );
+	metal = saturate( metal );
+	if ( rough >= 0.999 && metal <= 0.001 )
+		return;
+	float gloss = 1.0 - rough;
+	float3 F0 = lerp( float3( 0.04, 0.04, 0.04 ), albedo, metal );
+	float3 diff = albedo * ( 1.0 - metal );
+	sharp = F0 * gloss;
+	wide = diff * ( 1.0 - 0.04 * gloss ) + F0 * ( 1.0 - gloss ) * metal;
+	float specL = dot( sharp, float3( 0.2126, 0.7152, 0.0722 ) );
+	float wideL = dot( wide, float3( 0.2126, 0.7152, 0.0722 ) );
+	pSpec = specL / ( specL + wideL + 1e-5 );
+	legacy = 0.0;
+}
+
+float3 EvalLight( uint i, float3 pos, float3 normal, uint seed, int faceNum, int skipProp, bool allowSoft, inout float sunAmt, float lambda, float nearSkip, float3 shadeN, int nearMode, float specRough, float3 specWo )
 {
 	float4 a0 = LA0( i );
 	float4 a1 = LA1( i );
 	float type = a0.w;
 	float3 intensity = a1.xyz;
 	float3 sum = 0;
+	float3 specWi = float3( 0, 0, 1 );
+	bool hasSpecWi = false;
 
 	if ( type < 0.5f || ( type > 0.5f && type < 1.5f ) )
 	{
@@ -1479,13 +1733,15 @@ float3 EvalLight( uint i, float3 pos, float3 normal, uint seed, int faceNum, int
 		if ( distC < 1e-3f )
 			return 0;
 		toC /= distC;
+		specWi = toC;
+		hasSpecWi = true;
 )HLSL"
 R"HLSL(
 		int ns = 1;
 		if ( allowSoft && radius > 0.0f && SoftSamplesMax > 1 && distC > OccludeBias + 1.0f )
 		{
 			float tHit = distC;
-			bool blocked = OccludedT( pos, origin, skipProp, seed, tHit );
+			bool blocked = OccludedT( pos, origin, skipProp, seed, tHit, nearSkip, shadeN, nearMode );
 			ns = EstimatePenumbraSamples( radius, distC, tHit, blocked );
 		}
 
@@ -1516,7 +1772,7 @@ R"HLSL(
 			float falloff = PointFalloff( i, dist );
 			if ( falloff <= 0 )
 				continue;
-			float3 vis = VisRGB( pos, lightPos, skipProp, seed + (uint)s * 53u );
+			float3 vis = VisRGB( pos, lightPos, skipProp, seed + (uint)s * 53u, nearSkip, shadeN, nearMode );
 			if ( max( vis.x, max( vis.y, vis.z ) ) < 1e-5f )
 				continue;
 			float3 tint = float3( 1, 1, 1 );
@@ -1548,6 +1804,8 @@ R"HLSL(
 #endif
 
 		float3 axis = normalize( LB0( i ).xyz );
+		specWi = axis;
+		hasSpecWi = true;
 		float sinExt = LC1( i ).y; // sunExtent
 		// Finite sun wraps past 90°: cull only when the whole disk is below the horizon.
 		if ( dot( normal, axis ) <= -sinExt )
@@ -1568,7 +1826,7 @@ R"HLSL(
 			float ndlS = dot( normal, dir );
 			if ( ndlS <= 0 )
 				continue;
-			float3 visS = SunVisRGB( pos, dir, skipProp, seed + (uint)s * 53u );
+			float3 visS = SunVisRGB( pos, dir, skipProp, seed + (uint)s * 53u, nearSkip, shadeN, nearMode );
 			if ( max( visS.x, max( visS.y, visS.z ) ) < 1e-5f )
 				continue;
 			visAccum += visS;
@@ -1592,6 +1850,15 @@ R"HLSL(		// emit_surface / $vrad_emit*: hard center NEE + area falloff.
 		// solids for medium/large faces and zeros the light via occlusion.
 		float3 origin = a0.xyz;
 		float3 Lnor = normalize( LB0( i ).xyz );
+		{
+			float3 toL = origin - pos;
+			float lenL = length( toL );
+			if ( lenL > 1e-3 )
+			{
+				specWi = toL / lenL;
+				hasSpecWi = true;
+			}
+		}
 		float areaR2 = max( LC1( i ).x, 0.0f );
 		float softRadius = 0.0f;
 		int ns = 1;
@@ -1606,7 +1873,7 @@ R"HLSL(		// emit_surface / $vrad_emit*: hard center NEE + area falloff.
 				{
 					toL /= distL;
 					float tHit = distL;
-					bool blocked = OccludedT( pos, origin, skipProp, seed, tHit );
+					bool blocked = OccludedT( pos, origin, skipProp, seed, tHit, nearSkip, shadeN, nearMode );
 					ns = EstimatePenumbraSamples( softRadius, distL, tHit, blocked );
 				}
 			}
@@ -1636,13 +1903,15 @@ R"HLSL(		// emit_surface / $vrad_emit*: hard center NEE + area falloff.
 			float falloff = ApplyFade( emitterCos / denom, dist, c0.y, c0.z );
 			if ( falloff <= 0 )
 				continue;
-			float3 vis = VisRGB( pos, lightPos, skipProp, seed + (uint)s * 53u );
+			float3 vis = VisRGB( pos, lightPos, skipProp, seed + (uint)s * 53u, nearSkip, shadeN, nearMode );
 			if ( max( vis.x, max( vis.y, vis.z ) ) < 1e-5f )
 				continue;
 			accum += LightContrib( intensity, ndl * falloff, vis, lambda );
 		}
 		sum = accum * ( 1.0f / (float)ns );
 	}
+	if ( specRough >= 0.0 && hasSpecWi )
+		sum *= GgxShape( normal, specWo, specWi, specRough );
 	return sum;
 }
 
@@ -1686,8 +1955,427 @@ uint SampleLocalCdf( float u )
 	return lo;
 }
 
+float3 SchlickF( float3 f0, float cosTheta )
+{
+	float m = 1.0 - saturate( cosTheta );
+	float m2 = m * m;
+	float m5 = m2 * m2 * m;
+	return f0 + ( 1.0 - f0 ) * m5;
+}
+
+bool RayMirrorTri( float3 orig, float3 dir, float tmax, float3 v0, float3 v1, float3 v2, out float tHit, out float3 hitP )
+{
+	float3 e1 = v1 - v0;
+	float3 e2 = v2 - v0;
+	float3 pvec = cross( dir, e2 );
+	float det = dot( e1, pvec );
+	if ( abs( det ) < 1e-8 )
+		return false;
+	float inv = 1.0 / det;
+	float3 s = orig - v0;
+	float u = dot( s, pvec ) * inv;
+	if ( u < 0.0 || u > 1.0 )
+		return false;
+	float3 qvec = cross( s, e1 );
+	float v = dot( dir, qvec ) * inv;
+	if ( v < 0.0 || u + v > 1.0 )
+		return false;
+	float t = dot( e2, qvec ) * inv;
+	if ( t < 1.0 || t > tmax - 0.5 )
+		return false;
+	tHit = t;
+	hitP = orig + dir * t;
+	return true;
+}
+
+float3 ClosestOnTri( float3 p, float3 a, float3 b, float3 c )
+{
+	float3 ab = b - a;
+	float3 ac = c - a;
+	float3 ap = p - a;
+	float d1 = dot( ab, ap );
+	float d2 = dot( ac, ap );
+	if ( d1 <= 0.0 && d2 <= 0.0 )
+		return a;
+	float3 bp = p - b;
+	float d3 = dot( ab, bp );
+	float d4 = dot( ac, bp );
+	if ( d3 >= 0.0 && d4 <= d3 )
+		return b;
+	float vc = d1 * d4 - d3 * d2;
+	if ( vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 )
+		return a + ab * ( d1 / ( d1 - d3 ) );
+	float3 cp = p - c;
+	float d5 = dot( ab, cp );
+	float d6 = dot( ac, cp );
+	if ( d6 >= 0.0 && d5 <= d6 )
+		return c;
+	float vb = d5 * d2 - d1 * d6;
+	if ( vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 )
+		return a + ac * ( d2 / ( d2 - d6 ) );
+	float va = d3 * d6 - d5 * d4;
+	if ( va <= 0.0 && ( d4 - d3 ) >= 0.0 && ( d5 - d6 ) >= 0.0 )
+	{
+		float w = ( d4 - d3 ) / ( ( d4 - d3 ) + ( d5 - d6 ) );
+		return b + ( c - b ) * w;
+	}
+	float denom = 1.0 / ( va + vb + vc );
+	return a + ab * ( vb * denom ) + ac * ( vc * denom );
+}
+
+// 1 on the mirror direction. Falls off with the GGX half-vector at the surface.
+float GlossPeakRatio( float ndoth, float rough )
+{
+	float r = clamp( rough, 0.02, 1.0 );
+	float alpha = r * r;
+	float a2 = alpha * alpha;
+	float d = ndoth * ndoth * ( a2 - 1.0 ) + 1.0;
+	float q = a2 / max( d, 1e-8 );
+	return q * q;
+}
+
+// A miss counts only while the closest point's half-vector is still in the lobe.
+// lightRef is a position when lightIsPos > 0.5, otherwise the sun direction.
+bool MirrorSpreadHit( float3 pos, float3 dirIn, float tmax, float3 v0, float3 v1, float3 v2, float3 n, float rough,
+	float3 lightRef, float lightIsPos, out float3 hitP, out float3 dirOut, out float tOut, out float weight )
+{
+	float denom = dot( dirIn, n );
+	if ( abs( denom ) < 1e-6 )
+		return false;
+	float t = dot( v0 - pos, n ) / denom;
+	if ( t < 1.0 || t > tmax - 0.5 )
+		return false;
+	float3 planeHit = pos + dirIn * t;
+	float3 closest = ClosestOnTri( planeHit, v0, v1, v2 );
+	float miss = length( closest - planeHit );
+	float gloss = 1.0 - saturate( rough );
+	if ( gloss < 1e-3 )
+		return false;
+	if ( miss <= 0.02 )
+	{
+		weight = gloss;
+		hitP = planeHit;
+		dirOut = dirIn;
+		tOut = t;
+		return true;
+	}
+	if ( rough < 0.08 )
+		return false;
+	float3 wo = pos - closest;
+	float wol = length( wo );
+	if ( wol < 1e-6 )
+		return false;
+	wo /= wol;
+	float3 wi = ( lightIsPos > 0.5 ) ? ( lightRef - closest ) : lightRef;
+	float wil = length( wi );
+	if ( wil < 1e-6 )
+		return false;
+	wi /= wil;
+	if ( dot( n, wi ) <= 1e-4 || dot( n, wo ) <= 1e-4 )
+		return false;
+	float3 halfv = wi + wo;
+	float hl = length( halfv );
+	if ( hl < 1e-6 )
+		return false;
+	halfv /= hl;
+	float ndoth = dot( n, halfv );
+	if ( ndoth <= 0.0 )
+		return false;
+	float ratio = GlossPeakRatio( ndoth, rough );
+	if ( ratio < 0.04 )
+		return false;
+	float3 to = closest - pos;
+	float dist = length( to );
+	if ( dist < 1.0 )
+		return false;
+	to /= dist;
+	if ( dot( to, dirIn ) <= 0.0 )
+		return false;
+	weight = gloss * ratio;
+	hitP = closest;
+	dirOut = to;
+	tOut = dist;
+	return true;
+}
+
+// Planar virtual light for roughness < 0.08. Called only from Lambertian vertices.
+)HLSL"
+R"HLSL(
+float3 SampleMirrorLights( float3 pos, float3 normal, uint seed, int faceNum, int skipProp, float lambda, float nearSkip, float3 shadeN, int nearMode )
+{
+	float3 sum = 0;
+	if ( MirrorCount == 0 )
+		return sum;
+	[loop] for ( uint mi = 0; mi < MirrorCount; ++mi )
+	{
+		float4 m0 = MirrorTris[mi * 5u + 0u];
+		float4 m1 = MirrorTris[mi * 5u + 1u];
+		float4 m2 = MirrorTris[mi * 5u + 2u];
+		float4 m3 = MirrorTris[mi * 5u + 3u];
+		float4 m4 = MirrorTris[mi * 5u + 4u];
+		float3 v0 = m0.xyz;
+		float3 v1 = m1.xyz;
+		float3 v2 = m2.xyz;
+		float3 n = m3.xyz;
+		float3 f0 = m4.xyz;
+		int mirrorFace = (int)m0.w;
+		if ( mirrorFace >= 0 && faceNum >= 0 && mirrorFace == faceNum )
+			continue;
+		if ( dot( n, pos - v0 ) <= 0.5 )
+			continue;
+		[loop] for ( uint li = 0; li < LightCount; ++li )
+		{
+			float type = LA0( li ).w;
+			float3 intensity = LA1( li ).xyz;
+			if ( type > 3.5 ) // sky ambient: not a directional image
+				continue;
+			if ( type > 2.5 ) // emit_surface point proxy. Area meshes are EmitTris below.
+			{
+				int eFace = (int)LightsD[li].x;
+				if ( faceNum >= 0 && eFace == faceNum )
+					continue;
+				float3 lightPos = LA0( li ).xyz;
+				float3 Lnor = normalize( LB0( li ).xyz );
+				float planeDs = dot( lightPos - v0, n );
+				float3 virtS = lightPos - n * ( 2.0 * planeDs );
+				float3 toVs = virtS - pos;
+				float distPathS = length( toVs );
+				if ( distPathS < 1.0 )
+					continue;
+				float3 dirS = toVs / distPathS;
+				float ndlS = dot( normal, dirS );
+				if ( ndlS <= 0.0 )
+					continue;
+				float tHitS; float3 hitS; float spreadS; float3 dirUseS;
+				if ( !MirrorSpreadHit( pos, dirS, distPathS, v0, v1, v2, n, m1.w, lightPos, 1.0, hitS, dirUseS, tHitS, spreadS ) )
+					continue;
+				dirS = dirUseS;
+				ndlS = dot( normal, dirS );
+				if ( ndlS <= 0.0 )
+					continue;
+				float3 toLS = lightPos - hitS;
+				float distLS = length( toLS );
+				if ( distLS < 1.0 )
+					continue;
+				toLS /= distLS;
+				if ( dot( n, toLS ) <= 0.0 )
+					continue;
+				float eCos = -dot( toLS, Lnor );
+				if ( eCos <= 0.0 )
+					continue;
+				float areaR2 = max( LC1( li ).x, 0.0 );
+				float dist2 = max( distPathS * distPathS, 1.0 );
+				float denom = dist2 + areaR2;
+				if ( denom <= 1e-8 )
+					continue;
+				float4 c0s = LC0( li );
+				float falloffS = ApplyFade( eCos / denom, distPathS, c0s.y, c0s.z );
+				if ( falloffS <= 0.0 )
+					continue;
+				float3 visFromS = pos + normal * max( OccludeBias, 1.0 );
+				if ( dot( visFromS - pos, dirS ) > tHitS * 0.5 )
+					visFromS = pos;
+				float3 visRS = VisRGB( visFromS, hitS, skipProp, seed + mi * 17u + li, nearSkip, shadeN, nearMode );
+				float3 visLS = VisRGB( hitS + n * 1.0, lightPos, skipProp, seed + mi * 19u + li, 0, n, 0 );
+				if ( max( visRS.x, max( visRS.y, visRS.z ) ) < 1e-5 )
+					continue;
+				if ( max( visLS.x, max( visLS.y, visLS.z ) ) < 1e-5 )
+					continue;
+				float3 FS = SchlickF( f0, saturate( dot( n, -dirS ) ) );
+				sum += LightContrib( intensity * FS, ndlS * falloffS * spreadS, visRS * visLS, lambda );
+				continue;
+			}
+			if ( type > 1.5 ) // sun
+			{
+				float3 axis = normalize( LB0( li ).xyz );
+				float3 dir = axis - n * ( 2.0 * dot( axis, n ) );
+				float dlen = length( dir );
+				if ( dlen < 1e-6 )
+					continue;
+				dir /= dlen;
+				float ndl = dot( normal, dir );
+				if ( ndl <= 0.0 )
+					continue;
+				if ( dot( n, axis ) <= 0.0 )
+					continue;
+				float tHit; float3 hitP; float spread; float3 dirUse;
+				if ( !MirrorSpreadHit( pos, dir, MaxTrace, v0, v1, v2, n, m1.w, axis, 0.0, hitP, dirUse, tHit, spread ) )
+					continue;
+				dir = dirUse;
+				ndl = dot( normal, dir );
+				if ( ndl <= 0.0 )
+					continue;
+#if PT_ENABLE_VOLUMES
+				float wEnv = EnvWeight( LightsD[li].y, pos );
+				if ( wEnv <= 0.0 )
+					continue;
+#else
+				float wEnv = 1.0;
+#endif
+				float3 visFrom = pos + normal * max( OccludeBias, 1.0 );
+				if ( dot( visFrom - pos, dir ) > tHit * 0.5 )
+					visFrom = pos;
+				float3 visR = VisRGB( visFrom, hitP, skipProp, seed + mi * 17u + li, nearSkip, shadeN, nearMode );
+				float3 visL = SunVisRGB( hitP + n * 1.0, axis, skipProp, seed + mi * 19u + li, 0, n, 0 );
+				if ( max( visR.x, max( visR.y, visR.z ) ) < 1e-5 )
+					continue;
+				float3 F = SchlickF( f0, saturate( dot( n, -dir ) ) );
+				sum += LightContrib( intensity * F, ndl * wEnv * spread, visR * visL, lambda );
+				continue;
+			}
+			float3 lightPos = LA0( li ).xyz;
+			float planeD = dot( lightPos - v0, n );
+			float3 virt = lightPos - n * ( 2.0 * planeD );
+			float3 toV = virt - pos;
+			float distPath = length( toV );
+			if ( distPath < 1.0 )
+				continue;
+			float3 dir = toV / distPath;
+			float ndl = dot( normal, dir );
+			if ( ndl <= 0.0 )
+				continue;
+			float tHit; float3 hitP; float spread; float3 dirUse;
+			if ( !MirrorSpreadHit( pos, dir, distPath, v0, v1, v2, n, m1.w, lightPos, 1.0, hitP, dirUse, tHit, spread ) )
+				continue;
+			dir = dirUse;
+			ndl = dot( normal, dir );
+			if ( ndl <= 0.0 )
+				continue;
+			float3 toL = lightPos - hitP;
+			float distL = length( toL );
+			if ( distL < 1.0 )
+				continue;
+			toL /= distL;
+			if ( dot( n, toL ) <= 0.0 )
+				continue;
+			float cone = 1.0;
+			if ( type > 0.5 )
+			{
+				cone = SpotCone( li, -toL );
+				if ( cone <= 0.0 )
+					continue;
+			}
+			float falloff = PointFalloff( li, distPath );
+			if ( falloff <= 0.0 )
+				continue;
+			float3 visFrom = pos + normal * max( OccludeBias, 1.0 );
+			if ( dot( visFrom - pos, dir ) > tHit * 0.5 )
+				visFrom = pos;
+			float3 visR = VisRGB( visFrom, hitP, skipProp, seed + mi * 17u + li, nearSkip, shadeN, nearMode );
+			float3 visL = VisRGB( hitP + n * 1.0, lightPos, skipProp, seed + mi * 19u + li, 0, n, 0 );
+			if ( max( visR.x, max( visR.y, visR.z ) ) < 1e-5 )
+				continue;
+			if ( max( visL.x, max( visL.y, visL.z ) ) < 1e-5 )
+				continue;
+			float3 tint = float3( 1, 1, 1 );
+			if ( type > 0.5 )
+				tint = SampleProj( li, -toL );
+			float3 F = SchlickF( f0, saturate( dot( n, -dir ) ) );
+			sum += LightContrib( intensity * tint * F, ndl * falloff * cone * spread, visR * visL, lambda );
+		}
+)HLSL"
+R"HLSL(
+		if ( EmitTriCount > 0 )
+		{
+			bool sampleAll = ( EmitSamples == 0 ) || ( EmitSamples >= EmitTriCount );
+			uint k = sampleAll ? EmitTriCount : max( EmitSamples, 1u );
+			[loop] for ( uint s = 0; s < k; ++s )
+			{
+				uint ti;
+				float pPick;
+				if ( sampleAll )
+				{
+					ti = s;
+					pPick = 1.0f;
+				}
+				else
+				{
+					float uPick = ( (float)s + Hash01( seed + s * 91u + 7u + mi * 3u ) ) / (float)k;
+					if ( uPick < 1e-6f ) uPick = 1e-6f;
+					if ( uPick > 0.999999f ) uPick = 0.999999f;
+					uint lo = 0, hi = EmitTriCount;
+					while ( lo + 1 < hi )
+					{
+						uint mid = ( lo + hi ) >> 1;
+						if ( EmitCdf[mid] < uPick ) lo = mid; else hi = mid;
+					}
+					ti = lo;
+					float cdf0 = ( ti == 0 ) ? 0.0f : EmitCdf[ti - 1];
+					pPick = max( EmitCdf[ti] - cdf0, 1e-12f );
+				}
+				float4 ea0 = EmitA[ti * 4 + 0];
+				float4 ea1 = EmitA[ti * 4 + 1];
+				float4 ea2 = EmitA[ti * 4 + 2];
+				float4 ea3 = EmitA[ti * 4 + 3];
+				int eFace = (int)ea2.w;
+				if ( faceNum >= 0 && eFace == faceNum )
+					continue;
+				float area = max( ea0.w, 1e-8f );
+				float u0 = Hash01( seed + s * 97u + 11u + mi );
+				float u1 = Hash01( seed + s * 131u + 23u + mi );
+				float su0 = sqrt( max( u0, 0.0f ) );
+				float b0 = 1.0f - su0;
+				float b1 = u1 * su0;
+				float b2 = 1.0f - b0 - b1;
+				float3 lp = ea0.xyz * b0 + ea1.xyz * b1 + ea2.xyz * b2;
+				float3 Le = EmitE[ti * 3 + 0].xyz * b0 + EmitE[ti * 3 + 1].xyz * b1 + EmitE[ti * 3 + 2].xyz * b2;
+				float3 Ln = normalize( ea3.xyz );
+				lp += Ln * 1.0f;
+				float planeDe = dot( lp - v0, n );
+				float3 virtE = lp - n * ( 2.0 * planeDe );
+				float3 toVe = virtE - pos;
+				float distPathE = length( toVe );
+				if ( distPathE < 1.0 )
+					continue;
+				float3 dirE = toVe / distPathE;
+				float ndlE = dot( normal, dirE );
+				if ( ndlE <= 0.0 )
+					continue;
+				float tHitE; float3 hitE;
+				float spreadE; float3 dirUseE;
+				if ( !MirrorSpreadHit( pos, dirE, distPathE, v0, v1, v2, n, m1.w, lp, 1.0, hitE, dirUseE, tHitE, spreadE ) )
+					continue;
+				dirE = dirUseE;
+				ndlE = dot( normal, dirE );
+				if ( ndlE <= 0.0 )
+					continue;
+				float3 toLE = lp - hitE;
+				float distLE = length( toLE );
+				if ( distLE < 1.0 )
+					continue;
+				toLE /= distLE;
+				if ( dot( n, toLE ) <= 0.0 )
+					continue;
+				float eCosE = -dot( toLE, Ln );
+				if ( eCosE <= 0.0 )
+					continue;
+				float pdfA = 1.0f / area;
+				float pdf = sampleAll ? pdfA : ( pPick * pdfA );
+				if ( pdf <= 1e-20f )
+					continue;
+				float3 visFromE = pos + normal * max( OccludeBias, 1.0 );
+				if ( dot( visFromE - pos, dirE ) > tHitE * 0.5 )
+					visFromE = pos;
+				float3 visRE = VisRGB( visFromE, hitE, skipProp, seed + mi * 17u + s, nearSkip, shadeN, nearMode );
+				float3 visLE = VisRGB( hitE + n * 1.0, lp, skipProp, seed + mi * 19u + s, 0, n, 0 );
+				if ( max( visRE.x, max( visRE.y, visRE.z ) ) < 1e-5 )
+					continue;
+				if ( max( visLE.x, max( visLE.y, visLE.z ) ) < 1e-5 )
+					continue;
+				float3 FE = SchlickF( f0, saturate( dot( n, -dirE ) ) );
+				float geom = ndlE * eCosE * spreadE / ( distPathE * distPathE * pdf );
+				if ( !sampleAll )
+					geom *= ( 1.0f / (float)k );
+				sum += LightContrib( Le * FE, geom, visRE * visLE, lambda );
+			}
+		}
+	}
+	return sum;
+}
+
 float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, int skipProp, bool allowSoft,
-					 bool fullLocals, inout float sunAmt, float lambda )
+					 bool fullLocals, inout float sunAmt, float lambda, float nearSkip, float3 shadeN, int nearMode,
+					 float specRough, float3 specWo )
 {
 	float3 sum = 0;
 	// First bounce (fullLocals): evaluate every local - critical for indoor props.
@@ -1701,7 +2389,7 @@ float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, int skip
 			continue;
 		if ( powerSample && LightsD[i].z != 0 )
 			continue;
-		sum += EvalLight( i, pos, normal, seed + i * 17u, faceNum, skipProp, allowSoft, sunAmt, lambda );
+		sum += EvalLight( i, pos, normal, seed + i * 17u, faceNum, skipProp, allowSoft, sunAmt, lambda, nearSkip, shadeN, nearMode, specRough, specWo );
 	}
 
 	if ( powerSample )
@@ -1714,7 +2402,7 @@ float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, int skip
 			uint idx = LocalIdx[li];
 			float cdf0 = ( li == 0 ) ? 0.0f : LocalCdf[li - 1];
 			float pdf = max( LocalCdf[li] - cdf0, 1e-8f );
-			float3 col = EvalLight( idx, pos, normal, seed + ( s + 1 ) * 131u, faceNum, skipProp, allowSoft, sunAmt, lambda );
+			float3 col = EvalLight( idx, pos, normal, seed + ( s + 1 ) * 131u, faceNum, skipProp, allowSoft, sunAmt, lambda, nearSkip, shadeN, nearMode, specRough, specWo );
 			sum += col * ( 1.0f / ( pdf * (float)LightSamples ) );
 		}
 	}
@@ -1778,18 +2466,26 @@ float3 SampleDirect( float3 pos, float3 normal, uint seed, int faceNum, int skip
 			float pdfA = 1.0f / area;
 			float pdf = sampleAll ? pdfA : ( pPick * pdfA );
 			if ( pdf <= 1e-20f ) continue;
-			float3 vis = VisRGB( pos, lp, skipProp, seed );
+			float3 vis = VisRGB( pos, lp, skipProp, seed, nearSkip, shadeN, nearMode );
 			if ( max( vis.x, max( vis.y, vis.z ) ) < 1e-5f ) continue;
-			areaSum += LightContrib( Le, ndl * eCos / ( dist * dist * pdf ), vis, lambda );
+			{
+				float3 add = LightContrib( Le, ndl * eCos / ( dist * dist * pdf ), vis, lambda );
+				if ( specRough >= 0.0 )
+					add *= GgxShape( normal, specWo, delta, specRough );
+				areaSum += add;
+			}
 		}
 		if ( !sampleAll )
 			areaSum *= ( 1.0f / (float)k );
 		sum += areaSum;
 	}
+	if ( specRough < 0.0 )
+		sum += SampleMirrorLights( pos, normal, seed, faceNum, skipProp, lambda, nearSkip, shadeN, nearMode );
 	return sum;
 }
-
-float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int faceNum, int skipProp, out float sunAmt )
+)HLSL"
+R"HLSL(
+float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int faceNum, int skipProp, float nearSkip, out float sunAmt )
 {
 	sunAmt = 0;
 	uint pathDepth = Bounces + 1;
@@ -1819,14 +2515,39 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 	bool inMedium = false;
 	float3 medDir = float3( 0, 0, 1 );
 	uint mediumScatters = 0;
+	// Lobe chosen at the previous hit. <0 = Lambertian. Luxel (bounce 0) stays Lambertian.
+	float lobeSpec = -1;
+	float lobeRough = 1;
+	float3 lobeWo = normal;
+	float3 lobeF0 = 0;
+	float lobeVndf = 0;
+	float lobeHasDir = 0;
+	float3 lobeDir = normal;
 
 	for ( uint bounce = 0; bounce < pathDepth; ++bounce )
 	{
 		bool allowSoft = ( bounce == 0 ) || ( SoftMode != 0 );
 		float sunB = 0;
 		float3 neeN = inMedium ? medDir : normal;
-		float3 nee = SampleDirect( pos, neeN, seed + bounce * 31u + sppIndex * 17u, skipFace, skipProp, allowSoft,
-								   bounce == 0, sunB, lam0 );
+		// nearSkip > 0 is a lightmapped prop: shadow rays ignore the local
+		// same-facing surface, later bounces see the prop normally.
+		int raySkip = skipProp;
+		float rayNear = 0;
+		int rayMode = 0;
+		float giNear = 0;
+		int giMode = 0;
+		if ( nearSkip > 0.0f && bounce == 0 )
+		{
+			rayNear = nearSkip;
+			rayMode = 1;
+			giNear = 2.0f;
+			giMode = 2;
+		}
+		else if ( nearSkip > 0.0f )
+			raySkip = -1;
+		float specRough = inMedium ? -1.0 : lobeSpec;
+		float3 nee = SampleDirect( pos, neeN, seed + bounce * 31u + sppIndex * 17u, skipFace, raySkip, allowSoft,
+								   bounce == 0, sunB, lam0, rayNear, normalIn, rayMode, specRough, lobeWo );
 		nee = ClampFirefly( nee, FireflyCap );
 		if ( spectral )
 		{
@@ -1850,7 +2571,40 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 			Hash01( seed + bounce * 13u + qmcBlock * 0x9E3779B9u + 11u ) );
 		float u2 = SobolRot( qmcIndex, qmcDim + 1u,
 			Hash01( seed + bounce * 17u + qmcBlock * 0xBB67AE85u + 13u ) );
-		float3 dir = inMedium ? medDir : CosineHemi( normal, u1, u2 );
+		float3 dir;
+		if ( inMedium )
+			dir = medDir;
+		else if ( lobeHasDir > 0.5 )
+			dir = lobeDir;
+		else if ( lobeSpec >= 0.0 && lobeRough < 0.08 )
+			dir = SampleGlossDir( normal, -lobeWo, lobeRough, u1, u2 );
+		else if ( lobeSpec >= 0.0 )
+		{
+			dir = SampleGlossDir( normal, -lobeWo, lobeRough, u1, u2 );
+			if ( lobeVndf > 0.5 )
+			{
+				float ndotl = saturate( dot( normal, dir ) );
+				float kk = ( lobeRough + 1.0 ) * ( lobeRough + 1.0 ) / 8.0;
+				float g1 = ndotl / ( ndotl * ( 1.0 - kk ) + kk + 1e-6 );
+				float3 H = lobeWo + dir;
+				float hl = length( H );
+				float cosH = 1.0;
+				if ( hl > 1e-6 )
+					cosH = saturate( dot( lobeWo, H / hl ) );
+				float3 FF = SchlickF( lobeF0, cosH ) * g1 / max( lobeF0, 1e-5 );
+				if ( spectral )
+				{
+					beta.x *= SpecRefl( FF, lam0 );
+					beta.y *= SpecRefl( FF, lam1 );
+					beta.z *= SpecRefl( FF, lam2 );
+					beta.w *= SpecRefl( FF, lam3 );
+				}
+				else
+					throughput *= FF;
+			}
+		}
+		else
+			dir = CosineHemi( normal, u1, u2 );
 
 		float tFree = MaxTrace;
 		uint medBody = 0;
@@ -1865,6 +2619,7 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 		float maxDist = tryMed ? ( tFree + 1e-3f ) : MaxTrace;
 		float tmin = 0.25f;
 		float t = 0; uint flags = 0, prim = 0; float3 hitN = float3( 0, 0, 1 );
+		float2 hitBary = 0;
 		bool hit = false;
 		uint lastPrim = 0xFFFFFFFFu;
 		uint lastFace = 0xFFFFFFFFu;
@@ -1873,7 +2628,7 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 		[loop] for ( int fpass = 0; fpass < MAX_FILTER_HITS + 1; ++fpass )
 		{
 			float t0; uint f0, p0; float3 n0; float2 b0;
-			bool h0 = TraceClosest( pos, dir, tmin, maxDist, skipProp, t0, f0, p0, n0, b0 );
+			bool h0 = TraceClosest( pos, dir, tmin, maxDist, raySkip, giNear, normalIn, giMode, t0, f0, p0, n0, b0 );
 			if ( !h0 || ( f0 & TRACE_ID_SKY ) )
 			{
 				hit = false;
@@ -1920,6 +2675,7 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 			}
 			hit = true;
 			t = t0; flags = f0; prim = p0; hitN = n0;
+			hitBary = b0;
 			break;
 		}
 
@@ -1957,6 +2713,8 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 			pos = scatterPos;
 			normal = medDir;
 			inMedium = true;
+			lobeSpec = -1.0;
+			lobeHasDir = 0;
 			skipFace = -1;
 			if ( bounce >= 1 )
 			{
@@ -2021,15 +2779,54 @@ float3 PathLi( float3 posIn, float3 normalIn, uint seed, uint sppIndex, int face
 		float3 albedo = ( prim < TriCount ) ? TriAlbedo[prim] : float3( 0.45, 0.45, 0.45 );
 		albedo = ApplyBounceVolAlbedo( hitPos, albedo, bounce );
 		albedo = clamp( albedo, 0.0f, 1.0f );
+		float2 rm = SampleBrdfRM( prim, hitBary );
+		float3 wide, sharp;
+		float pSpec;
+		float legacy;
+		BrdfLobes( albedo, rm.x, rm.y, wide, sharp, pSpec, legacy );
+		float3 lobeW = albedo;
+		lobeSpec = -1.0;
+		lobeRough = 1.0;
+		lobeVndf = 0;
+		lobeHasDir = 0;
+		// Reflect when the ray clears the seam. A hit within 24 units is the
+		// adjacent face; that sample becomes the diffuse bounce instead.
+		if ( legacy < 0.5 && rm.x < 0.98 && pSpec > 1e-4 )
+		{
+			float uLobe = Hash01( seed + bounce * 59u + sppIndex * 23u + 17u );
+			float3 refl = dir - hitN * ( 2.0 * dot( dir, hitN ) );
+			float rl = length( refl );
+			if ( uLobe < pSpec && rl > 1e-6 )
+			{
+				refl /= rl;
+				float tS; uint fS; uint pS; float3 nS; float2 bS;
+				bool seam = TraceClosest( hitPos + hitN, refl, 0.5, 24.0, raySkip, 0, hitN, 0, tS, fS, pS, nS, bS );
+				if ( !seam )
+				{
+					lobeHasDir = 1;
+					lobeDir = refl;
+					lobeW = sharp * ( 1.0 / pSpec );
+				}
+				else
+					lobeW = wide + sharp;
+			}
+			else
+			{
+				float inv = 1.0 / max( 1.0 - pSpec, 1e-4 );
+				lobeW = wide * inv;
+			}
+		}
+		else if ( legacy < 0.5 )
+			lobeW = wide;
 		if ( spectral )
 		{
-			beta.x *= SpecRefl( albedo, lam0 );
-			beta.y *= SpecRefl( albedo, lam1 );
-			beta.z *= SpecRefl( albedo, lam2 );
-			beta.w *= SpecRefl( albedo, lam3 );
+			beta.x *= SpecRefl( lobeW, lam0 );
+			beta.y *= SpecRefl( lobeW, lam1 );
+			beta.z *= SpecRefl( lobeW, lam2 );
+			beta.w *= SpecRefl( lobeW, lam3 );
 		}
 		else
-			throughput *= albedo;
+			throughput *= lobeW;
 
 		if ( bounce >= 1 )
 		{
@@ -2084,6 +2881,7 @@ void CSMain( uint3 dtid : SV_DispatchThreadID )
 	float3 normal = normalize( a1.xyz );
 	uint seed = asuint( a1.w );
 	float3 axisU = LuxelsB[i * 2 + 0].xyz;
+	float nearSkip = LuxelsB[i * 2 + 0].w;
 	float3 axisV = LuxelsB[i * 2 + 1].xyz;
 	int faceNum = LuxelsC[i].x;
 	int aaN = max( LuxelsC[i].y, 1 );
@@ -2110,7 +2908,7 @@ void CSMain( uint3 dtid : SV_DispatchThreadID )
 				samplePos += axisU * u + axisV * v;
 			}
 			float sunAmt = 0;
-			float3 li = PathLi( samplePos, normal, seed, sGlobal, faceNum, skipProp, sunAmt );
+			float3 li = PathLi( samplePos, normal, seed, sGlobal, faceNum, skipProp, nearSkip, sunAmt );
 			li = ClampFirefly( li, FireflyCap );
 			sum += li;
 			sunSum += sunAmt;
@@ -2140,6 +2938,10 @@ struct PtBakeGpu
 	ComPtr<ID3D12Resource>		filterAtlas; // Texture2DArray
 	ComPtr<ID3D12Resource>		triAlpha; // AlphaMeta: 3 float4 / tri
 	ComPtr<ID3D12Resource>		alphaAtlas; // Texture2DArray (leaf/prop masks)
+	ComPtr<ID3D12Resource>		triSurf; // SurfMeta: 3 float4 / tri
+	ComPtr<ID3D12Resource>		surfAtlas; // Texture2DArray roughness / metalness
+	ComPtr<ID3D12Resource>		mirrorTris; // 5 x float4 per smooth mirror tri
+	uint32						mirrorCount = 0;
 	ComPtr<ID3D12Resource>		iesAtlas; // StructuredBuffer<float> layers*IesResV*IesResH
 	ComPtr<ID3D12Resource>		lightsE; // StructuredBuffer<float4> 3 per light (projection)
 	ComPtr<ID3D12Resource>		projCookies; // Texture2DArray
@@ -2150,6 +2952,9 @@ struct PtBakeGpu
 	uint32						alphaAtlasW = 1;
 	uint32						alphaAtlasH = 1;
 	uint32						alphaAtlasLayers = 1;
+	uint32						surfAtlasW = 1;
+	uint32						surfAtlasH = 1;
+	uint32						surfAtlasLayers = 1;
 	uint32						iesAtlasLayers = 1;
 	uint32						iesAtlasResV = 64;
 	uint32						iesAtlasResH = 32;
@@ -2189,7 +2994,7 @@ static PtBakeGpu g_ptBake;
 // DXIL so GpuBakeBegin after world->props does not re-enter dxcompiler.
 static ComPtr<ID3DBlob> g_ptLuxelCsCache[2]; // [0]=no volumes, [1]=volumes
 // Bump when luxel CS root signature / WaterVols layout changes.
-static const uint32 kPtLuxelCsCacheGen = 4;
+static const uint32 kPtLuxelCsCacheGen = 15;
 static uint32 g_ptLuxelCsCacheGen = 0;
 
 static bool PtEnsureDxcLoaded()
@@ -2640,6 +3445,24 @@ bool PathTraceDXR_GetCapturedTriAlbedo( uint32_t triIndex, Vector &outLinearRGB 
 	return true;
 }
 
+const char *PathTraceDXR_CapturedTriMaterial( unsigned triIndex )
+{
+	if ( triIndex >= (unsigned)g_ptTris.size() )
+		return NULL;
+	const int idx = g_ptTris[triIndex].matName;
+	if ( idx < 0 || idx >= (int)g_ptMatNames.size() )
+		return NULL;
+	return g_ptMatNames[idx].c_str();
+}
+
+bool PathTraceDXR_CapturedTriUV( unsigned triIndex, float outUv[6] )
+{
+	if ( !outUv || triIndex >= (unsigned)g_ptTris.size() || !g_ptTris[triIndex].hasUv )
+		return false;
+	memcpy( outUv, g_ptTris[triIndex].uv, sizeof( g_ptTris[triIndex].uv ) );
+	return true;
+}
+
 bool PathTraceDXR_GpuBakeIsActive()
 {
 	return g_ptBake.active;
@@ -2673,6 +3496,10 @@ void PathTraceDXR_GpuBakeEnd()
 	g_ptBake.filterAtlas.Reset();
 	g_ptBake.triAlpha.Reset();
 	g_ptBake.alphaAtlas.Reset();
+	g_ptBake.triSurf.Reset();
+	g_ptBake.surfAtlas.Reset();
+	g_ptBake.mirrorTris.Reset();
+	g_ptBake.mirrorCount = 0;
 	g_ptBake.iesAtlas.Reset();
 	g_ptBake.lightsE.Reset();
 	g_ptBake.projCookies.Reset();
@@ -2738,7 +3565,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 								const float *alphaMeta,
 								const unsigned char *alphaArrayRGBA,
 								uint32_t alphaArrayW, uint32_t alphaArrayH,
-								uint32_t alphaArrayLayers )
+								uint32_t alphaArrayLayers,
+								const float *brdfMeta,
+								const unsigned char *brdfArrayRGBA,
+								uint32_t brdfArrayW, uint32_t brdfArrayH,
+								uint32_t brdfArrayLayers )
 {
 	PathTraceDXR_GpuBakeEnd();
 	if ( !g_ptDev.ready || !lights || !albedoRGB || nTris == 0 || nTris != (uint32)g_ptTris.size() )
@@ -2758,10 +3589,10 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 		if ( !PtGetOrCompileLuxelCS( enableVolumes, &csBlob ) )
 			return false;
 
-		// Root: table t0..t27 + u0, then 32 constants + linear clamp sampler
+		// Root: table t0..t30 + u0, then 32 constants + linear clamp sampler
 		D3D12_DESCRIPTOR_RANGE ranges[2] = {};
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-		ranges[0].NumDescriptors = 28;
+		ranges[0].NumDescriptors = 31;
 		ranges[0].BaseShaderRegister = 0;
 		ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -2840,8 +3671,9 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	const UINT64 albBytes = (UINT64)nTris * sizeof( float ) * 3;
 	const UINT64 filtMetaBytes = (UINT64)nTris * 5u * sizeof( float ) * 4;
 	const UINT64 alphaMetaBytes = (UINT64)nTris * 3u * sizeof( float ) * 4;
+	const UINT64 brdfMetaBytes = (UINT64)nTris * 3u * sizeof( float ) * 4;
 
-	ComPtr<ID3D12Resource> upA, upB, upC, upD, upE, upAlb, upFilt, upAlpha;
+	ComPtr<ID3D12Resource> upA, upB, upC, upD, upE, upAlb, upFilt, upAlpha, upBrdf;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upA, L"upLA" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upB, L"upLB" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upC, L"upLC" ) ) return false;
@@ -2850,6 +3682,7 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !PtCreateBuffer( albBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upAlb, L"upAlb" ) ) return false;
 	if ( !PtCreateBuffer( filtMetaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upFilt, L"upFiltMeta" ) ) return false;
 	if ( !PtCreateBuffer( alphaMetaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upAlpha, L"upAlphaMeta" ) ) return false;
+	if ( !PtCreateBuffer( brdfMetaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upBrdf, L"upBrdfMeta" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.lightsA, L"LA" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.lightsB, L"LB" ) ) return false;
 	if ( !PtCreateBuffer( lightF4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.lightsC, L"LC" ) ) return false;
@@ -2858,9 +3691,10 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !PtCreateBuffer( albBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.albedo, L"Alb" ) ) return false;
 	if ( !PtCreateBuffer( filtMetaBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.triFilter, L"FiltMeta" ) ) return false;
 	if ( !PtCreateBuffer( alphaMetaBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.triAlpha, L"AlphaMeta" ) ) return false;
+	if ( !PtCreateBuffer( brdfMetaBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.triSurf, L"SurfMeta" ) ) return false;
 
 	{
-		float *pa = nullptr, *pb = nullptr, *pc = nullptr, *pe = nullptr; int *pd = nullptr; float *pal = nullptr; float *pf = nullptr; float *pAlpha = nullptr;
+		float *pa = nullptr, *pb = nullptr, *pc = nullptr, *pe = nullptr; int *pd = nullptr; float *pal = nullptr; float *pf = nullptr; float *pAlpha = nullptr; float *pBrdf = nullptr;
 		if ( FAILED( upA->Map( 0, nullptr, (void **)&pa ) ) || !pa ||
 			 FAILED( upB->Map( 0, nullptr, (void **)&pb ) ) || !pb ||
 			 FAILED( upC->Map( 0, nullptr, (void **)&pc ) ) || !pc ||
@@ -2868,7 +3702,8 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 			 FAILED( upE->Map( 0, nullptr, (void **)&pe ) ) || !pe ||
 			 FAILED( upAlb->Map( 0, nullptr, (void **)&pal ) ) || !pal ||
 			 FAILED( upFilt->Map( 0, nullptr, (void **)&pf ) ) || !pf ||
-			 FAILED( upAlpha->Map( 0, nullptr, (void **)&pAlpha ) ) || !pAlpha )
+			 FAILED( upAlpha->Map( 0, nullptr, (void **)&pAlpha ) ) || !pAlpha ||
+			 FAILED( upBrdf->Map( 0, nullptr, (void **)&pBrdf ) ) || !pBrdf )
 		{
 			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading lights/albedo (host OOM?).\n" );
 			return false;
@@ -2896,9 +3731,20 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 			memcpy( pAlpha, alphaMeta, (size_t)alphaMetaBytes );
 		else
 			memset( pAlpha, 0, (size_t)alphaMetaBytes );
+		if ( brdfMeta )
+			memcpy( pBrdf, brdfMeta, (size_t)brdfMetaBytes );
+		else
+		{
+			memset( pBrdf, 0, (size_t)brdfMetaBytes );
+			for ( uint32_t ti = 0; ti < nTris; ++ti )
+			{
+				pBrdf[ti * 12 + 0] = 1.0f;
+				pBrdf[ti * 12 + 2] = -1.0f;
+			}
+		}
 		upA->Unmap( 0, nullptr ); upB->Unmap( 0, nullptr ); upC->Unmap( 0, nullptr );
 		upD->Unmap( 0, nullptr ); upE->Unmap( 0, nullptr ); upAlb->Unmap( 0, nullptr );
-		upFilt->Unmap( 0, nullptr ); upAlpha->Unmap( 0, nullptr );
+		upFilt->Unmap( 0, nullptr ); upAlpha->Unmap( 0, nullptr ); upBrdf->Unmap( 0, nullptr );
 	}
 
 	// Filter Texture2DArray (1x1x1 white if unused) - upload kept until GPU copy below
@@ -3049,6 +3895,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	if ( !UploadTex2DArray( alphaArrayRGBA, alphaArrayW, alphaArrayH, alphaArrayLayers,
 							g_ptBake.alphaAtlasW, g_ptBake.alphaAtlasH, g_ptBake.alphaAtlasLayers,
 							&g_ptBake.alphaAtlas, &upAlphaArray, L"AlphaAtlas", L"upAlphaArray" ) )
+		return false;
+	ComPtr<ID3D12Resource> upSurfArray;
+	if ( !UploadTex2DArray( brdfArrayRGBA, brdfArrayW, brdfArrayH, brdfArrayLayers,
+							g_ptBake.surfAtlasW, g_ptBake.surfAtlasH, g_ptBake.surfAtlasLayers,
+							&g_ptBake.surfAtlas, &upSurfArray, L"SurfAtlas", L"upSurfArray" ) )
 		return false;
 
 	// Local light CDF for -pt_lights power sampling
@@ -3256,6 +4107,26 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	g_ptDev.list->CopyResource( g_ptBake.albedo.Get(), upAlb.Get() );
 	g_ptDev.list->CopyResource( g_ptBake.triFilter.Get(), upFilt.Get() );
 	g_ptDev.list->CopyResource( g_ptBake.triAlpha.Get(), upAlpha.Get() );
+	g_ptDev.list->CopyResource( g_ptBake.triSurf.Get(), upBrdf.Get() );
+
+	std::vector<float> mirrorHost;
+	VRadBrdf_PackMirrorGpu( mirrorHost );
+	g_ptBake.mirrorCount = (uint32)VRadBrdf_MirrorCount();
+	const UINT64 mirrorBytes = (UINT64)mirrorHost.size() * sizeof( float );
+	ComPtr<ID3D12Resource> upMirror;
+	if ( !PtCreateBuffer( mirrorBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &upMirror, L"upMirror" ) ) return false;
+	if ( !PtCreateBuffer( mirrorBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &g_ptBake.mirrorTris, L"MirrorTris" ) ) return false;
+	{
+		float *pm = nullptr;
+		if ( FAILED( upMirror->Map( 0, nullptr, (void **)&pm ) ) || !pm )
+		{
+			Warning( "[PathTrace-DXR] GPU bake: Map() failed uploading mirror tris.\n" );
+			return false;
+		}
+		memcpy( pm, mirrorHost.data(), (size_t)mirrorBytes );
+		upMirror->Unmap( 0, nullptr );
+	}
+	g_ptDev.list->CopyResource( g_ptBake.mirrorTris.Get(), upMirror.Get() );
 	{
 		const UINT64 rowPitch = ( (UINT64)g_ptBake.filterAtlasW * 4u + 255u ) & ~255ull;
 		const UINT64 slicePitch = rowPitch * g_ptBake.filterAtlasH;
@@ -3333,9 +4204,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 					g_ptBake.projCookieW, g_ptBake.projCookieH, g_ptBake.projCookieLayers );
 	CopyTex2DArray( g_ptBake.projCubes.Get(), upProjCube.Get(),
 					g_ptBake.projCubeW, g_ptBake.projCubeH, g_ptBake.projCubeLayers );
+	CopyTex2DArray( g_ptBake.surfAtlas.Get(), upSurfArray.Get(),
+					g_ptBake.surfAtlasW, g_ptBake.surfAtlasH, g_ptBake.surfAtlasLayers );
 
-	D3D12_RESOURCE_BARRIER bars[21] = {};
-	for ( int i = 0; i < 21; ++i )
+	D3D12_RESOURCE_BARRIER bars[24] = {};
+	for ( int i = 0; i < 24; ++i )
 	{
 		bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		bars[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -3363,7 +4236,10 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 	bars[18].Transition.pResource = g_ptBake.waterVols.Get();
 	bars[19].Transition.pResource = g_ptBake.triAlpha.Get();
 	bars[20].Transition.pResource = g_ptBake.alphaAtlas.Get();
-	g_ptDev.list->ResourceBarrier( 21, bars );
+	bars[21].Transition.pResource = g_ptBake.triSurf.Get();
+	bars[22].Transition.pResource = g_ptBake.surfAtlas.Get();
+	bars[23].Transition.pResource = g_ptBake.mirrorTris.Get();
+	g_ptDev.list->ResourceBarrier( 24, bars );
 	g_ptDev.list->Close();
 	ID3D12CommandList *lists[] = { g_ptDev.list.Get() };
 	g_ptDev.queue->ExecuteCommandLists( 1, lists );
@@ -3427,7 +4303,7 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 			pa[i * 8 + 0] = L.pos[0]; pa[i * 8 + 1] = L.pos[1]; pa[i * 8 + 2] = L.pos[2]; pa[i * 8 + 3] = L.luxelWorld;
 			pa[i * 8 + 4] = L.normal[0]; pa[i * 8 + 5] = L.normal[1]; pa[i * 8 + 6] = L.normal[2];
 			*(uint32 *)&pa[i * 8 + 7] = L.seed;
-			pb[i * 8 + 0] = L.axisU[0]; pb[i * 8 + 1] = L.axisU[1]; pb[i * 8 + 2] = L.axisU[2]; pb[i * 8 + 3] = 0;
+			pb[i * 8 + 0] = L.axisU[0]; pb[i * 8 + 1] = L.axisU[1]; pb[i * 8 + 2] = L.axisU[2]; pb[i * 8 + 3] = L.padU;
 			pb[i * 8 + 4] = L.axisV[0]; pb[i * 8 + 5] = L.axisV[1]; pb[i * 8 + 6] = L.axisV[2]; pb[i * 8 + 7] = 0;
 			pc[i * 4 + 0] = L.faceNum; pc[i * 4 + 1] = L.aaN; pc[i * 4 + 2] = L.skipPropIndex;
 			pc[i * 4 + 3] = max( L.sampleScale, 1 );
@@ -3639,14 +4515,29 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 		srv.Texture2DArray.ArraySize = g_ptBake.alphaAtlasLayers;
 		g_ptDev.device->CreateShaderResourceView( g_ptBake.alphaAtlas.Get(), &srv, at( 27 ) );
 	}
+	// t28 SurfMeta
+	makeF4( g_ptBake.triSurf.Get(), g_ptBake.triCount * 3, 28 );
+	// t29 SurfArray
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+		srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+		srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srv.Texture2DArray.MipLevels = 1;
+		srv.Texture2DArray.FirstArraySlice = 0;
+		srv.Texture2DArray.ArraySize = g_ptBake.surfAtlasLayers;
+		g_ptDev.device->CreateShaderResourceView( g_ptBake.surfAtlas.Get(), &srv, at( 29 ) );
+	}
+	// t30 MirrorTris (5 float4 / tri)
+	makeF4( g_ptBake.mirrorTris.Get(), max( g_ptBake.mirrorCount, 1u ) * 5u, 30 );
 	{
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
 		uav.Format = DXGI_FORMAT_UNKNOWN;
 		uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
 		uav.Buffer.NumElements = g_ptBake.luxelCap;
 		uav.Buffer.StructureByteStride = sizeof( float ) * 4;
-		// Heap: SRV t0..t27 (28), then UAV u0 at index 28
-		g_ptDev.device->CreateUnorderedAccessView( g_ptBake.outBuf.Get(), nullptr, &uav, at( 28 ) );
+		// Heap: SRV t0..t30 (31), then UAV u0 at index 31
+		g_ptDev.device->CreateUnorderedAccessView( g_ptBake.outBuf.Get(), nullptr, &uav, at( 31 ) );
 	}
 
 	ID3D12DescriptorHeap *heaps[] = { g_ptBake.heap.Get() };
@@ -3687,7 +4578,7 @@ bool PathTraceDXR_GpuBakeLuxels( const PtGpuBakeLuxel *luxels, uint32_t nLuxels,
 	cb[28] = g_ptBake.waterVolCount;
 	cb[29] = g_ptBake.waterMode;
 	cb[30] = g_ptBake.uwMaxScatter;
-	cb[31] = 0;
+	cb[31] = g_ptBake.mirrorCount;
 	g_ptDev.list->SetComputeRoot32BitConstants( 1, 32, cb, 0 );
 	g_ptDev.list->Dispatch( ( nLuxels + 63 ) / 64, 1, 1 );
 

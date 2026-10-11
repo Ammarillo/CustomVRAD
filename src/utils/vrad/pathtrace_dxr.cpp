@@ -26,6 +26,7 @@
 #include "vrad_emit.h"
 #include "vrad_emit_area.h"
 #include "vrad_filter.h"
+#include "vrad_brdf.h"
 #include "oklab.h"
 #include "bsplib.h"
 #include "pt_spectral.h"
@@ -553,17 +554,21 @@ static void PtWelfordChunk( float L, float &meanL, float &m2, int &nChunks )
 	m2 += d * (L - meanL);
 }
 
-// Path CV estimated from equal-size chunk means (Tamstorf/Jensen-style).
+// Relative standard error of the chunk-mean luminance. Path CV does not shrink
+// as spp grows, so testing it ran most luxels out to -pt_adaptive_max and pinned
+// the GPU for the whole cap on every compile.
 static bool PtLuxelNeedsMoreSpp( float meanL, float m2, int nChunks, int chunkSpp, int nSpp, int sppCap )
 {
-	if ( nSpp >= sppCap || nChunks < 2 || chunkSpp < 1 )
+	(void)chunkSpp;
+	if ( nSpp >= sppCap || nChunks < 2 )
 		return false;
-	if ( meanL < 1e-8f )
+	if ( meanL < 1e-4f )
 		return false;
 	const float varChunk = m2 / (float)( nChunks - 1 );
-	const float varPath = max( 0.0f, varChunk * (float)chunkSpp );
-	const float cv = sqrtf( varPath ) / max( meanL, 1e-5f );
-	return cv > 0.30f;
+	if ( varChunk <= 0.0f )
+		return false;
+	const float se = sqrtf( varChunk / (float)nChunks ) / meanL;
+	return se > 0.05f;
 }
 
 // Fast albedo: bound cluster walk (adaptivechop maps can have huge patch lists).
@@ -667,7 +672,7 @@ static float PtVisibility( const Vector &from, const Vector &to )
 // Lifting along the receiving normal is not enough: a floor sample next to a
 // wall is still in the contact shadow. Also push away from each nearby side
 // wall so hemisphere/NEE rays don't immediately hit the adjacent occluder.
-static Vector PtLuxelOriginInFront( const Vector &samplePos, const Vector &faceNormal, float luxelWorld )
+static Vector PtLuxelOriginInFront( const Vector &samplePos, const Vector &faceNormal, float luxelWorld, int skipTriId = 0 )
 {
 	const float baseBias = max( 1.0f, max( g_flPtOccludeBias * 0.4f, luxelWorld * 0.35f ) );
 	Vector pos = samplePos + faceNormal * baseBias;
@@ -693,7 +698,7 @@ static Vector PtLuxelOriginInFront( const Vector &samplePos, const Vector &faceN
 		float t[1];
 		unsigned int flags[1], hit[1];
 		Vector hitN[1];
-		if ( !PathTraceDXR_TraceClosest( origins, dirs, tmins, tmaxs, t, flags, hit, 1, hitN ) )
+		if ( !PathTraceDXR_TraceClosest( origins, dirs, tmins, tmaxs, t, flags, hit, 1, hitN, skipTriId ) )
 			continue;
 		if ( !hit[0] || ( flags[0] & TRACE_ID_SKY ) )
 			continue;
@@ -753,9 +758,9 @@ static Vector PtLuxelOriginInFront( const Vector &samplePos, const Vector &faceN
 	return pos + faceNormal * extraN + planar;
 }
 
-void PathTraceDXR_LuxelOriginInFront( const Vector &samplePos, const Vector &faceNormal, float luxelWorld, Vector &outPos )
+void PathTraceDXR_LuxelOriginInFront( const Vector &samplePos, const Vector &faceNormal, float luxelWorld, Vector &outPos, int skipTriId )
 {
-	outPos = PtLuxelOriginInFront( samplePos, faceNormal, luxelWorld );
+	outPos = PtLuxelOriginInFront( samplePos, faceNormal, luxelWorld, skipTriId );
 }
 
 enum
@@ -1142,7 +1147,7 @@ static void PtSampleTriangle( const VRadEmitTri_t &t, float u0, float u1, Vector
 // PBRT DiffuseAreaLight NEE: power-pick triangle (or all tris), uniform area sample,
 // textured L_e via vertex colors / live sample. -pt_emit_samples controls K.
 static Vector PtSampleEmitArea( const Vector &pos, const Vector &normal, unsigned int seed,
-								int skipFace, int nSamples )
+								int skipFace, int nSamples, float specRough = -1.0f, const Vector *pSpecWo = nullptr )
 {
 	Vector sum( 0, 0, 0 );
 	const int nTris = VRadEmitArea_TriCount();
@@ -1220,40 +1225,496 @@ static Vector PtSampleEmitArea( const Vector &pos, const Vector &normal, unsigne
 		if ( vis.x + vis.y + vis.z < 1e-6f )
 			continue;
 
-		sum.x += Le.x * ( ndl * emitterCos * absScale * vis.x / ( dist * dist * pdf ) );
-		sum.y += Le.y * ( ndl * emitterCos * absScale * vis.y / ( dist * dist * pdf ) );
-		sum.z += Le.z * ( ndl * emitterCos * absScale * vis.z / ( dist * dist * pdf ) );
+		Vector add;
+		add.x = Le.x * ( ndl * emitterCos * absScale * vis.x / ( dist * dist * pdf ) );
+		add.y = Le.y * ( ndl * emitterCos * absScale * vis.y / ( dist * dist * pdf ) );
+		add.z = Le.z * ( ndl * emitterCos * absScale * vis.z / ( dist * dist * pdf ) );
+		if ( specRough >= 0.0f && pSpecWo )
+			add *= VRadBrdf_GgxShape( normal, *pSpecWo, delta, specRough );
+		sum += add;
 	}
 	if ( !sampleAll )
 		sum *= ( 1.0f / (float)k );
 	return sum;
 }
 
+static Vector PtLightPrimaryDir( directlight_t *dl, const Vector &pos )
+{
+	if ( dl->light.type == emit_skylight )
+	{
+		Vector axis = -dl->light.normal;
+		VectorNormalize( axis );
+		return axis;
+	}
+	Vector wi = dl->light.origin - pos;
+	VectorNormalize( wi );
+	return wi;
+}
+
+static bool PtRayTri( const Vector &orig, const Vector &dir, float tmax,
+					 const Vector &v0, const Vector &v1, const Vector &v2,
+					 float &tOut, Vector &hitOut )
+{
+	const Vector e1 = v1 - v0;
+	const Vector e2 = v2 - v0;
+	Vector pvec;
+	CrossProduct( dir, e2, pvec );
+	const float det = DotProduct( e1, pvec );
+	if ( fabsf( det ) < 1e-8f )
+		return false;
+	const float inv = 1.0f / det;
+	const Vector s = orig - v0;
+	const float u = DotProduct( s, pvec ) * inv;
+	if ( u < 0.0f || u > 1.0f )
+		return false;
+	Vector qvec;
+	CrossProduct( s, e1, qvec );
+	const float v = DotProduct( dir, qvec ) * inv;
+	if ( v < 0.0f || u + v > 1.0f )
+		return false;
+	const float t = DotProduct( e2, qvec ) * inv;
+	if ( t < 1.0f || t > tmax - 0.5f )
+		return false;
+	tOut = t;
+	hitOut = orig + dir * t;
+	return true;
+}
+
+static Vector PtSchlick( const Vector &f0, float cosTheta )
+{
+	const float c = max( 0.0f, min( 1.0f, cosTheta ) );
+	const float m = 1.0f - c;
+	const float m2 = m * m;
+	const float m5 = m2 * m2 * m;
+	Vector F;
+	F.x = f0.x + ( 1.0f - f0.x ) * m5;
+	F.y = f0.y + ( 1.0f - f0.y ) * m5;
+	F.z = f0.z + ( 1.0f - f0.z ) * m5;
+	return F;
+}
+
+static Vector PtClosestOnTri( const Vector &p, const Vector &a, const Vector &b, const Vector &c )
+{
+	const Vector ab = b - a;
+	const Vector ac = c - a;
+	const Vector ap = p - a;
+	const float d1 = DotProduct( ab, ap );
+	const float d2 = DotProduct( ac, ap );
+	if ( d1 <= 0.0f && d2 <= 0.0f )
+		return a;
+	const Vector bp = p - b;
+	const float d3 = DotProduct( ab, bp );
+	const float d4 = DotProduct( ac, bp );
+	if ( d3 >= 0.0f && d4 <= d3 )
+		return b;
+	const float vc = d1 * d4 - d3 * d2;
+	if ( vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f )
+	{
+		const float v = d1 / ( d1 - d3 );
+		return a + ab * v;
+	}
+	const Vector cp = p - c;
+	const float d5 = DotProduct( ab, cp );
+	const float d6 = DotProduct( ac, cp );
+	if ( d6 >= 0.0f && d5 <= d6 )
+		return c;
+	const float vb = d5 * d2 - d1 * d6;
+	if ( vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f )
+	{
+		const float w = d2 / ( d2 - d6 );
+		return a + ac * w;
+	}
+	const float va = d3 * d6 - d5 * d4;
+	if ( va <= 0.0f && ( d4 - d3 ) >= 0.0f && ( d5 - d6 ) >= 0.0f )
+	{
+		const float w = ( d4 - d3 ) / ( ( d4 - d3 ) + ( d5 - d6 ) );
+		return b + ( c - b ) * w;
+	}
+	const float denom = 1.0f / ( va + vb + vc );
+	return a + ab * ( vb * denom ) + ac * ( vc * denom );
+}
+
+// GGX peak ratio at the surface. 1 on the mirror direction, falling off with roughness.
+static float PtGlossPeakRatio( float ndoth, float rough )
+{
+	float r = rough;
+	if ( r < 0.02f )
+		r = 0.02f;
+	if ( r > 1.0f )
+		r = 1.0f;
+	const float alpha = r * r;
+	const float a2 = alpha * alpha;
+	const float d = ndoth * ndoth * ( a2 - 1.0f ) + 1.0f;
+	const float q = a2 / max( d, 1e-8f );
+	return q * q;
+}
+
+// Deterministic reflection. The ray has to land on the triangle. A miss uses the
+// closest point only while the half-vector there still sits in the GGX lobe, so
+// the beam widens around the real reflection and does not light the rest of the room.
+// pLightPos is a point/spot/area sample. pToLight is the sun direction (surface toward sun).
+static bool PtMirrorSpreadHit( const VRadBrdfMirrorTri_t &m, const Vector &pos, const Vector &dirIn,
+							   float tmax, Vector &hit, Vector &dirOut, float &tOut, float &weight,
+							   const Vector *pLightPos, const Vector *pToLight )
+{
+	const float denom = DotProduct( dirIn, m.n );
+	if ( fabsf( denom ) < 1e-6f )
+		return false;
+	const float t = DotProduct( m.v0 - pos, m.n ) / denom;
+	if ( t < 1.0f || t > tmax - 0.5f )
+		return false;
+	const Vector planeHit = pos + dirIn * t;
+	const Vector closest = PtClosestOnTri( planeHit, m.v0, m.v1, m.v2 );
+	const float miss = ( closest - planeHit ).Length();
+	const float gloss = 1.0f - max( 0.0f, min( 1.0f, m.roughness ) );
+	if ( gloss < 1e-3f )
+		return false;
+	if ( miss <= 0.02f )
+	{
+		weight = gloss;
+		hit = planeHit;
+		dirOut = dirIn;
+		tOut = t;
+		return true;
+	}
+	// Roughness 0 is the triangle itself. A slop on the shared edge lights it twice.
+	if ( m.roughness < kVRadBrdfMirrorRough )
+		return false;
+
+	Vector wo = pos - closest;
+	if ( VectorNormalize( wo ) < 1e-6f )
+		return false;
+	Vector wi;
+	if ( pLightPos )
+		wi = *pLightPos - closest;
+	else if ( pToLight )
+		wi = *pToLight;
+	else
+		return false;
+	if ( pLightPos && VectorNormalize( wi ) < 1e-6f )
+		return false;
+	if ( !pLightPos )
+		VectorNormalize( wi );
+	if ( DotProduct( m.n, wi ) <= 1e-4f || DotProduct( m.n, wo ) <= 1e-4f )
+		return false;
+	Vector half = wi + wo;
+	if ( VectorNormalize( half ) < 1e-6f )
+		return false;
+	const float ndoth = DotProduct( m.n, half );
+	if ( ndoth <= 0.0f )
+		return false;
+	const float ratio = PtGlossPeakRatio( ndoth, m.roughness );
+	if ( ratio < 0.04f )
+		return false;
+	Vector to = closest - pos;
+	const float dist = VectorNormalize( to );
+	if ( dist < 1.0f || DotProduct( to, dirIn ) <= 0.0f )
+		return false;
+	weight = gloss * ratio;
+	hit = closest;
+	dirOut = to;
+	tOut = dist;
+	return true;
+}
+
+// One-bounce specular connection (image method). Point, spot, sun, emit_surface, $vrad_emit.
+static Vector PtConnectMirrorLight( const VRadBrdfMirrorTri_t &m, directlight_t *dl,
+									const Vector &pos, const Vector &normal, int facenum )
+{
+	Vector zero( 0, 0, 0 );
+	if ( !dl )
+		return zero;
+	if ( m.face >= 0 && facenum >= 0 && m.face == facenum )
+		return zero;
+	if ( DotProduct( m.n, pos - m.v0 ) <= 0.5f )
+		return zero;
+
+	const float absScale = Absorb_DirectScale( pos );
+	Vector dir;
+	float distPath = 0.0f;
+	Vector hit;
+	float ndl = 0.0f;
+	float falloff = 1.0f;
+	float cone = 1.0f;
+	Vector lightPos;
+
+	if ( dl->light.type == emit_skylight )
+	{
+		Vector axis = -dl->light.normal;
+		VectorNormalize( axis );
+		// Direction from the receiver toward the mirror that sees the sun.
+		dir = axis - m.n * ( 2.0f * DotProduct( axis, m.n ) );
+		if ( VectorNormalize( dir ) < 1e-6f )
+			return zero;
+		float t = 0.0f;
+		float spread = 1.0f;
+		Vector dirUse;
+		if ( !PtMirrorSpreadHit( m, pos, dir, (float)MAX_TRACE_LENGTH, hit, dirUse, t, spread, nullptr, &axis ) )
+			return zero;
+		dir = dirUse;
+		ndl = DotProduct( normal, dir );
+		if ( ndl <= 0.0f )
+			return zero;
+		if ( DotProduct( m.n, axis ) <= 0.0f )
+			return zero;
+		const float wEnv = LightEnv_GetWeight( dl->m_nEnvId, pos );
+		if ( wEnv <= 0.0f )
+			return zero;
+		Vector visFrom = pos + normal * g_flPtOccludeBias;
+		if ( DotProduct( visFrom - pos, dir ) > t * 0.5f )
+			visFrom = pos;
+		Vector visR = PtVisibilityRGB( visFrom, hit );
+		float tHit = 0.0f;
+		Vector T;
+		const bool blocked = PtProbeOccluder( hit + m.n * 1.0f, axis, g_flPtOccludeBias,
+											  (float)MAX_TRACE_LENGTH, &tHit, true, &T );
+		if ( blocked )
+			return zero;
+		const float cosI = max( 0.0f, DotProduct( m.n, -dir ) );
+		const Vector F = PtSchlick( m.f0, cosI );
+		Vector sum;
+		sum.x = dl->light.intensity.x * F.x * ndl * wEnv * absScale * visR.x * T.x;
+		sum.y = dl->light.intensity.y * F.y * ndl * wEnv * absScale * visR.y * T.y;
+		sum.z = dl->light.intensity.z * F.z * ndl * wEnv * absScale * visR.z * T.z;
+		sum *= spread;
+		return sum;
+	}
+
+	if ( dl->light.type == emit_surface )
+	{
+		if ( facenum >= 0 && dl->facenum == facenum )
+			return zero;
+	}
+	else if ( dl->light.type != emit_point && dl->light.type != emit_spotlight )
+		return zero;
+
+	lightPos = dl->light.origin;
+	const float planeD = DotProduct( lightPos - m.v0, m.n );
+	const Vector virt = lightPos - m.n * ( 2.0f * planeD );
+	dir = virt - pos;
+	distPath = VectorNormalize( dir );
+	if ( distPath < 1.0f )
+		return zero;
+	float t = 0.0f;
+	float spread = 1.0f;
+	Vector dirUse;
+	if ( !PtMirrorSpreadHit( m, pos, dir, distPath, hit, dirUse, t, spread, &lightPos, nullptr ) )
+		return zero;
+	dir = dirUse;
+	ndl = DotProduct( normal, dir );
+	if ( ndl <= 0.0f )
+		return zero;
+	Vector toL = lightPos - hit;
+	const float distL = VectorNormalize( toL );
+	if ( distL < 1.0f || DotProduct( m.n, toL ) <= 0.0f )
+		return zero;
+	if ( dl->light.type == emit_spotlight )
+	{
+		cone = PtSpotCone( dl, -toL );
+		if ( cone <= 0.0f )
+			return zero;
+	}
+	const float pathLen = max( t + distL, 1.0f );
+	if ( dl->light.type == emit_surface )
+	{
+		const float emitterCos = -DotProduct( toL, dl->light.normal );
+		falloff = PtSurfaceFalloff( dl, pathLen, emitterCos );
+	}
+	else
+		falloff = PtPointFalloff( dl, pathLen );
+	if ( falloff <= 0.0f )
+		return zero;
+	Vector visFrom = pos + normal * g_flPtOccludeBias;
+	if ( DotProduct( visFrom - pos, dir ) > t * 0.5f )
+		visFrom = pos;
+	Vector visR = PtVisibilityRGB( visFrom, hit );
+	Vector visL = PtVisibilityRGB( hit + m.n * 1.0f, lightPos );
+	if ( visR.x + visR.y + visR.z < 1e-6f || visL.x + visL.y + visL.z < 1e-6f )
+		return zero;
+	const float cosI = max( 0.0f, DotProduct( m.n, -dir ) );
+	const Vector F = PtSchlick( m.f0, cosI );
+	Vector intensity = dl->light.intensity;
+	Vector sum;
+	sum.x = intensity.x * F.x * ( ndl * falloff * cone * absScale * visR.x * visL.x );
+	sum.y = intensity.y * F.y * ( ndl * falloff * cone * absScale * visR.y * visL.y );
+	sum.z = intensity.z * F.z * ( ndl * falloff * cone * absScale * visR.z * visL.z );
+	sum *= spread;
+	return sum;
+}
+
+// Area-light image: reflect one sample on an emit triangle across the mirror plane.
+static Vector PtConnectMirrorEmitTri( const VRadBrdfMirrorTri_t &m, const VRadEmitTri_t &t,
+									  const Vector &lightPos, const Vector &Le, float pdf,
+									  const Vector &pos, const Vector &normal, int facenum )
+{
+	Vector zero( 0, 0, 0 );
+	if ( pdf <= 1e-20f )
+		return zero;
+	if ( m.face >= 0 && facenum >= 0 && m.face == facenum )
+		return zero;
+	if ( facenum >= 0 && t.facenum == facenum )
+		return zero;
+	if ( DotProduct( m.n, pos - m.v0 ) <= 0.5f )
+		return zero;
+
+	const float planeD = DotProduct( lightPos - m.v0, m.n );
+	const Vector virt = lightPos - m.n * ( 2.0f * planeD );
+	Vector dir = virt - pos;
+	const float distPath = VectorNormalize( dir );
+	if ( distPath < 1.0f )
+		return zero;
+	float th = 0.0f;
+	float spread = 1.0f;
+	Vector hit;
+	Vector dirUse;
+	if ( !PtMirrorSpreadHit( m, pos, dir, distPath, hit, dirUse, th, spread, &lightPos, nullptr ) )
+		return zero;
+	dir = dirUse;
+	const float ndl = DotProduct( normal, dir );
+	if ( ndl <= 0.0f )
+		return zero;
+	Vector toL = lightPos - hit;
+	const float distL = VectorNormalize( toL );
+	if ( distL < 1.0f || DotProduct( m.n, toL ) <= 0.0f )
+		return zero;
+	const float emitterCos = -DotProduct( toL, t.n );
+	if ( emitterCos <= 0.0f )
+		return zero;
+
+	Vector visFrom = pos + normal * g_flPtOccludeBias;
+	if ( DotProduct( visFrom - pos, dir ) > th * 0.5f )
+		visFrom = pos;
+	Vector visR = PtVisibilityRGB( visFrom, hit );
+	Vector visL = PtVisibilityRGB( hit + m.n * 1.0f, lightPos );
+	if ( visR.x + visR.y + visR.z < 1e-6f || visL.x + visL.y + visL.z < 1e-6f )
+		return zero;
+
+	const float cosI = max( 0.0f, DotProduct( m.n, -dir ) );
+	const Vector F = PtSchlick( m.f0, cosI );
+	const float absScale = Absorb_DirectScale( pos );
+	const float pathLen = max( th + distL, 1.0f );
+	const float geom = ndl * emitterCos * absScale * spread / ( pathLen * pathLen * pdf );
+	Vector sum;
+	sum.x = Le.x * F.x * geom * visR.x * visL.x;
+	sum.y = Le.y * F.y * geom * visR.y * visL.y;
+	sum.z = Le.z * F.z * geom * visR.z * visL.z;
+	return sum;
+}
+
+static Vector PtSampleMirrorConnections( const Vector &pos, const Vector &normal, unsigned int seed, int facenum )
+{
+	Vector sum( 0, 0, 0 );
+	const int nM = VRadBrdf_MirrorCount();
+	const VRadBrdfMirrorTri_t *tris = VRadBrdf_MirrorTris();
+	if ( nM <= 0 || !tris )
+		return sum;
+	for ( int mi = 0; mi < nM; ++mi )
+	{
+		for ( size_t i = 0; i < g_ptLocalLights.size(); ++i )
+			sum += PtConnectMirrorLight( tris[mi], g_ptLocalLights[i], pos, normal, facenum );
+		for ( size_t i = 0; i < g_ptSkyLights.size(); ++i )
+			sum += PtConnectMirrorLight( tris[mi], g_ptSkyLights[i], pos, normal, facenum );
+		for ( size_t i = 0; i < g_ptEmitLights.size(); ++i )
+			sum += PtConnectMirrorLight( tris[mi], g_ptEmitLights[i], pos, normal, facenum );
+	}
+
+	const int nTris = VRadEmitArea_TriCount();
+	if ( nTris > 0 && VRadEmitArea_PowerSum() > 0.0f )
+	{
+		const VRadEmitTri_t *etris = VRadEmitArea_Tris();
+		const float *cdf = VRadEmitArea_PowerCdf();
+		const bool sampleAll = ( g_nPathTraceEmitSamples <= 0 ) || ( g_nPathTraceEmitSamples >= nTris );
+		const int k = sampleAll ? nTris : g_nPathTraceEmitSamples;
+		Vector areaSum( 0, 0, 0 );
+		for ( int s = 0; s < k; ++s )
+		{
+			int idx;
+			float pPick = 1.0f;
+			if ( sampleAll )
+				idx = s;
+			else
+			{
+				float uPick = ( (float)s + PtHash( seed + (unsigned)s * 91u + 7u ) ) / (float)k;
+				if ( uPick < 1e-6f )
+					uPick = 1e-6f;
+				if ( uPick > 0.999999f )
+					uPick = 0.999999f;
+				int lo = 0, hi = nTris;
+				while ( lo + 1 < hi )
+				{
+					const int mid = ( lo + hi ) >> 1;
+					if ( cdf[mid] < uPick )
+						lo = mid;
+					else
+						hi = mid;
+				}
+				idx = lo;
+				const float cdf0 = ( idx == 0 ) ? 0.0f : cdf[idx - 1];
+				pPick = max( cdf[idx] - cdf0, 1e-12f );
+			}
+
+			const VRadEmitTri_t &t = etris[idx];
+			const float u0 = PtHash( seed + (unsigned)s * 97u + 11u );
+			const float u1 = PtHash( seed + (unsigned)s * 131u + 23u );
+			Vector lightPos, Le;
+			PtSampleTriangle( t, u0, u1, lightPos, Le );
+			lightPos += t.n * 1.0f;
+			Vector live;
+			if ( VRadEmit_SampleAtPos( t.facenum, lightPos - t.n * 1.0f, live ) )
+				VectorScale( live, lightscale * ( 100.0f * 100.0f ) / ( 128.0f * 128.0f ), Le );
+
+			const float pdfA = 1.0f / max( t.area, 1e-8f );
+			const float pdf = sampleAll ? pdfA : ( pPick * pdfA );
+			for ( int mi = 0; mi < nM; ++mi )
+				areaSum += PtConnectMirrorEmitTri( tris[mi], t, lightPos, Le, pdf, pos, normal, facenum );
+		}
+		if ( !sampleAll )
+			areaSum *= ( 1.0f / (float)k );
+		sum += areaSum;
+	}
+	return sum;
+}
+
 static Vector PtSampleDirect( const Vector &pos, const Vector &normal, unsigned int seed, float *pSunAmt,
-							  int facenum, unsigned neeFlags )
+							  int facenum, unsigned neeFlags, float specRough = -1.0f, const Vector *pSpecWo = nullptr )
 {
 	Vector sum( 0, 0, 0 );
 	float sunAmt = 0.0f;
 
 	for ( size_t i = 0; i < g_ptSkyLights.size(); ++i )
-		sum += PtEvalOneDirectLight( g_ptSkyLights[i], pos, normal, seed, &sunAmt, facenum, neeFlags );
+	{
+		Vector c = PtEvalOneDirectLight( g_ptSkyLights[i], pos, normal, seed, &sunAmt, facenum, neeFlags );
+		if ( specRough >= 0.0f && pSpecWo )
+			c *= VRadBrdf_GgxShape( normal, *pSpecWo, PtLightPrimaryDir( g_ptSkyLights[i], pos ), specRough );
+		sum += c;
+	}
 
 	// lights.rad texlights still as emit_surface point proxies (not $vrad_emit mesh).
 	for ( size_t i = 0; i < g_ptEmitLights.size(); ++i )
-		sum += PtEvalOneDirectLight( g_ptEmitLights[i], pos, normal, seed + (unsigned int)i * 19u,
-									 nullptr, facenum, neeFlags );
+	{
+		Vector c = PtEvalOneDirectLight( g_ptEmitLights[i], pos, normal, seed + (unsigned int)i * 19u,
+										 nullptr, facenum, neeFlags );
+		if ( specRough >= 0.0f && pSpecWo )
+			c *= VRadBrdf_GgxShape( normal, *pSpecWo, PtLightPrimaryDir( g_ptEmitLights[i], pos ), specRough );
+		sum += c;
+	}
 
 	// $vrad_emit*: textured triangle area lights (not a grid of face centers).
 	if ( VRadEmitArea_TriCount() > 0 )
-		sum += PtSampleEmitArea( pos, normal, seed + 0xA11Eu, facenum, g_nPathTraceEmitSamples );
+		sum += PtSampleEmitArea( pos, normal, seed + 0xA11Eu, facenum, g_nPathTraceEmitSamples, specRough, pSpecWo );
 
 	const int nLocal = (int)g_ptLocalLights.size();
 	int k = g_nPathTraceLightSamples;
 	if ( k <= 0 || k >= nLocal )
 	{
 		for ( int i = 0; i < nLocal; ++i )
-			sum += PtEvalOneDirectLight( g_ptLocalLights[i], pos, normal, seed + (unsigned int)i * 17u,
-										 nullptr, facenum, neeFlags );
+		{
+			Vector c = PtEvalOneDirectLight( g_ptLocalLights[i], pos, normal, seed + (unsigned int)i * 17u,
+											 nullptr, facenum, neeFlags );
+			if ( specRough >= 0.0f && pSpecWo )
+				c *= VRadBrdf_GgxShape( normal, *pSpecWo, PtLightPrimaryDir( g_ptLocalLights[i], pos ), specRough );
+			sum += c;
+		}
 	}
 	else
 	{
@@ -1268,9 +1729,16 @@ static Vector PtSampleDirect( const Vector &pos, const Vector &normal, unsigned 
 			Vector c = PtEvalOneDirectLight( g_ptLocalLights[idx], pos, normal,
 											 seed + (unsigned int)( s + 1 ) * 131u,
 											 nullptr, facenum, neeFlags );
+			if ( specRough >= 0.0f && pSpecWo )
+				c *= VRadBrdf_GgxShape( normal, *pSpecWo, PtLightPrimaryDir( g_ptLocalLights[idx], pos ), specRough );
 			sum += c * ( 1.0f / ( p * (float)k ) );
 		}
 	}
+
+	// Smooth mirrors: connect this Lambertian vertex to lights through each mirror
+	// triangle (planar virtual light). GGX NEE cannot see a point light in a delta lobe.
+	if ( specRough < 0.0f )
+		sum += PtSampleMirrorConnections( pos, normal, seed, facenum );
 
 	if ( pSunAmt )
 		*pSunAmt = sunAmt;
@@ -1317,6 +1785,14 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 	const int maxMed = WaterMedium_MaxScatter();
 	bool bInMedium = false;
 	Vector medDir( 0, 0, 1 );
+	// <0 = Lambertian. The luxel stays Lambertian; roughness changes the surfaces it hits.
+	float lobeSpec = -1.0f;
+	float lobeRough = 1.0f;
+	Vector lobeWo = normal;
+	Vector lobeF0( 0, 0, 0 );
+	bool lobeVndf = false;
+	bool lobeHasDir = false;
+	Vector lobeDir = normal;
 
 	// -pt_bounces N = N indirect hops after the luxel (primary NEE). Path depth = N+1.
 	int pathDepth = maxBounces + 1;
@@ -1332,9 +1808,10 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 			neeFlags |= PT_NEE_SOFT;
 		// Medium vertices: use last scatter dir as shading normal so NEE prefers forward lobe.
 		Vector neeN = bInMedium ? medDir : normal;
+		const float specRough = bInMedium ? -1.0f : lobeSpec;
 		Vector nee = PtSampleDirect( pos, neeN,
 									 seed + (unsigned)bounce * 31u + (unsigned)sppIndex * 17u,
-									 &sunB, skipFace, neeFlags );
+									 &sunB, skipFace, neeFlags, specRough, ( specRough >= 0.0f ) ? &lobeWo : nullptr );
 		nee = PtClampFirefly( nee, 2500.0f );
 		radiance += throughput * nee;
 		if ( bounce == 0 )
@@ -1349,6 +1826,40 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 		{
 			dir = medDir;
 			pdfBsdf = 1.0f; // already sampled via HG previous event
+		}
+		else if ( lobeHasDir )
+		{
+			dir = lobeDir;
+			pdfBsdf = 1.0f;
+		}
+		else if ( lobeSpec >= 0.0f && lobeRough < kVRadBrdfMirrorRough )
+		{
+			dir = VRadBrdf_SampleGloss( normal, -lobeWo, lobeRough, u1, u2 );
+			pdfBsdf = 1.0f;
+		}
+		else if ( lobeSpec >= 0.0f )
+		{
+			// VNDF sample. Weight is F * G1(wi) / pSpec (the f*cos/pdf of visible-normal
+			// sampling). pSpec was applied when the lobe was chosen.
+			dir = VRadBrdf_SampleGloss( normal, -lobeWo, lobeRough, u1, u2 );
+			pdfBsdf = 1.0f;
+			if ( lobeVndf )
+			{
+				const float ndotl = max( 0.0f, DotProduct( normal, dir ) );
+				const float k = ( lobeRough + 1.0f ) * ( lobeRough + 1.0f ) / 8.0f;
+				const float g1 = ( ndotl > 1e-4f ) ? ( ndotl / ( ndotl * ( 1.0f - k ) + k ) ) : 0.0f;
+				Vector H = lobeWo + dir;
+				float cosH = 1.0f;
+				if ( VectorNormalize( H ) > 1e-6f )
+					cosH = max( 0.0f, DotProduct( lobeWo, H ) );
+				const Vector F = PtSchlick( lobeF0, cosH );
+				if ( lobeF0.x > 1e-5f )
+					throughput.x *= F.x * g1 / lobeF0.x;
+				if ( lobeF0.y > 1e-5f )
+					throughput.y *= F.y * g1 / lobeF0.y;
+				if ( lobeF0.z > 1e-5f )
+					throughput.z *= F.z * g1 / lobeF0.z;
+			}
 		}
 		else
 		{
@@ -1377,6 +1888,7 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 		Vector hitN;
 		hitN.Init( 0, 0, 1 );
 		bool bHit = false;
+		unsigned int hitFlags = 0;
 		int lastFace = -2;
 		float lastFilterT = -1e30f;
 		Vector lastFilterN( 0, 0, 0 );
@@ -1425,6 +1937,7 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 			bHit = true;
 			tHit = t[0];
 			hitN = nOut[0];
+			hitFlags = flags[0];
 			break;
 		}
 
@@ -1459,6 +1972,8 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 			pos = scatterPos;
 			medDir = wi;
 			bInMedium = true;
+			lobeSpec = -1.0f;
+			lobeHasDir = false;
 			normal = wi;
 			skipFace = -1;
 
@@ -1518,7 +2033,53 @@ static Vector PtPathLi( const Vector &posIn, const Vector &normalIn, unsigned in
 		albedo.y = min( 1.0f, max( 0.0f, albedo.y ) );
 		albedo.z = min( 1.0f, max( 0.0f, albedo.z ) );
 
-		throughput *= albedo;
+		int brdfFace = -1;
+		if ( hitFlags & TRACE_ID_FILTER )
+			brdfFace = (int)( hitFlags & 0x00FFFFFFu );
+		else if ( hitFlags & TRACE_ID_OPAQUE )
+		{
+			const unsigned packed = hitFlags & 0x00FFFFFFu;
+			if ( packed != 0 )
+				brdfFace = (int)packed - 1;
+		}
+		VRadBrdfSample_t rm = VRadBrdf_SampleFace( brdfFace, hitPos );
+		VRadBrdfLobes_t lobes = VRadBrdf_Lobes( albedo, rm.roughness, rm.metalness );
+		Vector lobeW = albedo;
+		lobeSpec = -1.0f;
+		lobeRough = 1.0f;
+		lobeVndf = false;
+		lobeHasDir = false;
+		// Reflection stays on, but a ray that dies in the seam beside the hit is
+		// replaced by the diffuse bounce. That seam hit is the noisy edge.
+		// Direct lights still use the steady connection. lobeSpec stays clear so
+		// the light sample does not add a second random spike.
+		if ( rm.authored && !lobes.legacy && rm.roughness < 0.98f && lobes.pSpec > 1e-4f )
+		{
+			const float uLobe = PtHash( seed + (unsigned)bounce * 59u + (unsigned)sppIndex * 23u + 17u );
+			Vector refl = dir - hitNormal * ( 2.0f * DotProduct( dir, hitNormal ) );
+			if ( uLobe < lobes.pSpec && VectorNormalize( refl ) > 1e-6f )
+			{
+				float seamT = 0.0f;
+				const Vector origin = hitPos + hitNormal * 1.0f;
+				const bool seam = PtProbeOccluder( origin, refl, 0.5f, 24.0f, &seamT, false, nullptr );
+				if ( !seam )
+				{
+					lobeHasDir = true;
+					lobeDir = refl;
+					lobeW = lobes.sharp * ( 1.0f / lobes.pSpec );
+				}
+				else
+					lobeW = lobes.wide + lobes.sharp;
+			}
+			else
+			{
+				const float inv = 1.0f / max( 1.0f - lobes.pSpec, 1e-4f );
+				lobeW = lobes.wide * inv;
+			}
+		}
+		else if ( rm.authored && !lobes.legacy )
+			lobeW = lobes.wide;
+		throughput *= lobeW;
 
 		if ( bounce >= 1 )
 		{
@@ -2953,7 +3514,7 @@ static void PtPackGpuLights( std::vector<PtGpuBakeLight> &out, std::vector<float
 			{
 				L.projMode = 1.0f;
 				L.projLayer = layer;
-				L.projFrameMode = ( dl->m_nProjFrameMode == (int)PROJ_FRAME_FIT ) ? 1 : 0;
+				L.projFrameMode = dl->m_nProjFrameMode; // 0=fill, 1=fit, 2=hdri, 3=six-face
 				++nProj;
 			}
 			else if ( layer >= 0 && kind == PROJ_CUBE )
@@ -3234,6 +3795,9 @@ static bool PathTraceBakeWorldFacesGPU()
 	std::vector<float> alphaMeta;
 	ShadowAlphaGpuArray_t alphaArray;
 	PtBuildTriAlphaGpu( alphaMeta, alphaArray );
+	std::vector<float> brdfMeta;
+	VRadBrdfGpuArray_t brdfArray;
+	VRadBrdf_BuildGpuUpload( brdfArray, brdfMeta );
 
 	PtGpuBakeParams params = {};
 	params.spp = 1; // real spp set per pass via GpuBakeConfigurePass
@@ -3342,7 +3906,12 @@ static bool PathTraceBakeWorldFacesGPU()
 									 alphaArray.rgba.data(),
 									 (uint32_t)alphaArray.width,
 									 (uint32_t)alphaArray.height,
-									 (uint32_t)alphaArray.layers ) )
+									 (uint32_t)alphaArray.layers,
+									 brdfMeta.data(),
+									 brdfArray.rgba.data(),
+									 (uint32_t)brdfArray.width,
+									 (uint32_t)brdfArray.height,
+									 (uint32_t)brdfArray.layers ) )
 	{
 		Warning( "[PathTrace-DXR] GPU baker init failed - falling back to CPU.\n" );
 		return false;
@@ -3819,6 +4388,7 @@ bool PathTraceDXR_BakeWorldFaces()
 	else if ( g_bPathTraceCpuForced )
 	{
 		Msg( "[PathTrace-DXR] CPU path tracer forced (-pt_cpu).\n" );
+		VRadBrdf_EnsureCache();
 	}
 	else if ( !bDxrOk )
 	{
@@ -3826,7 +4396,10 @@ bool PathTraceDXR_BakeWorldFaces()
 	}
 
 	if ( !bGpuOk && !g_bInterrupt && !( bGpuAttempted && g_ptFacesBaked.load() > 0 ) )
+	{
+		VRadBrdf_EnsureCache();
 		RunThreadsOnIndividual( numfaces, false, PathTraceFaceWorker );
+	}
 
 	const double elapsed = Plat_FloatTime() - g_ptBakeStartTime;
 	char elapsedStr[32];
@@ -3877,6 +4450,9 @@ static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int sof
 	std::vector<float> alphaMeta;
 	ShadowAlphaGpuArray_t alphaArray;
 	PtBuildTriAlphaGpu( alphaMeta, alphaArray );
+	std::vector<float> brdfMeta;
+	VRadBrdfGpuArray_t brdfArray;
+	VRadBrdf_BuildGpuUpload( brdfArray, brdfMeta );
 
 	PtGpuBakeParams params = {};
 	params.spp = 1;
@@ -3969,7 +4545,12 @@ static bool PathTraceBeginGpuBakeSession( int bounces, int lightSamples, int sof
 									  alphaArray.rgba.data(),
 									  (uint32_t)alphaArray.width,
 									  (uint32_t)alphaArray.height,
-									  (uint32_t)alphaArray.layers );
+									  (uint32_t)alphaArray.layers,
+									  brdfMeta.data(),
+									  brdfArray.rgba.data(),
+									  (uint32_t)brdfArray.width,
+									  (uint32_t)brdfArray.height,
+									  (uint32_t)brdfArray.layers );
 }
 
 bool PathTraceDXR_BakePropSamples( const PtGpuBakeLuxel *samples, unsigned nSamples,

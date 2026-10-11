@@ -1809,7 +1809,7 @@ static void BuildLuxelEmbedMask( const lightinfo_t &l, int width, int height, CU
 		outHit.SetCount( nRays );
 		outN.SetCount( nRays );
 		if ( PathTraceDXR_TraceClosest( origins.Base(), dirs.Base(), tmins.Base(), tmaxs.Base(),
-				outT.Base(), outFlags.Base(), outHit.Base(), nRays, outN.Base() ) )
+				outT.Base(), outFlags.Base(), outHit.Base(), nRays, outN.Base(), 0, true ) )
 		{
 			for ( int i = 0; i < nRays; ++i )
 			{
@@ -1891,7 +1891,7 @@ static void BuildLuxelEmbedMask( const lightinfo_t &l, int width, int height, CU
 	outHit.SetCount( nSide );
 	outN.SetCount( nSide );
 	if ( !PathTraceDXR_TraceClosest( origins.Base(), dirs.Base(), tmins.Base(), tmaxs.Base(),
-			outT.Base(), outFlags.Base(), outHit.Base(), nSide, outN.Base() ) )
+			outT.Base(), outFlags.Base(), outHit.Base(), nSide, outN.Base(), 0, true ) )
 		return;
 
 	for ( int i = 0; i < nSide; ++i )
@@ -1938,6 +1938,45 @@ static const unsigned char *LuxelEmbedMask( int facenum, int width, int height, 
 	}
 	ThreadUnlock();
 	return NULL;
+}
+
+static void BuildEmbedMasks( int iThread, int facenum )
+{
+	(void)iThread;
+	if ( facenum < 0 || facenum >= numfaces )
+		return;
+
+	dface_t *f = &g_pFaces[facenum];
+	if ( texinfo[f->texinfo].flags & TEX_SPECIAL || f->dispinfo != -1 )
+		return;
+
+	facelight_t *fl = &facelight[facenum];
+	if ( !fl->numluxels )
+		return;
+
+	const int width = f->m_LightmapTextureSizeInLuxels[0] + 1;
+	const int height = f->m_LightmapTextureSizeInLuxels[1] + 1;
+	if ( width < 2 || height < 2 || width * height != fl->numluxels )
+		return;
+
+	lightinfo_t l;
+	InitLightinfo( &l, facenum );
+	LuxelEmbedMask( facenum, width, height, l );
+}
+
+void PrecomputeLuxelEmbedMasks()
+{
+	EnsureCreaseVertexHash();
+
+	ThreadLock();
+	if ( !g_LuxelEmbedMaskInit )
+	{
+		g_LuxelEmbedMask.SetCount( numfaces );
+		g_LuxelEmbedMaskInit = true;
+	}
+	ThreadUnlock();
+
+	RunThreadsOnIndividual( numfaces, true, BuildEmbedMasks );
 }
 
 // Black texels inside an intersecting solid bilinear-filter onto the visible

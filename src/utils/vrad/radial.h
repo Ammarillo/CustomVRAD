@@ -80,6 +80,10 @@ radial_t *BuildPatchRadial( int facenum );
 // bPathTraceNarrow: tighter blend (path-trace soft shadows without blotching).
 void StitchLightmapSeams( bool bPathTraceNarrow = false );
 
+// Build per-face solid/prop embed masks before FinalLightFace so 32 workers
+// do not each fire a GPU closest-trace (looks hung at "FinalLightFace: 0").
+void PrecomputeLuxelEmbedMasks();
+
 // Dilate dark outer luxels on concave creases (and any non-coplanar border
 // whose last luxel is a sharp outlier) from that row's own stable interior texel.
 // A light/shadow terminator keeps each side. Diagonal concave edges fill luxels

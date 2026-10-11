@@ -16,10 +16,16 @@ bool PathTraceDXR_DeviceReady();
 // outHit[i]=1 on triangle hit; outFlags = TRACE_ID_* from scene.
 // outNormal may be NULL; when non-NULL, receives geometric shading normal (unit) on hit.
 // Uses DXR RayQuery for large batches when the device is ready; else SSE Trace4Rays.
+// skipTriId: exact triangle id to ignore (0 = none). Used so a prop's crease-bias
+// probes do not treat that prop's own mesh as a side wall. GPU batches ignore it.
+// bForceCpu: skip DXR even for large batches. FinalLightFace embed-mask probes
+// must use this — a GPU submit per face serializes 32 workers on g_ptDev.mutex
+// and sticks the pacifier at "FinalLightFace: 0".
 bool PathTraceDXR_TraceClosest( const Vector *origins, const Vector *dirs,
 								const float *tmins, const float *tmaxs,
 								float *outT, unsigned int *outFlags, unsigned int *outHit,
-								int nRays, Vector *outNormal = NULL );
+								int nRays, Vector *outNormal = NULL, int skipTriId = 0,
+								bool bForceCpu = false );
 
 // ---------------------------------------------------------------------------
 // Full GPU luxel path baker (RayQuery integrator). Hard NEE + cosine GI.
@@ -65,7 +71,7 @@ struct PtGpuBakeLight
 	float	projUp[3];
 	float	projMode;		// 0=none, 1=2D planar, 2=cube, 3=spheremap/equirect
 	int		projLayer;		// planar layer or cube index
-	int		projFrameMode;	// 0=fill, 1=fit (2D only)
+	int		projFrameMode;	// planar: 0=fill, 1=fit, 2=hdri, 3=six-face; sphere: 1=equirect, 0=matcap
 };
 
 struct PtGpuBakeLuxel
@@ -75,12 +81,12 @@ struct PtGpuBakeLuxel
 	float		normal[3];
 	uint32_t	seed;
 	float		axisU[3];
-	float		padU;
+	float		padU;		// >0: lightmap near self-skip distance; 0 + skipPropIndex>=0 = full skip
 	float		axisV[3];
 	float		padV;
 	int			faceNum;
 	int			aaN;		// 1..5
-	int			skipPropIndex;	// -1 = allow self-shadow; >=0 skip TRACE_ID_STATICPROP|id
+	int			skipPropIndex;	// -1 = no prop skip; >=0 this prop (full if padU==0, near if padU>0)
 	int			sampleScale;	// paths per nominal spp sample (world narrow-chart convergence)
 };
 
@@ -165,7 +171,11 @@ bool PathTraceDXR_GpuBakeBegin( const PtGpuBakeLight *lights, uint32_t nLights,
 								const float *alphaMeta = nullptr,
 								const unsigned char *alphaArrayRGBA = nullptr,
 								uint32_t alphaArrayW = 0, uint32_t alphaArrayH = 0,
-								uint32_t alphaArrayLayers = 0 );
+								uint32_t alphaArrayLayers = 0,
+								const float *brdfMeta = nullptr,
+								const unsigned char *brdfArrayRGBA = nullptr,
+								uint32_t brdfArrayW = 0, uint32_t brdfArrayH = 0,
+								uint32_t brdfArrayLayers = 0 );
 
 // spp / sampleOffset for multi-pass high-spp bakes (chunked for GPU occupancy).
 void PathTraceDXR_GpuBakeConfigurePass( uint32_t spp, uint32_t sampleOffset );

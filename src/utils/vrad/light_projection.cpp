@@ -688,15 +688,15 @@ static Vector SampleCubeFace( const ProjTex *p, int face, float u, float v )
 
 // Source VTF cubemap faces match D3D cube sampling (CUBEMAP_FACE_*:
 // +X -X +Y -Y +Z -Z). sc/tc from the D3D cubemap face table.
-static Vector SampleCubeDir( const ProjTex *p, const Vector &dirIn )
+// dirIn is Source cube space: X=right, Y=forward, Z=up.
+static bool CubeFaceUV( const Vector &dirIn, int &face, float &u, float &v )
 {
 	Vector d = dirIn;
 	float len = VectorNormalize( d );
 	if ( len < 1e-8f )
-		return Vector( 1, 1, 1 );
+		return false;
 
 	const float ax = fabsf( d.x ), ay = fabsf( d.y ), az = fabsf( d.z );
-	int face;
 	float sc, tc, ma;
 	if ( ax >= ay && ax >= az )
 	{
@@ -716,9 +716,83 @@ static Vector SampleCubeDir( const ProjTex *p, const Vector &dirIn )
 		if ( d.z > 0 ) { face = 4; sc =  d.x; tc = -d.y; } // +Z UP
 		else           { face = 5; sc = -d.x; tc = -d.y; } // -Z DOWN
 	}
-	float u = 0.5f * ( sc / ma + 1.0f );
-	float v = 0.5f * ( tc / ma + 1.0f );
+	u = 0.5f * ( sc / ma + 1.0f );
+	v = 0.5f * ( tc / ma + 1.0f );
+	return true;
+}
+
+static Vector SampleCubeDir( const ProjTex *p, const Vector &dirIn )
+{
+	int face;
+	float u, v;
+	if ( !CubeFaceUV( dirIn, face, u, v ) )
+		return Vector( 1, 1, 1 );
 	return SampleCubeFace( p, face, u, v );
+}
+
+// Same 90° cube-face framing as SampleCubeDir, but every face reads the one 2D image.
+static Vector SampleSixFaceDir( const ProjTex *p, const Vector &cubeDir )
+{
+	int face;
+	float u, v;
+	if ( !CubeFaceUV( cubeDir, face, u, v ) )
+		return Vector( 1, 1, 1 );
+	u = max( 0.0f, min( 1.0f, u ) );
+	v = max( 0.0f, min( 1.0f, v ) );
+	return SampleRGBABilinear( p->rgba.Base(), p->width, p->height, u, v, false );
+}
+
+// Equirectangular HDRI. localDir is light-local: x=right, y=up, z=forward.
+// Image top is light up; the center column on the horizon is the beam.
+static Vector SampleHdriDir( const ProjTex *p, const Vector &localDir )
+{
+	Vector d = localDir;
+	float len = VectorNormalize( d );
+	if ( len < 1e-8f )
+		return Vector( 1, 1, 1 );
+
+	const float u = atan2f( d.x, d.z ) * ( 0.5f / (float)M_PI ) + 0.5f;
+	const float v = acosf( max( -1.0f, min( 1.0f, d.y ) ) ) * ( 1.0f / (float)M_PI );
+
+	const unsigned char *rgba = p->rgba.Base();
+	const int w = p->width;
+	const int h = p->height;
+	if ( !rgba || w <= 0 || h <= 0 )
+		return Vector( 0, 0, 0 );
+
+	// Longitude wraps so the seam blends the first and last columns.
+	float uu = u - floorf( u );
+	float vv = max( 0.0f, min( 1.0f, v ) );
+	float x = uu * (float)w - 0.5f;
+	float y = vv * (float)( h - 1 );
+	int x0 = (int)floorf( x );
+	int y0 = (int)floorf( y );
+	int x1 = x0 + 1;
+	int y1 = min( y0 + 1, h - 1 );
+	y0 = max( 0, min( y0, h - 1 ) );
+	auto wrap = [w]( int ix ) -> int
+	{
+		int m = ix % w;
+		if ( m < 0 )
+			m += w;
+		return m;
+	};
+	x0 = wrap( x0 );
+	x1 = wrap( x1 );
+	float tx = x - floorf( x );
+	float ty = y - (float)y0;
+	auto fetch = [&]( int ix, int iy ) -> Vector
+	{
+		const unsigned char *px = rgba + ( ( iy * w + ix ) * 4 );
+		return Vector( px[0] / 255.0f, px[1] / 255.0f, px[2] / 255.0f );
+	};
+	Vector c00 = fetch( x0, y0 );
+	Vector c10 = fetch( x1, y0 );
+	Vector c01 = fetch( x0, y1 );
+	Vector c11 = fetch( x1, y1 );
+	Vector c0 = c00 + ( c10 - c00 ) * tx;
+	Vector c1 = c01 + ( c11 - c01 ) * tx;
+	return c0 + ( c1 - c0 ) * ty;
 }
 
 // Omnidirectional 2D env: equirect if wide, else OpenGL spheremap (matcaps).
@@ -765,13 +839,14 @@ Vector Proj_EvalRGB( const ProjTex *p, const Vector &beamDir, const Vector &righ
 	Vector dir = lightToSample;
 	VectorNormalize( dir );
 
+	// Light-local: x=right, y=up, z=forward(beam).
+	Vector local;
+	local.x = DotProduct( dir, rightDir );
+	local.y = DotProduct( dir, upDir );
+	local.z = DotProduct( dir, beamDir );
+
 	if ( p->kind == PROJ_CUBE || p->kind == PROJ_SPHERE )
 	{
-		// Light-local: x=right, y=up, z=forward(beam).
-		Vector local;
-		local.x = DotProduct( dir, rightDir );
-		local.y = DotProduct( dir, upDir );
-		local.z = DotProduct( dir, beamDir );
 		if ( p->kind == PROJ_CUBE )
 		{
 			// Source cube axes are Z-up: X=right, Y=forward, Z=up.
@@ -779,6 +854,16 @@ Vector Proj_EvalRGB( const ProjTex *p, const Vector &beamDir, const Vector &righ
 			return SampleCubeDir( p, cubeDir );
 		}
 		return SampleSphereDir( p, local );
+	}
+
+	if ( frameMode == PROJ_FRAME_HDRI )
+		return SampleHdriDir( p, local );
+
+	if ( frameMode == PROJ_FRAME_SIXFACE )
+	{
+		// Same image on every face. Each face is the 90° square of a cubemap.
+		const Vector cubeDir( local.x, local.z, local.y );
+		return SampleSixFaceDir( p, cubeDir );
 	}
 
 	// 2D planar framed to outer cone.
@@ -813,8 +898,14 @@ Vector Proj_EvalLightRGB( const directlight_t *dl, const Vector &lightToSample )
 		up = dl->m_vecProjUp;
 	else
 		VectorNormalize( up );
-	const ProjFrameMode_t frame = ( dl->m_nProjFrameMode == (int)PROJ_FRAME_FIT )
-		? PROJ_FRAME_FIT : PROJ_FRAME_FILL;
+	ProjFrameMode_t frame = PROJ_FRAME_FILL;
+	switch ( dl->m_nProjFrameMode )
+	{
+	case PROJ_FRAME_FIT:		frame = PROJ_FRAME_FIT; break;
+	case PROJ_FRAME_HDRI:		frame = PROJ_FRAME_HDRI; break;
+	case PROJ_FRAME_SIXFACE:	frame = PROJ_FRAME_SIXFACE; break;
+	default:					frame = PROJ_FRAME_FILL; break;
+	}
 	return Proj_EvalRGB( dl->m_pProj, dl->light.normal, dl->m_vecProjRight, up,
 						 dl->light.stopdot2, lightToSample, frame );
 }
@@ -824,7 +915,14 @@ bool Proj_IsOmniEnvmap( const directlight_t *dl )
 	if ( !dl || !dl->m_pProj )
 		return false;
 	const ProjKind_t k = Proj_Kind( dl->m_pProj );
-	return k == PROJ_CUBE || k == PROJ_SPHERE;
+	if ( k == PROJ_CUBE || k == PROJ_SPHERE )
+		return true;
+	if ( k == PROJ_2D )
+	{
+		return dl->m_nProjFrameMode == (int)PROJ_FRAME_HDRI
+			|| dl->m_nProjFrameMode == (int)PROJ_FRAME_SIXFACE;
+	}
+	return false;
 }
 
 void Proj_AssignGpuLayers()
